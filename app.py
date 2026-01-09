@@ -1076,7 +1076,7 @@ else:
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; padding: 1rem; background: linear-gradient(90deg, #4CAF50, #45a049); border-radius: 10px;">
-    <h3 style="color: white; margin: 0;">🐸 Ultra Frog SEO Crawler 3.0</h3>
+    <h3 style="color: white; margin: 0;">🐸 Battersea SEO Crawler</h3>
     <p style="color: black; margin: 0;">Professional Edition • Full Feature Set • Created by Kamal</p>
 </div>
 """, unsafe_allow_html=True)
