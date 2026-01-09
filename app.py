@@ -632,7 +632,7 @@ elif st.session_state.crawl_data:
     df = pd.DataFrame(st.session_state.crawl_data)
     
     # Summary stats
-    st.header("📊 Ultra Frog Analysis Dashboard")
+    st.header("📊 Battersea Analysis Dashboard")
     col1, col2, col3, col4, col5, col6 = st.columns(6)
     with col1:
         st.metric("Total URLs", len(df))
