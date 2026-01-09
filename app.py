@@ -467,7 +467,7 @@ st.markdown("""
 # Header
 st.markdown("""
 <div class="main-header">
-    <h1 style="color: white; margin: 0;">🐸 Ultra Frog SEO Crawler 3.0</h1>
+    <h1 style="color: white; margin: 0;">Battersea Crawler</h1>
     <p style="color: white; margin: 0; opacity: 0.9;">Professional Edition • Full SEO Analysis • Graph Visualization • Path Detection</p>
 </div>
 """, unsafe_allow_html=True)
