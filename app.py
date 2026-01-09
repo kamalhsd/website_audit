@@ -452,17 +452,44 @@ def crawl_from_sitemap(sitemap_url, max_urls, progress_container, ignore_robots=
 # CSS
 st.markdown("""
 <style>
-.main-header {
-    background: linear-gradient(90deg, #4CAF50, #45a049);
-    padding: 1rem;
-    border-radius: 10px;
-    margin-bottom: 2rem;
+/* Tabs bar background */
+.stTabs [data-baseweb="tab-list"]{
+  gap: 10px;
+  padding: 6px 6px;
+  border-radius: 10px;
+  background: #eef2f6; /* visible bar */
 }
-.stTabs [data-baseweb="tab-list"] { gap: 10px; }
-.stTabs [data-baseweb="tab"] { height: 50px; white-space: pre-wrap; background-color: #f0f2f6; border-radius: 5px; }
-.stTabs [aria-selected="true"] { background-color: #4CAF50; color: black; }
+
+/* Unselected tab */
+.stTabs [data-baseweb="tab"]{
+  height: 50px;
+  white-space: pre-wrap;
+  border-radius: 8px;
+  background: #ffffff !important;       /* tab bg */
+  color: #111827 !important;            /* tab text */
+  border: 1px solid #d1d5db !important; /* outline */
+}
+
+/* Ensure label text inside tab also inherits color */
+.stTabs [data-baseweb="tab"] *{
+  color: inherit !important;
+}
+
+/* Selected tab */
+.stTabs [aria-selected="true"]{
+  background: #4CAF50 !important;
+  color: #ffffff !important;
+  border: 1px solid #3f9f46 !important;
+  font-weight: 700;
+}
+
+/* Optional hover */
+.stTabs [data-baseweb="tab"]:hover{
+  background: #f3f4f6 !important;
+}
 </style>
 """, unsafe_allow_html=True)
+
 
 # Header
 st.markdown("""
