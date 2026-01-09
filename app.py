@@ -21,7 +21,7 @@ except ImportError:
     HAS_PYVIS = False
 
 # Page config
-st.set_page_config(page_title="Ultra Frog SEO Crawler 3.0", layout="wide", page_icon="🐸")
+st.set_page_config(page_title="Battersea Crawler", layout="wide", page_icon="🐸")
 
 # Initialize session state
 if 'crawl_data' not in st.session_state:
