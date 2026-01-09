@@ -460,7 +460,7 @@ st.markdown("""
 }
 .stTabs [data-baseweb="tab-list"] { gap: 10px; }
 .stTabs [data-baseweb="tab"] { height: 50px; white-space: pre-wrap; background-color: #f0f2f6; border-radius: 5px; }
-.stTabs [aria-selected="true"] { background-color: #4CAF50; color: white; }
+.stTabs [aria-selected="true"] { background-color: #4CAF50; color: black; }
 </style>
 """, unsafe_allow_html=True)
 
