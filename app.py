@@ -12,6 +12,8 @@ import xml.etree.ElementTree as ET
 from urllib.robotparser import RobotFileParser
 import networkx as nx
 import streamlit.components.v1 as components
+import html
+import re
 
 # Try importing pyvis for graphing, handle if missing
 try:
@@ -73,7 +75,7 @@ class UltraFrogCrawler:
             return self.base_domain in parsed.netloc
         else:  # subfolder
             return (parsed.netloc == self.base_domain and 
-                   parsed.path.startswith(self.base_path))
+                    parsed.path.startswith(self.base_path))
     
     def can_fetch(self, url):
         if self.ignore_robots:
@@ -93,6 +95,22 @@ class UltraFrogCrawler:
             return self.robots_cache[domain].can_fetch('*', url)
         except:
             return True
+
+    def smart_clean(self, text):
+        """
+        Cleans text by removing extra whitespace, newlines, and unescaping HTML entities.
+        """
+        if not text:
+            return ""
+        # Convert to string just in case
+        text = str(text)
+        # Unescape HTML entities (e.g., &amp; -> &, &nbsp; -> space)
+        text = html.unescape(text)
+        # Replace newlines, tabs, and multiple spaces with a single space
+        text = re.sub(r'[\r\n\t]+', ' ', text)
+        text = re.sub(r'\s+', ' ', text)
+        # Strip leading/trailing whitespace
+        return text.strip()
 
     def get_css_path(self, element):
         """Generates the CSS path for a specific element to identify Header/Footer/Body."""
@@ -142,12 +160,12 @@ class UltraFrogCrawler:
             response = self.session.get(url, timeout=8, allow_redirects=True)
             soup = BeautifulSoup(response.content, 'html.parser')
             
-            # Basic SEO data extraction
+            # Basic SEO data extraction (Using Smart Clean)
             title = soup.find('title')
-            title_text = title.get_text().strip() if title else ""
+            title_text = self.smart_clean(title.get_text()) if title else ""
             
             meta_desc = soup.find('meta', attrs={'name': 'description'})
-            meta_desc_text = meta_desc.get('content', '') if meta_desc else ""
+            meta_desc_text = self.smart_clean(meta_desc.get('content', '')) if meta_desc else ""
             
             canonical = soup.find('link', attrs={'rel': 'canonical'})
             canonical_url = canonical.get('href') if canonical else ""
@@ -165,17 +183,17 @@ class UltraFrogCrawler:
             twitter_desc = soup.find('meta', attrs={'name': 'twitter:description'})
             twitter_image = soup.find('meta', attrs={'name': 'twitter:image'})
             
-            # Header tags (all levels)
-            h1_tags = [h1.get_text().strip() for h1 in soup.find_all('h1')]
-            h2_tags = [h2.get_text().strip() for h2 in soup.find_all('h2')]
-            h3_tags = [h3.get_text().strip() for h3 in soup.find_all('h3')]
-            h4_tags = [h4.get_text().strip() for h4 in soup.find_all('h4')]
+            # Header tags (all levels - Smart Cleaned)
+            h1_tags = [self.smart_clean(h1.get_text()) for h1 in soup.find_all('h1')]
+            h2_tags = [self.smart_clean(h2.get_text()) for h2 in soup.find_all('h2')]
+            h3_tags = [self.smart_clean(h3.get_text()) for h3 in soup.find_all('h3')]
+            h4_tags = [self.smart_clean(h4.get_text()) for h4 in soup.find_all('h4')]
             
-            # --- CUSTOM EXTRACTION ---
+            # --- CUSTOM EXTRACTION (Smart Cleaned) ---
             custom_data = ""
             if self.custom_selector:
                 custom_elements = soup.select(self.custom_selector)
-                custom_data = "; ".join([el.get_text(strip=True) for el in custom_elements])
+                custom_data = "; ".join([self.smart_clean(el.get_text()) for el in custom_elements])
 
             # --- UPDATED: Links with CSS Path ---
             internal_links = []
@@ -184,7 +202,8 @@ class UltraFrogCrawler:
             
             for link in soup.find_all('a', href=True):
                 href = urljoin(url, link['href'])
-                link_text = link.get_text().strip()[:100]
+                # Smart clean the anchor text
+                link_text = self.smart_clean(link.get_text())[:100]
                 
                 # Generate Path
                 css_path = self.get_css_path(link)
@@ -217,8 +236,8 @@ class UltraFrogCrawler:
                 img_src = urljoin(url, img.get('src', ''))
                 images.append({
                     'src': img_src,
-                    'alt': img.get('alt', ''),
-                    'title': img.get('title', ''),
+                    'alt': self.smart_clean(img.get('alt', '')),  # Cleaned Alt
+                    'title': self.smart_clean(img.get('title', '')), # Cleaned Title
                     'width': img.get('width', ''),
                     'height': img.get('height', '')
                 })
@@ -257,8 +276,8 @@ class UltraFrogCrawler:
                         'to_url': resp.headers.get('location', ''),
                         'status_code': resp.status_code,
                         'redirect_type': '301 Permanent' if resp.status_code == 301 else 
-                                       '302 Temporary' if resp.status_code == 302 else 
-                                       f'{resp.status_code} Redirect'
+                                         '302 Temporary' if resp.status_code == 302 else 
+                                         f'{resp.status_code} Redirect'
                     })
             
             return {
