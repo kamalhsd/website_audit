@@ -531,7 +531,7 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("⛏️ Custom Extraction (Optional)")
-    custom_selector = st.text_input("CSS Selector", placeholder="e.g., .price, h1, .sku", help="Extract specific data from pages")
+    custom_selector = st.text_input("CSS Selector", placeholder="e.g., .price, h1, .sku", help="Use . for Class # for ID")
     
     col1, col2 = st.columns(2)
     with col1:
