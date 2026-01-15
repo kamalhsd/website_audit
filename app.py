@@ -15,30 +15,50 @@ import streamlit.components.v1 as components
 import html
 import re
 
-# Try importing pyvis for graphing, handle if missing
+# Try importing pyvis for graphing
 try:
     from pyvis.network import Network
     HAS_PYVIS = True
 except ImportError:
     HAS_PYVIS = False
 
-# Page config
-st.set_page_config(page_title="Battersea Crawler", layout="wide", page_icon="🐸")
+# --- 1. PAGE CONFIGURATION & STYLING ---
+st.set_page_config(page_title="Battersea Crawler Pro", layout="wide", page_icon="🐸")
 
-# Initialize session state
-if 'crawl_data' not in st.session_state:
-    st.session_state.crawl_data = []
-if 'crawling' not in st.session_state:
-    st.session_state.crawling = False
-if 'stop_crawling' not in st.session_state:
-    st.session_state.stop_crawling = False
-if 'sitemap_urls_set' not in st.session_state:
-    st.session_state.sitemap_urls_set = set()
-if 'psi_results' not in st.session_state:
-    st.session_state.psi_results = {}
+# Custom CSS for better scrolling and structure
+st.markdown("""
+<style>
+    /* Main Layout adjustment */
+    .block-container { padding-top: 2rem; padding-bottom: 3rem; }
+    
+    /* Tab Styling */
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; background-color: #f8f9fa; padding: 10px; border-radius: 10px; }
+    .stTabs [data-baseweb="tab"] { height: 45px; background-color: #ffffff; border-radius: 6px; padding: 0 20px; border: 1px solid #e0e0e0; }
+    .stTabs [aria-selected="true"] { background-color: #ff4b4b; color: white !important; border: 1px solid #ff4b4b; }
+    
+    /* Metrics Styling */
+    div[data-testid="stMetricValue"] { font-size: 24px; font-weight: 700; }
+    
+    /* Table Scrolling Fix */
+    .stDataFrame { width: 100%; }
+    
+    /* Headers */
+    .main-header { background: linear-gradient(90deg, #1e3a8a, #3b82f6); padding: 1.5rem; border-radius: 10px; color: white; margin-bottom: 2rem; }
+    .main-header h1 { color: white; margin: 0; font-size: 2rem; }
+    .main-header p { color: #e0e7ff; margin: 0; font-size: 1rem; }
+</style>
+""", unsafe_allow_html=True)
 
+# --- 2. SESSION STATE INITIALIZATION ---
+if 'crawl_data' not in st.session_state: st.session_state.crawl_data = []
+if 'crawling' not in st.session_state: st.session_state.crawling = False
+if 'stop_crawling' not in st.session_state: st.session_state.stop_crawling = False
+if 'sitemap_urls_set' not in st.session_state: st.session_state.sitemap_urls_set = set()
+if 'psi_results' not in st.session_state: st.session_state.psi_results = {}
+
+# --- 3. CRAWLER LOGIC CLASS ---
 class UltraFrogCrawler:
-    def __init__(self, max_urls=100000, ignore_robots=False, crawl_scope="subfolder", custom_selector=None, link_selector=None):
+    def __init__(self, max_urls=1000, ignore_robots=False, crawl_scope="subfolder", custom_selector=None, link_selector=None):
         self.max_urls = max_urls
         self.ignore_robots = ignore_robots
         self.crawl_scope = crawl_scope
@@ -46,13 +66,11 @@ class UltraFrogCrawler:
         self.link_selector = link_selector
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Ultra Frog SEO Crawler/3.0 (https://ultrafrog.seo)',
+            'User-Agent': 'Ultra Frog SEO Crawler/3.0 (Internal Analysis)',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
+            'Connection': 'keep-alive'
         })
+        # Optimize connection pool
         adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=1)
         self.session.mount('http://', adapter)
         self.session.mount('https://', adapter)
@@ -71,7 +89,7 @@ class UltraFrogCrawler:
             return url == urljoin(f"https://{self.base_domain}", self.base_path)
         elif self.crawl_scope == "subdomain":
             return self.base_domain in parsed.netloc
-        else:
+        else: # subfolder
             return (parsed.netloc == self.base_domain and parsed.path.startswith(self.base_path))
     
     def can_fetch(self, url):
@@ -84,8 +102,7 @@ class UltraFrogCrawler:
                     rp.set_url(f"https://{domain}/robots.txt")
                     rp.read()
                     self.robots_cache[domain] = rp
-                except:
-                    self.robots_cache[domain] = None
+                except: self.robots_cache[domain] = None
             if self.robots_cache[domain] is None: return True
             return self.robots_cache[domain].can_fetch('*', url)
         except: return True
@@ -107,74 +124,68 @@ class UltraFrogCrawler:
             elif parent.get('class'): selector += f".{parent['class'][0]}"
             path.append(selector)
         path.reverse()
-        element_selector = element.name
-        if element.get('class'): element_selector += f".{element['class'][0]}"
-        path.append(element_selector)
         return " > ".join(path)
 
     def extract_sitemap_urls(self, sitemap_url):
         urls = []
         try:
-            response = self.session.get(sitemap_url, timeout=8)
+            response = self.session.get(sitemap_url, timeout=10)
             if response.status_code == 200:
                 root = ET.fromstring(response.content)
                 namespaces = {'sitemap': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+                # Check for index
                 sitemapindex = root.findall('.//sitemap:sitemap', namespaces)
                 if sitemapindex:
-                    for sitemap in sitemapindex:
-                        loc = sitemap.find('sitemap:loc', namespaces)
+                    for s in sitemapindex:
+                        loc = s.find('sitemap:loc', namespaces)
                         if loc is not None: urls.extend(self.extract_sitemap_urls(loc.text))
                 else:
                     url_elements = root.findall('.//sitemap:url', namespaces)
-                    for url_elem in url_elements:
-                        loc = url_elem.find('sitemap:loc', namespaces)
+                    for u in url_elements:
+                        loc = u.find('sitemap:loc', namespaces)
                         if loc is not None: urls.append(loc.text)
-        except Exception as e: st.error(f"Error parsing sitemap: {e}")
+        except: pass
         return urls
         
     def extract_page_data(self, url):
         try:
-            response = self.session.get(url, timeout=8, allow_redirects=True)
+            response = self.session.get(url, timeout=10, allow_redirects=True)
             soup = BeautifulSoup(response.content, 'html.parser')
             
+            # --- 1. BASIC SEO ---
             title = soup.find('title')
             title_text = self.smart_clean(title.get_text()) if title else ""
             meta_desc = soup.find('meta', attrs={'name': 'description'})
             meta_desc_text = self.smart_clean(meta_desc.get('content', '')) if meta_desc else ""
             canonical = soup.find('link', attrs={'rel': 'canonical'})
             canonical_url = canonical.get('href') if canonical else ""
+            
+            # --- 2. INDEXING ---
             meta_robots = soup.find('meta', attrs={'name': 'robots'})
             robots_content = meta_robots.get('content', '') if meta_robots else ""
-            
-            # Check specifically for 'noindex, follow'
-            is_noindex_follow = False
-            if robots_content:
-                content_lower = robots_content.lower()
-                if 'noindex' in content_lower and 'follow' in content_lower:
-                    is_noindex_follow = True
+            is_noindex_follow = 'noindex' in robots_content.lower() and 'follow' in robots_content.lower()
 
-            h1_tags = [self.smart_clean(h1.get_text()) for h1 in soup.find_all('h1')]
-            h2_tags = [self.smart_clean(h2.get_text()) for h2 in soup.find_all('h2')]
-            h3_tags = [self.smart_clean(h3.get_text()) for h3 in soup.find_all('h3')]
-            h4_tags = [self.smart_clean(h4.get_text()) for h4 in soup.find_all('h4')]
+            # --- 3. HEADINGS ---
+            h1s = [self.smart_clean(h.get_text()) for h in soup.find_all('h1')]
+            h2s = [self.smart_clean(h.get_text()) for h in soup.find_all('h2')]
             
-            custom_data = ""
-            if self.custom_selector:
-                custom_elements = soup.select(self.custom_selector)
-                custom_data = "; ".join([self.smart_clean(el.get_text()) for el in custom_elements])
-
+            # --- 4. LINKS (Scoped) ---
             internal_links = []
             external_links = []
             base_domain = urlparse(url).netloc
+            
+            # Determine search area
             search_area = soup
             if self.link_selector:
-                specific_section = soup.select_one(self.link_selector)
-                if specific_section: search_area = specific_section
+                found_section = soup.select_one(self.link_selector)
+                if found_section: search_area = found_section
             
             for link in search_area.find_all('a', href=True):
                 href = urljoin(url, link['href'])
                 link_text = self.smart_clean(link.get_text())[:100]
                 css_path = self.get_css_path(link)
+                
+                # Placement Detection
                 placement = "Body"
                 path_lower = css_path.lower()
                 if "footer" in path_lower: placement = "Footer"
@@ -185,38 +196,42 @@ class UltraFrogCrawler:
                 if urlparse(href).netloc == base_domain: internal_links.append(link_data)
                 else: external_links.append(link_data)
             
+            # --- 5. IMAGES ---
             images = []
             for img in soup.find_all('img'):
-                img_src = urljoin(url, img.get('src', ''))
                 images.append({
-                    'src': img_src,
+                    'src': urljoin(url, img.get('src', '')),
                     'alt': self.smart_clean(img.get('alt', '')),
-                    'title': self.smart_clean(img.get('title', '')),
-                    'width': img.get('width', ''),
-                    'height': img.get('height', '')
+                    'title': self.smart_clean(img.get('title', ''))
                 })
             
-            og_title = soup.find('meta', attrs={'property': 'og:title'})
-            og_desc = soup.find('meta', attrs={'property': 'og:description'})
-            og_image = soup.find('meta', attrs={'property': 'og:image'})
-            twitter_title = soup.find('meta', attrs={'name': 'twitter:title'})
-            twitter_desc = soup.find('meta', attrs={'name': 'twitter:description'})
-            twitter_image = soup.find('meta', attrs={'name': 'twitter:image'})
-            
-            scripts = soup.find_all('script', type='application/ld+json')
-            schema_types = []
+            # --- 6. SCHEMA (Enhanced) ---
+            schema_scripts = soup.find_all('script', type='application/ld+json')
             schema_validity = "No Schema"
+            schema_types = []
+            schema_raw_data = [] # Store full JSON objects
             schema_errors = []
-            if scripts:
+
+            if schema_scripts:
                 schema_validity = "Valid"
-                for script in scripts:
+                for script in schema_scripts:
                     try:
-                        if script.string:
-                            schema_data = json.loads(script.string)
-                            if isinstance(schema_data, dict) and '@type' in schema_data: schema_types.append(schema_data['@type'])
-                            elif isinstance(schema_data, list):
-                                for item in schema_data:
-                                    if isinstance(item, dict) and '@type' in item: schema_types.append(item['@type'])
+                        # robust text extraction
+                        content = script.string if script.string else script.get_text()
+                        if content:
+                            data = json.loads(content)
+                            schema_raw_data.append(data) # Store raw
+                            
+                            # Extract types
+                            if isinstance(data, dict):
+                                if '@type' in data: schema_types.append(data['@type'])
+                                if '@graph' in data: # Handle Yoast style graph
+                                    for node in data['@graph']:
+                                        if '@type' in node: schema_types.append(node['@type'])
+                            elif isinstance(data, list):
+                                for item in data:
+                                    if isinstance(item, dict) and '@type' in item:
+                                        schema_types.append(item['@type'])
                     except json.JSONDecodeError as e:
                         schema_validity = "Invalid JSON"
                         schema_errors.append(str(e))
@@ -224,389 +239,406 @@ class UltraFrogCrawler:
                         schema_validity = "Error"
                         schema_errors.append(str(e))
 
-            css_files = len(soup.find_all('link', attrs={'rel': 'stylesheet'}))
-            js_files = len(soup.find_all('script', src=True))
-            text_content = soup.get_text()
-            word_count = len(text_content.split())
-            
+            # --- 7. REDIRECTS ---
             redirect_chain = []
             if hasattr(response, 'history') and response.history:
                 for i, resp in enumerate(response.history):
                     redirect_chain.append({
-                        'step': i + 1, 'from_url': resp.url, 'status_code': resp.status_code,
-                        'redirect_type': '301' if resp.status_code == 301 else f'{resp.status_code}'
+                        'step': i+1, 'from': resp.url, 'code': resp.status_code
                     })
-            
+
+            # --- 8. CUSTOM EXTRACTION ---
+            custom_data = ""
+            if self.custom_selector:
+                els = soup.select(self.custom_selector)
+                custom_data = "; ".join([self.smart_clean(e.get_text()) for e in els])
+
             return {
-                'url': response.url, 'original_url': url, 'status_code': response.status_code,
-                'title': title_text, 'title_length': len(title_text), 'meta_description': meta_desc_text,
-                'meta_desc_length': len(meta_desc_text), 'canonical_url': canonical_url, 'meta_robots': robots_content,
+                'url': response.url, 'status_code': response.status_code,
+                'title': title_text, 'title_length': len(title_text),
+                'meta_description': meta_desc_text, 'meta_desc_length': len(meta_desc_text),
+                'canonical_url': canonical_url, 'meta_robots': robots_content,
                 'is_noindex_follow': is_noindex_follow,
-                'h1_tags': '; '.join(h1_tags), 'h1_count': len(h1_tags), 'h2_tags': '; '.join(h2_tags), 'h2_count': len(h2_tags),
-                'h3_tags': '; '.join(h3_tags), 'h3_count': len(h3_tags), 'h4_tags': '; '.join(h4_tags), 'h4_count': len(h4_tags),
-                'word_count': word_count, 'response_time': response.elapsed.total_seconds(),
-                'content_length': len(response.content), 'internal_links_count': len(internal_links),
-                'external_links_count': len(external_links), 'internal_links': internal_links,
-                'external_links': external_links, 'images': images, 'image_count': len(images),
-                'images_without_alt': len([img for img in images if not img['alt']]), 'schema_types': '; '.join(schema_types),
-                'schema_count': len(schema_types), 'schema_validity': schema_validity, 'schema_errors': '; '.join(schema_errors),
+                'h1_tags': "; ".join(h1s), 'h1_count': len(h1s),
+                'h2_tags': "; ".join(h2s), 'h2_count': len(h2s),
+                'internal_links': internal_links, 'internal_count': len(internal_links),
+                'external_links': external_links, 'external_count': len(external_links),
+                'images': images, 'image_count': len(images),
+                'schema_types': "; ".join(schema_types), 'schema_validity': schema_validity,
+                'schema_raw': json.dumps(schema_raw_data, indent=2) if schema_raw_data else "", # Store Raw
+                'schema_errors': "; ".join(schema_errors),
                 'redirect_chain': redirect_chain, 'redirect_count': len(redirect_chain),
-                'css_files': css_files, 'js_files': js_files,
-                'og_title': og_title.get('content', '') if og_title else '', 'og_description': og_desc.get('content', '') if og_desc else '',
-                'og_image': og_image.get('content', '') if og_image else '', 'twitter_title': twitter_title.get('content', '') if twitter_title else '',
-                'twitter_description': twitter_desc.get('content', '') if twitter_desc else '', 'twitter_image': twitter_image.get('content', '') if twitter_image else '',
-                'content_type': response.headers.get('content-type', ''), 'last_modified': response.headers.get('last-modified', ''),
-                'server': response.headers.get('server', ''), 'custom_extraction': custom_data,
-                'indexability': self.get_indexability_status(response.status_code, robots_content),
-                'crawl_timestamp': datetime.now().isoformat()
+                'response_time': response.elapsed.total_seconds(),
+                'word_count': len(soup.get_text().split()),
+                'custom_extraction': custom_data,
+                'crawl_time': datetime.now().isoformat()
             }
         except Exception as e:
-            return {
-                'url': url, 'original_url': url, 'status_code': 0, 'error': str(e),
-                'title': '', 'title_length': 0, 'meta_description': '', 'meta_desc_length': 0,
-                'canonical_url': '', 'meta_robots': '', 'is_noindex_follow': False,
-                'h1_tags': '', 'h1_count': 0, 'h2_tags': '', 'h2_count': 0, 'h3_tags': '', 'h3_count': 0,
-                'h4_tags': '', 'h4_count': 0, 'word_count': 0, 'response_time': 0,
-                'content_length': 0, 'internal_links_count': 0, 'external_links_count': 0,
-                'internal_links': [], 'external_links': [], 'images': [], 'image_count': 0,
-                'images_without_alt': 0, 'schema_types': '', 'schema_count': 0, 'schema_validity': 'Error', 'schema_errors': '',
-                'redirect_chain': [], 'redirect_count': 0, 'css_files': 0, 'js_files': 0,
-                'og_title': '', 'og_description': '', 'og_image': '', 'twitter_title': '', 'twitter_description': '', 'twitter_image': '',
-                'content_type': '', 'last_modified': '', 'server': '', 'custom_extraction': '',
-                'indexability': 'Error', 'crawl_timestamp': datetime.now().isoformat()
-            }
-    
-    def get_indexability_status(self, status_code, robots_content):
-        if status_code != 200: return 'Non-Indexable'
-        if 'noindex' in robots_content.lower(): return 'Non-Indexable'
-        return 'Indexable'
+            return {'url': url, 'status_code': 0, 'error': str(e)}
 
+# --- 4. HELPER FUNCTIONS ---
 def run_psi_test(url, api_key):
-    if not api_key: return {"error": "No API Key Provided"}
+    if not api_key: return {"error": "No API Key"}
     api_url = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={url}&strategy=mobile&key={api_key}"
     try:
-        response = requests.get(api_url)
-        data = response.json()
-        if "error" in data: return {"error": data["error"]["message"]}
-        lh = data["lighthouseResult"]
+        r = requests.get(api_url)
+        d = r.json()
+        if "error" in d: return {"error": d["error"]["message"]}
+        lh = d["lighthouseResult"]
         return {
             "Score": lh["categories"]["performance"]["score"] * 100,
             "LCP": lh["audits"]["largest-contentful-paint"]["displayValue"],
-            "FCP": lh["audits"]["first-contentful-paint"]["displayValue"],
             "CLS": lh["audits"]["cumulative-layout-shift"]["displayValue"],
-            "INP": lh["audits"].get("interaction-to-next-paint", {}).get("displayValue", "N/A"),
-            "TTI": lh["audits"]["interactive"]["displayValue"]
+            "FID": lh["audits"]["max-potential-fid"]["displayValue"],
+            "INP": lh["audits"].get("interaction-to-next-paint", {}).get("displayValue", "N/A")
         }
     except Exception as e: return {"error": str(e)}
 
-def crawl_website(start_url, max_urls, crawl_scope, progress_container, ignore_robots, custom_selector, link_selector):
-    crawler = UltraFrogCrawler(max_urls, ignore_robots, crawl_scope, custom_selector, link_selector)
-    crawler.set_base_url(start_url)
-    urls = deque([start_url])
+def execute_crawl(mode, start_url, up_file, txt_urls, sm_url, max_urls, ignore, custom_sel, link_sel, sm_orphan):
+    crawler = UltraFrogCrawler(max_urls, ignore, "exact" if mode!="🕷️ Spider Crawl" else "subfolder", custom_sel, link_sel)
+    
+    if sm_orphan:
+        st.session_state.sitemap_urls_set = set(crawler.extract_sitemap_urls(sm_orphan))
+    
+    urls = []
+    if mode == "🕷️ Spider Crawl":
+        crawler.set_base_url(start_url)
+        urls = deque([start_url])
+    elif mode == "📝 List Mode":
+        if up_file: urls = deque([l.strip() for l in up_file.read().decode('utf-8').split('\n') if l.strip()])
+        else: urls = deque([l.strip() for l in txt_urls.split('\n') if l.strip()])
+    elif mode == "🗺️ Sitemap Crawl":
+        urls = deque(crawler.extract_sitemap_urls(sm_url)[:max_urls])
+
     visited = set()
     data = []
-    bar = progress_container.progress(0)
-    txt = progress_container.empty()
+    
+    # Progress UI
+    bar = st.progress(0)
+    status = st.empty()
+    
     with ThreadPoolExecutor(max_workers=10) as exe:
         while urls and len(visited) < max_urls:
             if st.session_state.stop_crawling: break
+            
+            # Batching
             batch = []
-            for _ in range(min(20, len(urls), max_urls - len(visited))):
-                if urls and not st.session_state.stop_crawling:
+            for _ in range(min(20, len(urls))):
+                if urls:
                     u = urls.popleft()
-                    if u not in visited and crawler.can_fetch(u):
+                    if u not in visited:
                         batch.append(u)
                         visited.add(u)
+            
             if not batch: break
+            
             futures = {exe.submit(crawler.extract_page_data, u): u for u in batch}
+            
             for f in as_completed(futures):
                 if st.session_state.stop_crawling: break
                 try:
-                    res = f.result(timeout=12)
-                    data.append(res)
-                    if not st.session_state.stop_crawling:
-                        for l in res.get('internal_links', []):
-                            lu = l['url']
-                            if lu not in visited and lu not in urls and crawler.should_crawl_url(lu): urls.append(lu)
-                    bar.progress(min(len(data)/max_urls, 1.0))
-                    txt.text(f"🚀 Crawled: {len(data)}")
+                    res = f.result()
+                    if res.get('status_code') != 0:
+                        data.append(res)
+                        # Spider Logic
+                        if mode == "🕷️ Spider Crawl":
+                            for l in res.get('internal_links', []):
+                                lu = l['url']
+                                if lu not in visited and lu not in urls and crawler.should_crawl_url(lu):
+                                    urls.append(lu)
+                    
+                    # Update UI
+                    prog_val = min(len(data) / max_urls, 1.0)
+                    bar.progress(prog_val)
+                    status.text(f"🚀 Crawled: {len(data)} pages")
+                    
                 except: pass
+                
     return data
 
-def crawl_from_list(url_list, progress_container, ignore_robots, custom_selector, link_selector):
-    crawler = UltraFrogCrawler(len(url_list), ignore_robots, "exact", custom_selector, link_selector)
-    data = []
-    bar = progress_container.progress(0)
-    txt = progress_container.empty()
-    valid = [u.strip() for u in url_list if crawler.can_fetch(u.strip())]
-    if not valid: return []
-    with ThreadPoolExecutor(max_workers=15) as exe:
-        for i in range(0, len(valid), 25):
-            if st.session_state.stop_crawling: break
-            futures = {exe.submit(crawler.extract_page_data, u): u for u in valid[i:i+25]}
-            for f in as_completed(futures):
-                try:
-                    res = f.result(timeout=12)
-                    data.append(res)
-                    bar.progress(len(data)/len(valid))
-                    txt.text(f"🚀 Processed: {len(data)}/{len(valid)}")
-                except: pass
-    return data
+# --- 5. MAIN UI LAYOUT ---
 
-def crawl_from_sitemap(sitemap_url, max_urls, progress_container, ignore_robots, custom_selector, link_selector):
-    crawler = UltraFrogCrawler(max_urls, ignore_robots, "exact", custom_selector, link_selector)
-    progress_container.text("🗺️ Reading sitemap...")
-    urls = crawler.extract_sitemap_urls(sitemap_url)
-    if not urls: return []
-    if len(urls) > max_urls: urls = urls[:max_urls]
-    return crawl_from_list(urls, progress_container, ignore_robots, custom_selector, link_selector)
+# HEADER
+st.markdown("""
+<div class="main-header">
+    <h1>Battersea Crawler Pro</h1>
+    <p>Professional SEO Audit Tool • Schema Validation • PageSpeed • Structure Analysis</p>
+</div>
+""", unsafe_allow_html=True)
 
-st.markdown("""<style>.stTabs [data-baseweb="tab-list"]{gap:10px;padding:6px;background:#eef2f6;}.stTabs [data-baseweb="tab"]{height:50px;background:#fff;border:1px solid #d1d5db;}.stTabs [aria-selected="true"]{background:#4CAF50 !important;color:#fff !important;}</style>""", unsafe_allow_html=True)
-st.markdown("""<div class="main-header"><h1 style="color:white;">Battersea Crawler</h1><p style="color:white;opacity:0.9;">Professional Edition • Full SEO Analysis</p></div>""", unsafe_allow_html=True)
-
+# SIDEBAR
 with st.sidebar:
-    st.header("🔧 Configuration")
-    mode = st.selectbox("🎯 Mode", ["🕷️ Spider Crawl", "📝 List Mode", "🗺️ Sitemap Crawl"])
-    sm_orphan = ""
-    if mode == "🕷️ Spider Crawl":
-        start_url = st.text_input("🌐 Website URL", "https://example.com")
-        sm_orphan = st.text_input("🗺️ Orphan Check Sitemap (Optional)")
-        max_urls = st.number_input("📊 Max URLs", 1, 100000, 1000)
-        scope = st.selectbox("🎯 Scope", ["subfolder", "subdomain", "exact"])
-    elif mode == "📝 List Mode":
+    st.header("⚙️ Configuration")
+    crawl_mode = st.selectbox("Method", ["🕷️ Spider Crawl", "📝 List Mode", "🗺️ Sitemap Crawl"])
+    
+    # Dynamic Inputs based on mode
+    start_url, sm_orphan, up_file, txt_urls, sm_url = None, None, None, None, None
+    
+    if crawl_mode == "🕷️ Spider Crawl":
+        start_url = st.text_input("Start URL", "https://example.com")
+        sm_orphan = st.text_input("Sitemap (Orphan Check)", placeholder="Optional")
+    elif crawl_mode == "📝 List Mode":
         up_file = st.file_uploader("Upload URLs", type=['txt','csv'])
         txt_urls = st.text_area("Paste URLs")
-    elif mode == "🗺️ Sitemap Crawl":
-        sm_url = st.text_input("🗺️ Sitemap URL")
-        max_urls = st.number_input("📊 Max URLs", 1, 100000, 5000)
+    elif crawl_mode == "🗺️ Sitemap Crawl":
+        sm_url = st.text_input("Sitemap URL")
+
+    max_urls = st.number_input("Max Pages", 1, 50000, 500)
+    ignore_robots = st.checkbox("Ignore Robots.txt", value=False)
     
-    ignore_robots = st.checkbox("🤖 Ignore robots.txt")
     st.markdown("---")
-    st.subheader("⛏️ Custom Extraction")
-    custom_sel = st.text_input("Data Selector", placeholder=".price, h1")
-    link_sel = st.text_input("Link Scope", placeholder=".footer, .content")
+    st.subheader("⛏️ Extraction")
+    custom_sel = st.text_input("CSS Data Selector", placeholder=".price, #sku")
+    link_sel = st.text_input("Link Scope Selector", placeholder="#footer, .sidebar")
+    
     st.markdown("---")
     st.subheader("⚡ PageSpeed")
-    psi_key = st.text_input("API Key (Optional)", type="password")
+    psi_key = st.text_input("Google API Key", type="password")
     
     c1, c2 = st.columns(2)
-    with c1: start = st.button("🚀 Start", type="primary", disabled=st.session_state.crawling)
-    with c2: stop = st.button("⛔ Stop", disabled=not st.session_state.crawling)
-    
-    if stop:
+    start_btn = c1.button("🚀 Run", type="primary", disabled=st.session_state.crawling)
+    stop_btn = c2.button("⛔ Stop")
+
+    if stop_btn:
         st.session_state.stop_crawling = True
         st.session_state.crawling = False
         st.rerun()
-    
-    if start:
-        valid = False
-        if mode == "🕷️ Spider Crawl" and start_url:
-            valid = True
-            if sm_orphan: st.session_state.sitemap_urls_set = set(UltraFrogCrawler().extract_sitemap_urls(sm_orphan))
-            else: st.session_state.sitemap_urls_set = set()
-        elif mode == "📝 List Mode" and (up_file or txt_urls): valid = True
-        elif mode == "🗺️ Sitemap Crawl" and sm_url: valid = True
-        
-        if valid:
-            st.session_state.crawling = True
-            st.session_state.stop_crawling = False
-            st.session_state.crawl_data = []
-            st.session_state.psi_results = {}
-            st.rerun()
 
-    if st.button("🗑️ Reset"):
+    if start_btn:
+        st.session_state.crawling = True
+        st.session_state.stop_crawling = False
         st.session_state.crawl_data = []
-        st.session_state.sitemap_urls_set = set()
         st.session_state.psi_results = {}
         st.rerun()
 
-if st.session_state.crawling:
-    st.header("🐸 Crawling...")
-    prog = st.container()
-    try:
-        c_sel = custom_sel if custom_sel else None
-        l_sel = link_sel if link_sel else None
-        if mode == "🕷️ Spider Crawl": data = crawl_website(start_url, max_urls, scope, prog, ignore_robots, c_sel, l_sel)
-        elif mode == "📝 List Mode":
-            u = []
-            if up_file: u = [l.strip() for l in up_file.read().decode('utf-8').split('\n') if l.strip()]
-            else: u = [l.strip() for l in txt_urls.split('\n') if l.strip()]
-            data = crawl_from_list(u, prog, ignore_robots, c_sel, l_sel)
-        else: data = crawl_from_sitemap(sm_url, max_urls, prog, ignore_robots, c_sel, l_sel)
-        st.session_state.crawl_data = data
-        st.session_state.crawling = False
+    if st.sidebar.button("🗑️ Clear All"):
+        st.session_state.crawl_data = []
+        st.session_state.psi_results = {}
         st.rerun()
-    except Exception as e:
-        st.error(f"Error: {e}")
-        st.session_state.crawling = False
 
-elif st.session_state.crawl_data:
+# MAIN EXECUTION
+if st.session_state.crawling:
+    st.info("🐸 Crawling started... Please wait.")
+    data = execute_crawl(crawl_mode, start_url, up_file, txt_urls, sm_url, max_urls, ignore_robots, custom_sel, link_sel, sm_orphan)
+    st.session_state.crawl_data = data
+    st.session_state.crawling = False
+    st.success("Crawl Complete!")
+    st.rerun()
+
+# RESULTS DISPLAY
+if st.session_state.crawl_data:
     df = pd.DataFrame(st.session_state.crawl_data)
-    st.header("📊 Battersea Analysis Dashboard")
     
-    # Tabs
+    # 1. METRICS ROW
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Total URLs", len(df))
+    m2.metric("200 OK", len(df[df['status_code'] == 200]))
+    m3.metric("Errors", len(df[df['status_code'] != 200]))
+    m4.metric("Avg Speed", f"{df['response_time'].mean():.2f}s" if 'response_time' in df else "0s")
+    if 'schema_validity' in df:
+        m5.metric("Valid Schema", len(df[df['schema_validity'] == 'Valid']))
+
+    st.markdown("---")
+
+    # 2. ANALYSIS TABS
     tabs = st.tabs([
-        "🔗 Links", "🌐 External", "🖼️ Images", "📝 Titles", "📄 Meta", "🏷️ Headers", 
-        "🔄 Redirects", "📊 Status", "🎯 Canonicals", "📱 Social", "🚀 Tech", 
-        "🕸️ Graph", "👻 Orphans", "⛏️ Custom", "⚡ Speed (PSI)", "🏗️ Schema"
+        "🔗 Internal Links", "🌐 External", "🖼️ Images", "📝 Titles & Meta", "🏷️ Headers",
+        "🏗️ Schema", "⚡ Speed (PSI)", "📊 Status", "🔄 Redirects", "🎯 Canonicals",
+        "📱 Social", "👻 Orphans", "⛏️ Custom Data"
     ])
+
+    # --- TAB LOGIC ---
     
-    # 1. Links
+    # Links
     with tabs[0]:
-        st.subheader("Internal Links")
+        st.subheader("Internal Links Analysis")
         if 'internal_links' in df.columns:
-            base = df[['url', 'internal_links']].copy().rename(columns={'url':'Source'})
-            exp = base.explode('internal_links').dropna()
-            if not exp.empty:
-                norm = pd.json_normalize(exp['internal_links'])
-                final = pd.concat([exp['Source'].reset_index(drop=True), norm.reset_index(drop=True)], axis=1)
-                st.dataframe(final, use_container_width=True)
-            else: st.warning("No links found")
-            
-    # 2. External
+            # Flatten links for display
+            link_rows = []
+            for _, row in df.iterrows():
+                for l in row.get('internal_links', []):
+                    link_rows.append({
+                        'Source': row['url'], 
+                        'Destination': l['url'], 
+                        'Anchor': l['anchor_text'],
+                        'Placement': l['placement']
+                    })
+            df_int = pd.DataFrame(link_rows)
+            st.dataframe(df_int, use_container_width=True) # Full width scroll
+        else: st.warning("No internal link data.")
+
+    # External
     with tabs[1]:
         st.subheader("External Links")
-        ext_data = []
-        for _, r in df.iterrows():
-            for l in r.get('external_links', []):
-                ext_data.append({'Source': r['url'], 'Dest': l['url'], 'Anchor': l['anchor_text']})
-        st.dataframe(pd.DataFrame(ext_data), use_container_width=True)
+        if 'external_links' in df.columns:
+            ext_rows = []
+            for _, row in df.iterrows():
+                for l in row.get('external_links', []):
+                    ext_rows.append({'Source': row['url'], 'External URL': l['url'], 'Anchor': l['anchor_text']})
+            df_ext = pd.DataFrame(ext_rows)
+            st.dataframe(df_ext, use_container_width=True)
 
-    # 3. Images
+    # Images
     with tabs[2]:
-        st.subheader("Images")
-        img_data = []
-        for _, r in df.iterrows():
-            for i in r.get('images', []):
-                img_data.append({'Source': r['url'], 'Img': i['src'], 'Alt': i['alt']})
-        st.dataframe(pd.DataFrame(img_data), use_container_width=True)
+        st.subheader("Image Audit")
+        if 'images' in df.columns:
+            img_rows = []
+            for _, row in df.iterrows():
+                for i in row.get('images', []):
+                    img_rows.append({'Source': row['url'], 'Image': i['src'], 'Alt': i['alt'], 'Title': i['title']})
+            df_img = pd.DataFrame(img_rows)
+            st.dataframe(df_img, use_container_width=True)
 
-    # 4-11 Standard Tabs
-    with tabs[3]: st.dataframe(df[['url', 'title', 'title_length']], use_container_width=True)
-    with tabs[4]: st.dataframe(df[['url', 'meta_description', 'meta_desc_length']], use_container_width=True)
-    with tabs[5]: st.dataframe(df[['url', 'h1_tags', 'h2_tags']], use_container_width=True)
-    with tabs[6]: st.dataframe(df[df['redirect_count']>0][['url','status_code','redirect_count']], use_container_width=True)
-    with tabs[7]: st.dataframe(df[['url', 'status_code', 'indexability']], use_container_width=True)
-    with tabs[8]: st.dataframe(df[['url', 'canonical_url']], use_container_width=True)
-    with tabs[9]: st.dataframe(df[['url', 'og_title', 'twitter_title']], use_container_width=True)
-    with tabs[10]: st.dataframe(df[['url', 'response_time', 'word_count']], use_container_width=True)
-    
-    # 12. Graph
-    with tabs[11]:
-        if HAS_PYVIS:
-            G = nx.DiGraph()
-            sub = df.head(50)
-            for _, r in sub.iterrows():
-                G.add_node(r['url'], label=r['title'][:20], color='#4CAF50')
-                for l in r.get('internal_links', []):
-                    if l['url'] in sub['url'].values: G.add_edge(r['url'], l['url'])
-            net = Network(height='500px', width='100%', bgcolor='#222', font_color='white')
-            net.from_nx(G)
-            try:
-                net.save_graph("g.html")
-                with open("g.html",'r',encoding='utf-8') as f: components.html(f.read(), height=550)
-            except: st.error("Graph Error")
-        else: st.error("Install pyvis")
+    # Titles & Meta
+    with tabs[3]:
+        st.subheader("Content Tags")
+        cols = ['url', 'title', 'title_length', 'meta_description', 'meta_desc_length']
+        st.dataframe(df[[c for c in cols if c in df]], use_container_width=True)
 
-    # 13. Orphans
-    with tabs[12]:
-        crawled = set(df['url'])
-        orphans = list(st.session_state.sitemap_urls_set - crawled) if st.session_state.sitemap_urls_set else []
-        st.dataframe(pd.DataFrame(orphans, columns=['Orphan URL']), use_container_width=True)
+    # Headers
+    with tabs[4]:
+        st.subheader("Heading Structure")
+        st.dataframe(df[['url', 'h1_tags', 'h2_tags', 'h1_count']], use_container_width=True)
 
-    # 14. Custom
-    with tabs[13]: st.dataframe(df[['url', 'custom_extraction']], use_container_width=True)
+    # SCHEMA VALIDATOR (FIXED)
+    with tabs[5]:
+        st.subheader("🏗️ Schema Validation")
+        
+        # Overview Table
+        s_df = df[['url', 'schema_types', 'schema_validity', 'schema_errors']].copy()
+        
+        def color_schema(val):
+            color = '#ffcccc' if 'Error' in val or 'Invalid' in val else '#ccffcc' if val == 'Valid' else '#fff'
+            return f'background-color: {color}'
+        
+        st.dataframe(s_df.style.applymap(color_schema, subset=['schema_validity']), use_container_width=True)
+        
+        # Raw Data Inspector
+        with st.expander("🔍 Inspect Raw Schema JSON"):
+            selected_url = st.selectbox("Select Page to Inspect", df['url'].tolist())
+            if selected_url:
+                row = df[df['url'] == selected_url].iloc[0]
+                if row['schema_raw']:
+                    st.code(row['schema_raw'], language='json')
+                else:
+                    st.warning("No Schema found on this page.")
 
-    # 15. Speed (PSI)
-    with tabs[14]:
-        st.subheader("⚡ Google PageSpeed Insights")
+    # PSI Speed
+    with tabs[6]:
+        st.subheader("⚡ Core Web Vitals")
         if psi_key:
-            u_test = st.multiselect("Select URLs", df['url'].head(10).tolist())
-            if st.button("Run Test"):
+            targets = st.multiselect("Select URLs to Test", df['url'].head(10).tolist())
+            if st.button("Run PageSpeed"):
                 res = []
-                p = st.progress(0)
-                for i, u in enumerate(u_test):
-                    res.append({**{'url': u}, **run_psi_test(u, psi_key)})
-                    p.progress((i+1)/len(u_test))
+                bar = st.progress(0)
+                for i, u in enumerate(targets):
+                    data = run_psi_test(u, psi_key)
+                    data['url'] = u
+                    res.append(data)
+                    bar.progress((i+1)/len(targets))
                 st.session_state.psi_results = res
             
             if st.session_state.psi_results:
-                st.dataframe(pd.DataFrame(st.session_state.psi_results), use_container_width=True)
-        else: st.warning("Enter API Key in Sidebar")
+                psi_df = pd.DataFrame(st.session_state.psi_results)
+                st.dataframe(psi_df, use_container_width=True)
+        else: st.warning("Please enter Google API Key in Sidebar")
 
-    # 16. Schema & Indexing
-    with tabs[15]:
-        st.subheader("🏗️ Schema Validator")
-        st.dataframe(df[['url', 'schema_types', 'schema_validity', 'schema_errors']], use_container_width=True)
-        
-        st.divider()
-        st.subheader("🤖 Indexing Check (noindex, follow)")
-        noindex = df[df['is_noindex_follow']==True][['url', 'meta_robots']]
-        if not noindex.empty:
-            st.error(f"Found {len(noindex)} pages with 'noindex, follow'")
-            st.dataframe(noindex, use_container_width=True)
-        else: st.success("No 'noindex, follow' pages found.")
+    # Status
+    with tabs[7]:
+        st.subheader("Status Codes")
+        st.dataframe(df[['url', 'status_code']], use_container_width=True)
 
-    # 📥 EXPORT ALL CENTER 📥
-    st.markdown("---")
-    st.header("📥 Export Center")
-    st.info("Download individual reports for specific analysis.")
+    # Redirects
+    with tabs[8]:
+        st.subheader("Redirect Chains")
+        if 'redirect_chain' in df.columns:
+            # Flatten for display
+            red_rows = []
+            for _, row in df.iterrows():
+                if row['redirect_count'] > 0:
+                    red_rows.append({
+                        'Original': row['url'],
+                        'Chain Length': row['redirect_count'],
+                        'Chain Details': str(row['redirect_chain'])
+                    })
+            if red_rows: st.dataframe(pd.DataFrame(red_rows), use_container_width=True)
+            else: st.success("No redirects found.")
+
+    # Canonicals
+    with tabs[9]:
+        st.subheader("Canonical Checks")
+        st.dataframe(df[['url', 'canonical_url']], use_container_width=True)
+
+    # Social
+    with tabs[10]:
+        st.subheader("Open Graph / Twitter")
+        st.dataframe(df[['url', 'og_title', 'twitter_title']], use_container_width=True)
+
+    # Orphans
+    with tabs[11]:
+        st.subheader("Orphan Pages")
+        crawled = set(df['url'])
+        orphans = list(st.session_state.sitemap_urls_set - crawled) if st.session_state.sitemap_urls_set else []
+        if orphans:
+            st.dataframe(pd.DataFrame(orphans, columns=['Orphan URL']), use_container_width=True)
+        else: st.info("No orphans detected (Ensure Sitemap is provided).")
+
+    # Custom
+    with tabs[12]:
+        st.subheader("Custom Extraction")
+        st.dataframe(df[['url', 'custom_extraction']], use_container_width=True)
+
+    # 3. DOWNLOAD CENTER (SEPARATE BUTTONS)
+    st.markdown("### 📥 Download Reports")
     
-    ec1, ec2, ec3, ec4 = st.columns(4)
+    # Helper to safe download
+    def convert_df(dataframe):
+        return dataframe.to_csv(index=False).encode('utf-8')
+
+    d1, d2, d3, d4 = st.columns(4)
     
-    # Preparing DataFrames for Export
-    # Internal Links
-    df_int = pd.DataFrame()
-    if 'internal_links' in df.columns:
-        base = df[['url', 'internal_links']].copy().rename(columns={'url':'Source'})
-        exp = base.explode('internal_links').dropna()
-        if not exp.empty:
-            norm = pd.json_normalize(exp['internal_links'])
-            df_int = pd.concat([exp['Source'].reset_index(drop=True), norm.reset_index(drop=True)], axis=1)
-
-    # External
-    ext_list = []
-    for _, r in df.iterrows():
-        for l in r.get('external_links', []):
-            ext_list.append({'Source': r['url'], 'Dest': l['url'], 'Anchor': l['anchor_text']})
-    df_ext = pd.DataFrame(ext_list)
-
-    # Images
-    img_list = []
-    for _, r in df.iterrows():
-        for i in r.get('images', []):
-            img_list.append({'Source': r['url'], 'Img': i['src'], 'Alt': i['alt']})
-    df_img = pd.DataFrame(img_list)
-
-    # Button Grid
-    with ec1:
-        st.download_button("🔗 Internal Links", df_int.to_csv(index=False).encode('utf-8'), "internal_links.csv", "text/csv")
-        st.download_button("📄 Meta Desc", df[['url','meta_description']].to_csv(index=False).encode('utf-8'), "meta.csv", "text/csv")
-        st.download_button("🎯 Canonicals", df[['url','canonical_url']].to_csv(index=False).encode('utf-8'), "canonicals.csv", "text/csv")
-        st.download_button("👻 Orphans", pd.DataFrame(orphans, columns=['Orphan']).to_csv(index=False).encode('utf-8'), "orphans.csv", "text/csv")
-
-    with ec2:
-        st.download_button("🌐 External Links", df_ext.to_csv(index=False).encode('utf-8'), "external_links.csv", "text/csv")
-        st.download_button("🏷️ Headers", df[['url','h1_tags','h2_tags']].to_csv(index=False).encode('utf-8'), "headers.csv", "text/csv")
-        st.download_button("📱 Social Tags", df[['url','og_title','twitter_title']].to_csv(index=False).encode('utf-8'), "social.csv", "text/csv")
-        st.download_button("⛏️ Custom Data", df[['url','custom_extraction']].to_csv(index=False).encode('utf-8'), "custom.csv", "text/csv")
-
-    with ec3:
-        st.download_button("🖼️ Images", df_img.to_csv(index=False).encode('utf-8'), "images.csv", "text/csv")
-        st.download_button("🔄 Redirects", df[df['redirect_count']>0].to_csv(index=False).encode('utf-8'), "redirects.csv", "text/csv")
-        st.download_button("🚀 Performance", df[['url','response_time','word_count']].to_csv(index=False).encode('utf-8'), "performance.csv", "text/csv")
+    with d1:
+        # Re-generate internal link DF for download
+        l_rows = []
+        for _, r in df.iterrows():
+            for l in r.get('internal_links', []):
+                l_rows.append({'Source': r['url'], 'Dest': l['url'], 'Anchor': l['anchor_text']})
         
-    with ec4:
-        st.download_button("📝 Titles", df[['url','title']].to_csv(index=False).encode('utf-8'), "titles.csv", "text/csv")
-        st.download_button("📊 Status Codes", df[['url','status_code']].to_csv(index=False).encode('utf-8'), "status.csv", "text/csv")
-        # Graph is visual, skipping CSV
-        if st.session_state.psi_results:
-            st.download_button("⚡ Speed (PSI)", pd.DataFrame(st.session_state.psi_results).to_csv(index=False).encode('utf-8'), "psi.csv", "text/csv")
-        else:
-            st.button("⚡ Speed (Run Test First)", disabled=True)
+        st.download_button("🔗 Internal Links", convert_df(pd.DataFrame(l_rows)), "internal_links.csv", "text/csv")
+        st.download_button("📝 Titles", convert_df(df[['url', 'title', 'title_length']]), "titles.csv", "text/csv")
+        st.download_button("🎯 Canonicals", convert_df(df[['url', 'canonical_url']]), "canonicals.csv", "text/csv")
+        st.download_button("👻 Orphans", convert_df(pd.DataFrame(orphans, columns=['Url'])), "orphans.csv", "text/csv")
 
+    with d2:
+        # Re-generate external DF
+        e_rows = []
+        for _, r in df.iterrows():
+            for l in r.get('external_links', []):
+                e_rows.append({'Source': r['url'], 'Dest': l['url'], 'Anchor': l['anchor_text']})
+                
+        st.download_button("🌐 External Links", convert_df(pd.DataFrame(e_rows)), "external.csv", "text/csv")
+        st.download_button("📄 Meta Desc", convert_df(df[['url', 'meta_description']]), "meta.csv", "text/csv")
+        st.download_button("📱 Social", convert_df(df[['url', 'og_title']]), "social.csv", "text/csv")
+        st.download_button("⛏️ Custom Data", convert_df(df[['url', 'custom_extraction']]), "custom.csv", "text/csv")
+
+    with d3:
+        # Re-generate Image DF
+        i_rows = []
+        for _, r in df.iterrows():
+            for i in r.get('images', []):
+                i_rows.append({'Source': r['url'], 'Img': i['src'], 'Alt': i['alt']})
+                
+        st.download_button("🖼️ Images", convert_df(pd.DataFrame(i_rows)), "images.csv", "text/csv")
+        st.download_button("🏷️ Headers", convert_df(df[['url', 'h1_tags', 'h2_tags']]), "headers.csv", "text/csv")
+        st.download_button("🚀 Performance", convert_df(df[['url', 'response_time', 'word_count']]), "perf.csv", "text/csv")
+
+    with d4:
+        st.download_button("🔄 Redirects", convert_df(df[df['redirect_count']>0]), "redirects.csv", "text/csv")
+        st.download_button("📊 Status Codes", convert_df(df[['url', 'status_code']]), "status.csv", "text/csv")
+        st.download_button("🏗️ Schema", convert_df(df[['url', 'schema_types', 'schema_validity']]), "schema.csv", "text/csv")
+        
     st.markdown("---")
-    st.download_button("📥 DOWNLOAD COMPLETE DATASET", df.to_csv(index=False).encode('utf-8'), "full_crawl_complete.csv", "text/csv", use_container_width=True)
+    st.download_button("📦 DOWNLOAD FULL RAW DATASET", convert_df(df), "full_crawl_data.csv", "text/csv", use_container_width=True)
 
 else:
-    st.info("Ready to crawl.")
+    st.info("Ready. Configure settings in the sidebar and click 'Run'.")
