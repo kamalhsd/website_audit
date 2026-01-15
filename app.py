@@ -34,6 +34,8 @@ if 'stop_crawling' not in st.session_state:
     st.session_state.stop_crawling = False
 if 'sitemap_urls_set' not in st.session_state:
     st.session_state.sitemap_urls_set = set()
+if 'psi_results' not in st.session_state:
+    st.session_state.psi_results = {}
 
 class UltraFrogCrawler:
     def __init__(self, max_urls=100000, ignore_robots=False, crawl_scope="subfolder", custom_selector=None, link_selector=None):
@@ -170,6 +172,14 @@ class UltraFrogCrawler:
             meta_robots = soup.find('meta', attrs={'name': 'robots'})
             robots_content = meta_robots.get('content', '') if meta_robots else ""
             
+            # --- INDEXING TAG CHECK ---
+            # Check specifically for 'noindex, follow'
+            is_noindex_follow = False
+            if robots_content:
+                content_lower = robots_content.lower()
+                if 'noindex' in content_lower and 'follow' in content_lower:
+                    is_noindex_follow = True
+
             # Header tags
             h1_tags = [self.smart_clean(h1.get_text()) for h1 in soup.find_all('h1')]
             h2_tags = [self.smart_clean(h2.get_text()) for h2 in soup.find_all('h2')]
@@ -238,7 +248,6 @@ class UltraFrogCrawler:
                 })
             
             # Schema & Social tags extraction...
-            # (Keeping existing logic abbreviated for length, but it's fully functional)
             og_title = soup.find('meta', attrs={'property': 'og:title'})
             og_desc = soup.find('meta', attrs={'property': 'og:description'})
             og_image = soup.find('meta', attrs={'property': 'og:image'})
@@ -246,21 +255,31 @@ class UltraFrogCrawler:
             twitter_desc = soup.find('meta', attrs={'name': 'twitter:description'})
             twitter_image = soup.find('meta', attrs={'name': 'twitter:image'})
             
-            # Schema
+            # --- SCHEMA VALIDATOR ---
             scripts = soup.find_all('script', type='application/ld+json')
             schema_types = []
-            for script in scripts:
-                try:
-                    if script.string:
-                        schema_data = json.loads(script.string)
-                        if isinstance(schema_data, dict) and '@type' in schema_data:
-                            schema_types.append(schema_data['@type'])
-                        elif isinstance(schema_data, list):
-                            for item in schema_data:
-                                if isinstance(item, dict) and '@type' in item:
-                                    schema_types.append(item['@type'])
-                except:
-                    pass
+            schema_validity = "No Schema"
+            schema_errors = []
+            
+            if scripts:
+                schema_validity = "Valid" # Assume valid until proven otherwise
+                for script in scripts:
+                    try:
+                        if script.string:
+                            schema_data = json.loads(script.string)
+                            # Type extraction
+                            if isinstance(schema_data, dict) and '@type' in schema_data:
+                                schema_types.append(schema_data['@type'])
+                            elif isinstance(schema_data, list):
+                                for item in schema_data:
+                                    if isinstance(item, dict) and '@type' in item:
+                                        schema_types.append(item['@type'])
+                    except json.JSONDecodeError as e:
+                        schema_validity = "Invalid JSON"
+                        schema_errors.append(str(e))
+                    except Exception as e:
+                        schema_validity = "Error"
+                        schema_errors.append(str(e))
 
             # Performance
             css_files = len(soup.find_all('link', attrs={'rel': 'stylesheet'}))
@@ -289,6 +308,7 @@ class UltraFrogCrawler:
                 'meta_desc_length': len(meta_desc_text),
                 'canonical_url': canonical_url,
                 'meta_robots': robots_content,
+                'is_noindex_follow': is_noindex_follow, # <--- Added Specific Check
                 'h1_tags': '; '.join(h1_tags),
                 'h1_count': len(h1_tags),
                 'h2_tags': '; '.join(h2_tags),
@@ -309,6 +329,8 @@ class UltraFrogCrawler:
                 'images_without_alt': len([img for img in images if not img['alt']]),
                 'schema_types': '; '.join(schema_types),
                 'schema_count': len(schema_types),
+                'schema_validity': schema_validity, # <--- Added Schema Validity
+                'schema_errors': '; '.join(schema_errors), # <--- Added Schema Errors
                 'redirect_chain': redirect_chain,
                 'redirect_count': len(redirect_chain),
                 'css_files': css_files,
@@ -331,12 +353,13 @@ class UltraFrogCrawler:
             return {
                 'url': url, 'original_url': url, 'status_code': 0, 'error': str(e),
                 'title': '', 'title_length': 0, 'meta_description': '', 'meta_desc_length': 0,
-                'canonical_url': '', 'meta_robots': '', 'h1_tags': '', 'h1_count': 0,
+                'canonical_url': '', 'meta_robots': '', 'is_noindex_follow': False,
+                'h1_tags': '', 'h1_count': 0,
                 'h2_tags': '', 'h2_count': 0, 'h3_tags': '', 'h3_count': 0,
                 'h4_tags': '', 'h4_count': 0, 'word_count': 0, 'response_time': 0,
                 'content_length': 0, 'internal_links_count': 0, 'external_links_count': 0,
                 'internal_links': [], 'external_links': [], 'images': [], 'image_count': 0,
-                'images_without_alt': 0, 'schema_types': '', 'schema_count': 0,
+                'images_without_alt': 0, 'schema_types': '', 'schema_count': 0, 'schema_validity': 'Error', 'schema_errors': '',
                 'redirect_chain': [], 'redirect_count': 0, 'css_files': 0, 'js_files': 0,
                 'og_title': '', 'og_description': '', 'og_image': '',
                 'twitter_title': '', 'twitter_description': '', 'twitter_image': '',
@@ -350,6 +373,34 @@ class UltraFrogCrawler:
         if 'noindex' in robots_content.lower():
             return 'Non-Indexable'
         return 'Indexable'
+
+# --- PSI HELPER FUNCTION ---
+def run_psi_test(url, api_key):
+    if not api_key:
+        return {"error": "No API Key Provided"}
+    
+    api_url = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={url}&strategy=mobile&key={api_key}"
+    try:
+        response = requests.get(api_url)
+        data = response.json()
+        
+        if "error" in data:
+            return {"error": data["error"]["message"]}
+            
+        lh_result = data["lighthouseResult"]
+        score = lh_result["categories"]["performance"]["score"] * 100
+        
+        metrics = {
+            "Score": score,
+            "LCP": lh_result["audits"]["largest-contentful-paint"]["displayValue"],
+            "FCP": lh_result["audits"]["first-contentful-paint"]["displayValue"],
+            "CLS": lh_result["audits"]["cumulative-layout-shift"]["displayValue"],
+            "INP": lh_result["audits"].get("interaction-to-next-paint", {}).get("displayValue", "N/A"),
+            "TTI": lh_result["audits"]["interactive"]["displayValue"]
+        }
+        return metrics
+    except Exception as e:
+        return {"error": str(e)}
 
 # --- CRAWLER HANDLERS ---
 def crawl_website(start_url, max_urls, crawl_scope, progress_container, ignore_robots=False, custom_selector=None, link_selector=None):
@@ -507,6 +558,10 @@ with st.sidebar:
     st.subheader("🎯 Link Scope (Optional)")
     link_selector = st.text_input("Link Area Selector", placeholder=".sidebar, #footer, .content", help="Only extract links found inside this element")
     
+    st.markdown("---")
+    st.subheader("⚡ PageSpeed Insights")
+    psi_api_key = st.text_input("Google API Key (Optional)", type="password", help="Required for Speed Tab")
+
     col1, col2 = st.columns(2)
     with col1:
         start_btn = st.button("🚀 Start Crawl", type="primary", disabled=st.session_state.crawling)
@@ -552,6 +607,7 @@ with st.sidebar:
     if st.button("🗑️ Clear All Data"):
         st.session_state.crawl_data = []
         st.session_state.sitemap_urls_set = set()
+        st.session_state.psi_results = {}
         st.rerun()
 
 # Main content
@@ -607,9 +663,10 @@ elif st.session_state.crawl_data:
         st.metric("👻 Orphans", len(orphans))
     
     # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15, tab16 = st.tabs([
         "🔗 Internal Links", "🌐 External", "🖼️ Images", "📝 Titles", "📄 Meta Desc", "🏷️ Headers", 
-        "🔄 Redirects", "📊 Status", "🎯 Canonicals", "📱 Social", "🚀 Performance", "🕸️ Graph", "👻 Orphans", "⛏️ Custom Data"
+        "🔄 Redirects", "📊 Status", "🎯 Canonicals", "📱 Social", "🚀 Performance", "🕸️ Graph", "👻 Orphans", "⛏️ Custom Data",
+        "⚡ Speed (PSI)", "🏗️ Schema"
     ])
     
     # TAB 1: INTERNAL LINKS
@@ -799,6 +856,70 @@ elif st.session_state.crawl_data:
             st.download_button("📥 Download Custom Data", csv, "custom_data.csv", "text/csv")
         else:
             st.info("Enter a CSS Selector in the sidebar to extract custom data.")
+
+    # TAB 15: SPEED (PSI)
+    with tab15:
+        st.subheader("⚡ Google PageSpeed Insights (PSI)")
+        st.info("Enter your Google PageSpeed API Key in the Sidebar to use this feature.")
+        
+        if psi_api_key:
+            # Dropdown to select which URLs to test
+            urls_to_test = st.multiselect("Select URLs to Test (Max 5 recommended)", df['url'].head(20).tolist())
+            
+            if st.button("🏃 Run PageSpeed Test"):
+                if not urls_to_test:
+                    st.warning("Please select at least one URL.")
+                else:
+                    progress_psi = st.progress(0)
+                    results = []
+                    
+                    for i, u in enumerate(urls_to_test):
+                        res = run_psi_test(u, psi_api_key)
+                        res['url'] = u
+                        results.append(res)
+                        progress_psi.progress((i + 1) / len(urls_to_test))
+                    
+                    st.session_state.psi_results = results
+            
+            # Display Results
+            if st.session_state.psi_results:
+                psi_df = pd.DataFrame(st.session_state.psi_results)
+                # Reorder columns if they exist
+                cols = ['url', 'Score', 'LCP', 'FCP', 'CLS', 'INP', 'TTI']
+                available_cols = [c for c in cols if c in psi_df.columns]
+                st.dataframe(psi_df[available_cols], use_container_width=True)
+                
+                csv_psi = psi_df.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Download PSI Report", csv_psi, "psi_report.csv", "text/csv")
+        else:
+            st.warning("⚠️ PSI API Key is missing. Please add it in the sidebar.")
+
+    # TAB 16: SCHEMA VALIDATOR
+    with tab16:
+        st.subheader("🏗️ Schema Validator & Indexing")
+        
+        # Schema Table
+        st.write("### Schema Markup Status")
+        schema_df = df[['url', 'schema_types', 'schema_validity', 'schema_errors']].copy()
+        
+        # Color code validity
+        def color_schema(val):
+            color = 'red' if 'Error' in val or 'Invalid' in val else 'green' if val == 'Valid' else 'orange'
+            return f'color: {color}'
+        
+        st.dataframe(schema_df.style.applymap(color_schema, subset=['schema_validity']), use_container_width=True)
+        
+        st.write("### 🤖 Indexing Check (noindex, follow)")
+        st.info("Checks specifically for: meta name='robots' content='noindex, follow'")
+        
+        # Filter for the specific tag
+        noindex_follow_df = df[df['is_noindex_follow'] == True][['url', 'meta_robots']]
+        
+        if not noindex_follow_df.empty:
+            st.warning(f"⚠️ Found {len(noindex_follow_df)} pages with 'noindex, follow'")
+            st.dataframe(noindex_follow_df, use_container_width=True)
+        else:
+            st.success("✅ No pages found with 'noindex, follow' directive.")
 
     # Quick Download All
     st.markdown("---")
