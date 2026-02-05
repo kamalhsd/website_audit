@@ -10,26 +10,18 @@ import json
 from datetime import datetime
 import xml.etree.ElementTree as ET
 from urllib.robotparser import RobotFileParser
-import networkx as nx
 import streamlit.components.v1 as components
 import html
 import re
-import csv
 import os
 import threading
-
-# Try importing pyvis for graphing, handle if missing
-try:
-    from pyvis.network import Network
-    HAS_PYVIS = True
-except ImportError:
-    HAS_PYVIS = False
+import sqlite3 # <--- ADDED THIS
 
 # Page config
 st.set_page_config(page_title="Battersea Crawler", layout="wide", page_icon="🐸")
 
 # --- GLOBAL CONFIG ---
-CSV_FILE = "battersea_data.csv"
+DB_FILE = "battersea_data.db" # <--- CHANGED FROM CSV TO DB
 write_lock = threading.Lock()
 
 # Initialize session state
@@ -47,35 +39,86 @@ if 'total_crawled_count' not in st.session_state:
     st.session_state.total_crawled_count = 0
 if 'storage_mode' not in st.session_state:
     st.session_state.storage_mode = "RAM"
+if 'img_size_cache' not in st.session_state:
+    st.session_state.img_size_cache = {}
+if 'link_status_cache' not in st.session_state:
+    st.session_state.link_status_cache = {}
 
-# --- CSV HELPER FUNCTIONS ---
-def init_csv():
-    """Initializes the CSV file with headers."""
-    headers = [
-        'url', 'original_url', 'status_code', 'title', 'title_length', 
-        'meta_description', 'meta_desc_length', 'canonical_url', 'meta_robots', 
-        'is_noindex_follow', 'is_noindex_nofollow', 'h1_tags', 'h1_count', 
-        'h2_tags', 'h2_count', 'h3_tags', 'h3_count', 'h4_tags', 'h4_count', 
-        'word_count', 'response_time', 'content_length', 'internal_links_count', 
-        'external_links_count', 'internal_links', 'external_links', 'images', 
-        'image_count', 'images_without_alt', 'schema_types', 'schema_dump', 
-        'schema_count', 'schema_validity', 'schema_errors', 'redirect_chain', 
-        'redirect_count', 'css_files', 'js_files', 'og_title', 'og_description', 
-        'twitter_title', 'custom_extraction', 'indexability', 'crawl_timestamp', 'error'
-    ]
-    with open(CSV_FILE, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=headers)
-        writer.writeheader()
+# --- SQLITE HELPER FUNCTIONS (REPLACED CSV FUNCTIONS) ---
+def init_db():
+    """Initializes the SQLite database with the pages table."""
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    c = conn.cursor()
+    # Create table if not exists
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS pages (
+            url TEXT PRIMARY KEY,
+            original_url TEXT,
+            status_code INTEGER,
+            title TEXT,
+            title_length INTEGER,
+            meta_description TEXT,
+            meta_desc_length INTEGER,
+            canonical_url TEXT,
+            meta_robots TEXT,
+            is_noindex_follow BOOLEAN,
+            is_noindex_nofollow BOOLEAN,
+            h1_tags TEXT,
+            h1_count INTEGER,
+            h2_tags TEXT,
+            h2_count INTEGER,
+            h3_tags TEXT,
+            h3_count INTEGER,
+            h4_tags TEXT,
+            h4_count INTEGER,
+            word_count INTEGER,
+            response_time REAL,
+            content_length INTEGER,
+            internal_links_count INTEGER,
+            external_links_count INTEGER,
+            internal_links TEXT,
+            external_links TEXT,
+            images TEXT,
+            image_count INTEGER,
+            images_without_alt INTEGER,
+            schema_types TEXT,
+            schema_dump TEXT,
+            schema_count INTEGER,
+            schema_validity TEXT,
+            schema_errors TEXT,
+            redirect_chain TEXT,
+            redirect_count INTEGER,
+            css_files INTEGER,
+            js_files INTEGER,
+            og_title TEXT,
+            og_description TEXT,
+            twitter_title TEXT,
+            custom_extraction TEXT,
+            indexability TEXT,
+            crawl_timestamp TEXT,
+            error TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-def save_row_to_csv(data):
-    """Writes a single row of data to the CSV file safely."""
+def save_row_to_db(data):
+    """Writes a single row of data to the SQLite DB safely."""
     row_data = data.copy()
-    # Serialize lists/dicts to JSON for CSV storage
+    
+    # Serialize lists/dicts to JSON for SQLite storage (TEXT columns)
     for key in ['internal_links', 'external_links', 'images', 'redirect_chain', 'schema_dump']:
         if key in row_data:
             row_data[key] = json.dumps(row_data[key])
     
-    headers = [
+    # Convert Booleans to Integers (SQLite has no native Boolean)
+    if 'is_noindex_follow' in row_data:
+        row_data['is_noindex_follow'] = 1 if row_data['is_noindex_follow'] else 0
+    if 'is_noindex_nofollow' in row_data:
+        row_data['is_noindex_nofollow'] = 1 if row_data['is_noindex_nofollow'] else 0
+
+    # Define columns explicitly to match the CREATE TABLE statement
+    columns = [
         'url', 'original_url', 'status_code', 'title', 'title_length', 
         'meta_description', 'meta_desc_length', 'canonical_url', 'meta_robots', 
         'is_noindex_follow', 'is_noindex_nofollow', 'h1_tags', 'h1_count', 
@@ -88,11 +131,25 @@ def save_row_to_csv(data):
         'twitter_title', 'custom_extraction', 'indexability', 'crawl_timestamp', 'error'
     ]
     
+    # Filter row_data to only include keys that are in our columns list
+    filtered_data = {k: row_data.get(k) for k in columns}
+    
+    placeholders = ', '.join(['?'] * len(columns))
+    col_names = ', '.join(columns)
+    sql = f"INSERT OR REPLACE INTO pages ({col_names}) VALUES ({placeholders})"
+    
     with write_lock:
-        with open(CSV_FILE, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=headers)
-            writer.writerow({k: v for k, v in row_data.items() if k in headers})
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        try:
+            conn.execute(sql, list(filtered_data.values()))
+            conn.commit()
+        except Exception as e:
+            # Silently fail or log error to avoid stopping crawl
+            print(f"DB Error: {e}")
+        finally:
+            conn.close()
 
+# --- CRAWLER CLASS (UNCHANGED) ---
 class UltraFrogCrawler:
     def __init__(self, max_urls=100000, ignore_robots=False, crawl_scope="subfolder", custom_selector=None, link_selector=None):
         self.max_urls = max_urls
@@ -217,6 +274,21 @@ class UltraFrogCrawler:
             pass
         return 0
 
+    # --- RECURSIVE SCHEMA EXTRACTOR ---
+    def extract_recursive_types(self, data, types_list):
+        """Recursively finds all @type values in nested JSON data."""
+        if isinstance(data, dict):
+            if '@type' in data:
+                if isinstance(data['@type'], list):
+                    types_list.extend(data['@type'])
+                else:
+                    types_list.append(data['@type'])
+            for key, value in data.items():
+                self.extract_recursive_types(value, types_list)
+        elif isinstance(data, list):
+            for item in data:
+                self.extract_recursive_types(item, types_list)
+
     def extract_page_data(self, url):
         try:
             response = self.session.get(url, timeout=10, allow_redirects=True)
@@ -302,8 +374,8 @@ class UltraFrogCrawler:
             images = []
             for img in soup.find_all('img'):
                 img_src = urljoin(url, img.get('src', ''))
+                # Default size 0, will be updated via button
                 file_size = 0 
-                # file_size = self.get_file_size(img_src) # Enable if needed
                 images.append({
                     'src': img_src,
                     'alt': self.smart_clean(img.get('alt', '')),
@@ -313,7 +385,7 @@ class UltraFrogCrawler:
                     'size_kb': file_size
                 })
             
-            # Schema
+            # Schema (Recursive)
             scripts = soup.find_all('script', type='application/ld+json')
             schema_types = []
             schema_dump = [] 
@@ -327,12 +399,8 @@ class UltraFrogCrawler:
                         if script.string:
                             data = json.loads(script.string)
                             schema_dump.append(data)
-                            if isinstance(data, dict) and '@type' in data:
-                                schema_types.append(data['@type'])
-                            elif isinstance(data, list):
-                                for item in data:
-                                    if isinstance(item, dict) and '@type' in item:
-                                        schema_types.append(item['@type'])
+                            # Recursive extraction
+                            self.extract_recursive_types(data, schema_types)
                     except json.JSONDecodeError as e:
                         schema_validity = "Invalid JSON"
                         schema_errors.append(str(e))
@@ -370,7 +438,7 @@ class UltraFrogCrawler:
                 'internal_links': internal_links, 'external_links': external_links,
                 'images': images, 'image_count': len(images),
                 'images_without_alt': len([img for img in images if not img['alt']]),
-                'schema_types': '; '.join(schema_types), 'schema_dump': schema_dump, 
+                'schema_types': '; '.join(list(set(schema_types))), 'schema_dump': schema_dump,
                 'schema_count': len(schema_types), 'schema_validity': schema_validity,
                 'schema_errors': '; '.join(schema_errors), 'redirect_chain': redirect_chain,
                 'redirect_count': len(redirect_chain), 'css_files': css_files, 'js_files': js_files,
@@ -379,7 +447,7 @@ class UltraFrogCrawler:
                 'twitter_title': soup.find('meta', attrs={'name': 'twitter:title'}).get('content', '') if soup.find('meta', attrs={'name': 'twitter:title'}) else '',
                 'custom_extraction': custom_data,
                 'indexability': self.get_indexability_status(response.status_code, robots_content),
-                'crawl_timestamp': datetime.now().isoformat()
+                'crawl_timestamp': datetime.now().isoformat(), 'error': ''
             }
         except Exception as e:
             return {
@@ -405,32 +473,39 @@ class UltraFrogCrawler:
         return 'Indexable'
 
 # --- PSI HELPER FUNCTION ---
-def run_psi_test(url, api_key):
+def run_psi_test(url, api_key, strategy="mobile"):
     if not api_key: return {"error": "No API Key Provided"}
-    api_url = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={url}&strategy=mobile&key={api_key}"
+    
+    # Dynamic strategy parameter
+    api_url = f"https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url={url}&strategy={strategy}&key={api_key}"
+    
     try:
         response = requests.get(api_url)
         data = response.json()
-        if "error" in data: return {"error": data["error"]["message"]}
+        
+        if "error" in data: 
+            return {"error": data["error"]["message"]}
+            
         lh_result = data["lighthouseResult"]
         return {
-            "Score": lh_result["categories"]["performance"]["score"] * 100,
+            "Score": int(lh_result["categories"]["performance"]["score"] * 100),
             "LCP": lh_result["audits"]["largest-contentful-paint"]["displayValue"],
             "FCP": lh_result["audits"]["first-contentful-paint"]["displayValue"],
             "CLS": lh_result["audits"]["cumulative-layout-shift"]["displayValue"],
             "INP": lh_result["audits"].get("interaction-to-next-paint", {}).get("displayValue", "N/A"),
             "TTI": lh_result["audits"]["interactive"]["displayValue"]
         }
-    except Exception as e: return {"error": str(e)}
+    except Exception as e: 
+        return {"error": str(e)}
 
-# --- CRAWLER HANDLERS (HYBRID RAM/CSV) ---
+# --- CRAWLER HANDLERS (HYBRID RAM/SQLITE) ---
 def crawl_website(start_url, max_urls, crawl_scope, progress_container, ignore_robots=False, custom_selector=None, link_selector=None, storage="RAM"):
     crawler = UltraFrogCrawler(max_urls, ignore_robots, crawl_scope, custom_selector, link_selector)
     crawler.set_base_url(start_url)
     
     # Initialize Storage
-    if storage == "CSV":
-        init_csv()
+    if storage == "SQLite":
+        init_db()
     else:
         st.session_state.crawl_data = [] # Clear RAM if starting new RAM crawl
     
@@ -466,12 +541,10 @@ def crawl_website(start_url, max_urls, crawl_scope, progress_container, ignore_r
                 try:
                     page_data = future.result(timeout=12)
                     
-                    # --- HYBRID STORAGE LOGIC ---
-                    if storage == "CSV":
-                        save_row_to_csv(page_data)
+                    if storage == "SQLite":
+                        save_row_to_db(page_data)
                     else:
                         st.session_state.crawl_data.append(page_data)
-                    # ----------------------------
 
                     st.session_state.total_crawled_count += 1
                     
@@ -491,8 +564,8 @@ def crawl_website(start_url, max_urls, crawl_scope, progress_container, ignore_r
 def crawl_from_list(url_list, progress_container, ignore_robots=False, custom_selector=None, link_selector=None, storage="RAM"):
     crawler = UltraFrogCrawler(len(url_list), ignore_robots, custom_selector=custom_selector, link_selector=link_selector)
     
-    if storage == "CSV":
-        init_csv()
+    if storage == "SQLite":
+        init_db()
     else:
         st.session_state.crawl_data = []
 
@@ -517,8 +590,8 @@ def crawl_from_list(url_list, progress_container, ignore_robots=False, custom_se
                 try:
                     page_data = future.result(timeout=12)
                     
-                    if storage == "CSV":
-                        save_row_to_csv(page_data)
+                    if storage == "SQLite":
+                        save_row_to_db(page_data)
                     else:
                         st.session_state.crawl_data.append(page_data)
 
@@ -567,12 +640,12 @@ st.markdown("""
 with st.sidebar:
     st.header("🔧 Crawl Configuration")
     
-    # --- NEW STORAGE SELECTOR ---
+    # --- STORAGE SELECTOR (UPDATED) ---
     storage_option = st.radio(
         "💾 Storage Mode", 
-        ["RAM (Fast, <10k URLs)", "CSV Stream (Unlimited)"], 
+        ["RAM (Fast, <10k URLs)", "SQLite (Unlimited)"], # <--- CHANGED LABEL
         index=0,
-        help="Use RAM for speed on small sites. Use CSV for 100k+ URLs to prevent crashing."
+        help="Use RAM for speed on small sites. Use SQLite for 100k+ URLs to prevent crashing."
     )
     # ----------------------------
 
@@ -627,14 +700,16 @@ with st.sidebar:
         url_list = []
         
         # Set storage mode logic
-        if "CSV" in storage_option:
-            st.session_state.storage_mode = "CSV"
+        if "SQLite" in storage_option: # <--- CHANGED LOGIC
+            st.session_state.storage_mode = "SQLite"
             # Clear old RAM data to free memory
             st.session_state.crawl_data = [] 
+            # Remove old DB to prevent confusion
+            if os.path.exists(DB_FILE): os.remove(DB_FILE)
         else:
             st.session_state.storage_mode = "RAM"
-            # Remove old CSV to prevent confusion
-            if os.path.exists(CSV_FILE): os.remove(CSV_FILE)
+            # Remove old DB to prevent confusion
+            if os.path.exists(DB_FILE): os.remove(DB_FILE)
 
         if crawl_mode == "🕷️ Spider Crawl (Follow Links)" and start_url:
             valid_input = True
@@ -664,7 +739,7 @@ with st.sidebar:
     
     if st.button("🗑️ Clear All Data"):
         st.session_state.crawl_data = []
-        if os.path.exists(CSV_FILE): os.remove(CSV_FILE)
+        if os.path.exists(DB_FILE): os.remove(DB_FILE)
         st.session_state.sitemap_urls_set = set()
         st.session_state.psi_results = {}
         st.rerun()
@@ -706,33 +781,43 @@ if st.session_state.crawling:
         st.session_state.crawling = False
 
 # --- RESULT LOADING LOGIC ---
-# Determine which dataset to load (RAM or CSV)
+# Determine which dataset to load (RAM or SQLite)
 df = None
 has_data = False
 
 if st.session_state.storage_mode == "RAM" and st.session_state.crawl_data:
     df = pd.DataFrame(st.session_state.crawl_data)
     has_data = True
-elif st.session_state.storage_mode == "CSV" and os.path.exists(CSV_FILE):
-    # For Dashboard performance, only load first 20k rows if in CSV mode
-    df = pd.read_csv(CSV_FILE, nrows=20000) 
-    
-    # Process complex columns for CSV data so they work with tabs
-    for col in ['internal_links', 'external_links', 'images', 'redirect_chain', 'schema_dump']:
-        if col in df.columns:
-            df[col] = df[col].apply(lambda x: json.loads(x) if isinstance(x, str) else [])
-    
-    has_data = True
-    total_in_csv = sum(1 for _ in open(CSV_FILE, 'r', encoding='utf-8')) - 1
-    if total_in_csv > 20000:
-        st.warning(f"⚠️ Displaying first 20,000 URLs for performance. Download the CSV below for the full dataset ({total_in_csv} URLs).")
+elif st.session_state.storage_mode == "SQLite" and os.path.exists(DB_FILE):
+    # For Dashboard performance, only load first 20k rows if in SQLite mode
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    try:
+        # Load data efficiently using SQL
+        df = pd.read_sql("SELECT * FROM pages LIMIT 20000", conn)
+        
+        # Process complex columns so they work with tabs (Deserialize JSON)
+        for col in ['internal_links', 'external_links', 'images', 'redirect_chain', 'schema_dump']:
+            if col in df.columns:
+                df[col] = df[col].apply(lambda x: json.loads(x) if isinstance(x, str) else [])
+        
+        has_data = True
+        # Count total rows for metric
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM pages")
+        total_in_db = cursor.fetchone()[0]
+        
+        if total_in_db > 20000:
+            st.warning(f"⚠️ Displaying first 20,000 URLs for performance. Download the DB below for the full dataset ({total_in_db} URLs).")
+        conn.close()
+    except Exception as e:
+        st.error(f"Error reading DB: {e}")
 
 
 if has_data and df is not None:
     # Summary stats
     st.header("📊 Battersea Analysis Dashboard")
     col1, col2, col3, col4, col5, col6 = st.columns(6)
-    with col1: st.metric("Total URLs", len(df) if st.session_state.storage_mode == "RAM" else total_in_csv)
+    with col1: st.metric("Total URLs", len(df) if st.session_state.storage_mode == "RAM" else total_in_db)
     with col2: st.metric("✅ Indexable", len(df[df['indexability'] == 'Indexable']))
     with col3: st.metric("❌ Non-Indexable", len(df[df['indexability'] == 'Non-Indexable']))
     with col4: st.metric("🔄 Redirects", len(df[df['redirect_count'] > 0]))
@@ -743,9 +828,9 @@ if has_data and df is not None:
         st.metric("👻 Orphans", len(orphans))
     
     # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13, tab14, tab15, tab16 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab13, tab14, tab15, tab16 = st.tabs([
         "🔗 Internal Links", "🌐 External", "🖼️ Images", "📝 Titles", "📄 Meta Desc", "🏷️ Headers", 
-        "🔄 Redirects", "📊 Status", "🎯 Canonicals", "📱 Social", "🚀 Performance", "🕸️ Graph", "👻 Orphans", "⛏️ Custom Data",
+        "🔄 Redirects", "📊 Status", "🎯 Canonicals", "📱 Social", "🚀 Performance", "👻 Orphans", "⛏️ Custom Data",
         "⚡ Speed (PSI)", "🏗️ Schema"
     ])
     
@@ -777,15 +862,68 @@ if has_data and df is not None:
                 final_links = final_links[['Source URL', 'url', 'anchor_text', 'rel_status', 'target', 'placement', 'css_path']]
                 final_links.columns = ['Source URL', 'Destination URL', 'Anchor Text', 'Link Type', 'Target', 'Placement', 'CSS Path']
                 
+                # 1. Merge with status from the main crawl (pages we actually visited)
                 final_links = pd.merge(final_links, status_lookup, on='Destination URL', how='left')
+                
+                # 2. Apply Cached Statuses (for links checked via button)
+                if 'link_status_cache' not in st.session_state:
+                    st.session_state.link_status_cache = {}
+                
+                # Fill "NaN" status from cache if available
+                final_links['Status Code'] = final_links.apply(
+                    lambda x: st.session_state.link_status_cache.get(x['Destination URL'], x['Status Code']), axis=1
+                )
+                
+                # 3. Fill remaining with "Not Crawled"
                 final_links['Status Code'] = final_links['Status Code'].fillna('Not Crawled').astype(str)
+
+                # --- BUTTON: CHECK UNCRAWLED STATUS ---
+                col_btn, col_info = st.columns([1, 3])
+                
+                # Identify URLs that are still "Not Crawled"
+                uncrawled_list = final_links[final_links['Status Code'] == 'Not Crawled']['Destination URL'].unique().tolist()
+                
+                if col_btn.button("🔍 Check Internal Statuses"):
+                    if uncrawled_list:
+                        progress_bar = col_info.progress(0)
+                        status_text = col_info.empty()
+                        
+                        temp_crawler = UltraFrogCrawler()
+                        results = {}
+                        
+                        def fetch_status(url):
+                            try:
+                                # Try HEAD first for speed
+                                r = temp_crawler.session.head(url, timeout=5, allow_redirects=True)
+                                if r.status_code == 405: # Some servers block HEAD
+                                    r = temp_crawler.session.get(url, timeout=5, stream=True)
+                                return url, r.status_code
+                            except:
+                                return url, "Error"
+
+                        with ThreadPoolExecutor(max_workers=20) as executor:
+                            futures = [executor.submit(fetch_status, u) for u in uncrawled_list]
+                            for i, future in enumerate(as_completed(futures)):
+                                u, code = future.result()
+                                results[u] = code
+                                if i % 5 == 0:
+                                    progress_bar.progress((i + 1) / len(uncrawled_list))
+                                    status_text.text(f"Checking: {u}")
+                        
+                        st.session_state.link_status_cache.update(results)
+                        status_text.success("✅ Internal statuses updated!")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        col_info.info("All internal links have status codes.")
+                # --------------------------------------
 
                 st.dataframe(final_links, use_container_width=True)
                 
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Nofollow Links", len(final_links[final_links['Link Type'].str.contains('nofollow')]))
                 c2.metric("Sponsored Links", len(final_links[final_links['Link Type'].str.contains('sponsored')]))
-                c3.metric("New Tab (_blank)", len(final_links[final_links['Target'] == '_blank']))
+                c3.metric("Broken Links (4xx/5xx)", len(final_links[final_links['Status Code'].str.match(r'4|5', na=False)]))
                 
                 csv = final_links.to_csv(index=False).encode('utf-8')
                 st.download_button("📥 Download Internal Links", csv, "internal_links.csv", "text/csv")
@@ -809,8 +947,60 @@ if has_data and df is not None:
                 })
         if external_data:
             ext_df = pd.DataFrame(external_data)
+            
+            # 1. Merge with status (unlikely to match for external, but good practice)
             ext_df = pd.merge(ext_df, status_lookup, on='Destination URL', how='left')
+            
+            # 2. Apply Cached Statuses
+            if 'link_status_cache' not in st.session_state:
+                st.session_state.link_status_cache = {}
+                
+            ext_df['Status Code'] = ext_df.apply(
+                lambda x: st.session_state.link_status_cache.get(x['Destination URL'], x['Status Code']), axis=1
+            )
+            
+            # 3. Fill remaining
             ext_df['Status Code'] = ext_df['Status Code'].fillna('Not Crawled').astype(str)
+
+            # --- BUTTON: CHECK EXTERNAL STATUS ---
+            col_btn_ext, col_info_ext = st.columns([1, 3])
+            
+            uncrawled_ext = ext_df[ext_df['Status Code'] == 'Not Crawled']['Destination URL'].unique().tolist()
+            
+            if col_btn_ext.button("🔍 Check External Statuses"):
+                if uncrawled_ext:
+                    progress_bar = col_info_ext.progress(0)
+                    status_text = col_info_ext.empty()
+                    
+                    temp_crawler = UltraFrogCrawler()
+                    results = {}
+                    
+                    def fetch_status(url):
+                        try:
+                            # External links often block HEAD, so we might need strict timeouts
+                            r = temp_crawler.session.head(url, timeout=5, allow_redirects=True)
+                            if r.status_code == 405 or r.status_code == 403: 
+                                r = temp_crawler.session.get(url, timeout=5, stream=True)
+                            return url, r.status_code
+                        except Exception as e:
+                            return url, "Error"
+
+                    with ThreadPoolExecutor(max_workers=20) as executor:
+                        futures = [executor.submit(fetch_status, u) for u in uncrawled_ext]
+                        for i, future in enumerate(as_completed(futures)):
+                            u, code = future.result()
+                            results[u] = code
+                            if i % 5 == 0:
+                                progress_bar.progress((i + 1) / len(uncrawled_ext))
+                                status_text.text(f"Checking: {u}")
+                    
+                    st.session_state.link_status_cache.update(results)
+                    status_text.success("✅ External statuses updated!")
+                    time.sleep(1)
+                    st.rerun()
+                else:
+                    col_info_ext.info("All external links have status codes.")
+            # -------------------------------------
 
             st.dataframe(ext_df, use_container_width=True)
             csv = ext_df.to_csv(index=False).encode('utf-8')
@@ -821,9 +1011,17 @@ if has_data and df is not None:
     # TAB 3: IMAGES
     with tab3:
         st.subheader("🖼️ Images Analysis")
+        
+        # 1. flatten the image data from the main dataframe
         images_data = []
         for _, row in df.iterrows():
-            for img in row.get('images', []):
+            # Handle list being string (if loaded from CSV) or list (if RAM)
+            imgs = row.get('images', [])
+            if isinstance(imgs, str):
+                try: imgs = json.loads(imgs)
+                except: imgs = []
+                
+            for img in imgs:
                 images_data.append({
                     'source_url': row['url'],
                     'image_url': img['src'],
@@ -832,8 +1030,64 @@ if has_data and df is not None:
                     'dimensions': f"{img['width']}x{img['height']}" if img['width'] else 'Unknown',
                     'size_kb': img.get('size_kb', 0)
                 })
+        
         if images_data:
             img_df = pd.DataFrame(images_data)
+            
+            # --- NEW FEATURE: ON-DEMAND SIZE CHECK ---
+            # Initialize cache for sizes if not present
+            if 'img_size_cache' not in st.session_state:
+                st.session_state.img_size_cache = {}
+            
+            # Apply cached sizes to the dataframe immediately (if any exist)
+            if st.session_state.img_size_cache:
+                img_df['size_kb'] = img_df['image_url'].map(st.session_state.img_size_cache).fillna(img_df['size_kb'])
+
+            col_btn, col_info = st.columns([1, 4])
+            
+            # Button to trigger size check
+            if col_btn.button("📏 Check Image Sizes"):
+                # Get unique URLs that have size 0 or are not in cache
+                unique_img_urls = img_df[img_df['size_kb'] == 0]['image_url'].unique().tolist()
+                
+                if unique_img_urls:
+                    progress_text = col_info.empty()
+                    progress_bar = col_info.progress(0)
+                    
+                    # Create a temporary crawler instance just for fetching headers
+                    temp_crawler = UltraFrogCrawler() 
+                    
+                    results = {}
+                    total = len(unique_img_urls)
+                    
+                    # Use threads to fetch sizes quickly
+                    with ThreadPoolExecutor(max_workers=20) as executor:
+                        future_to_url = {executor.submit(temp_crawler.get_file_size, url): url for url in unique_img_urls}
+                        
+                        completed = 0
+                        for future in as_completed(future_to_url):
+                            url = future_to_url[future]
+                            try:
+                                size = future.result()
+                                results[url] = size
+                            except:
+                                results[url] = 0
+                            
+                            completed += 1
+                            if completed % 5 == 0: # Update UI every 5 images
+                                progress_bar.progress(completed / total)
+                                progress_text.text(f"⏳ Checking size: {completed}/{total} images...")
+                    
+                    # Update cache and session state
+                    st.session_state.img_size_cache.update(results)
+                    progress_text.success("✅ sizes checked!")
+                    time.sleep(1) # Small pause so user sees success
+                    st.rerun() # Rerun to refresh table with new data
+                else:
+                    col_info.info("All image sizes are already checked.")
+
+            # -----------------------------------------
+
             st.dataframe(img_df, use_container_width=True)
             csv = img_df.to_csv(index=False).encode('utf-8')
             st.download_button("📥 Download Images", csv, "images.csv", "text/csv")
@@ -886,8 +1140,23 @@ if has_data and df is not None:
     # TAB 9: CANONICALS
     with tab9:
         st.subheader("🎯 Canonicals")
-        st.dataframe(df[['url', 'canonical_url']], use_container_width=True)
-        csv = df[['url', 'canonical_url']].to_csv(index=False).encode('utf-8')
+        
+        # --- NEW CANONICAL CHECK LOGIC ---
+        can_df = df[['url', 'canonical_url']].copy()
+        
+        def check_canonical(row):
+            c_url = row['canonical_url']
+            if not c_url:
+                return "❌ Missing"
+            # Basic match check
+            if row['url'] == c_url:
+                return "✅ Match"
+            return "⚠️ Mismatch"
+
+        can_df['Status'] = can_df.apply(check_canonical, axis=1)
+        
+        st.dataframe(can_df, use_container_width=True)
+        csv = can_df.to_csv(index=False).encode('utf-8')
         st.download_button("📥 Download Canonicals", csv, "canonicals.csv", "text/csv")
 
     # TAB 10: SOCIAL
@@ -903,30 +1172,6 @@ if has_data and df is not None:
         st.dataframe(df[['url', 'response_time', 'word_count', 'content_length']], use_container_width=True)
         csv = df[['url', 'response_time']].to_csv(index=False).encode('utf-8')
         st.download_button("📥 Download Performance", csv, "performance.csv", "text/csv")
-
-    # TAB 12: GRAPH
-    with tab12:
-        st.subheader("🕸️ Visual Graph")
-        if HAS_PYVIS:
-            G = nx.DiGraph()
-            max_nodes = 50
-            subset = df.head(max_nodes)
-            for _, row in subset.iterrows():
-                src = row['url']
-                G.add_node(src, title=row['title'][:50], color='#4CAF50', size=20)
-                for link in row.get('internal_links', []):
-                    dst = link['url']
-                    if dst in subset['url'].values:
-                        G.add_edge(src, dst, color='#aaaaaa')
-            net = Network(height='600px', width='100%', bgcolor='#111111', font_color='white')
-            net.from_nx(G)
-            try:
-                net.save_graph("graph.html")
-                with open("graph.html", 'r', encoding='utf-8') as f:
-                    components.html(f.read(), height=650)
-            except: st.error("Graph error")
-        else:
-            st.error("Install pyvis to view graph.")
 
     # TAB 13: ORPHANS
     with tab13:
@@ -950,34 +1195,82 @@ if has_data and df is not None:
         else:
             st.info("Enter a CSS Selector in the sidebar to extract custom data.")
 
-    # TAB 15: SPEED (PSI)
+   # TAB 15: SPEED (PSI)
     with tab15:
         st.subheader("⚡ Google PageSpeed Insights (PSI)")
         st.info("Enter your Google PageSpeed API Key in the Sidebar to use this feature.")
         
         if psi_api_key:
-            urls_to_test = st.multiselect("Select URLs to Test (Max 5 recommended)", df['url'].head(20).tolist())
+            # --- NEW SELECT ALL OPTION ---
+            check_all = st.checkbox("Select All URLs (Run for everyone)", help="⚠️ Be careful with API limits if you have thousands of URLs.")
             
-            if st.button("🏃 Run PageSpeed Test"):
+            if check_all:
+                urls_to_test = df['url'].tolist()
+                st.write(f"Selected {len(urls_to_test)} URLs.")
+            else:
+                urls_to_test = st.multiselect("Select URLs to Test (Max 5 recommended)", df['url'].head(20).tolist())
+            
+            if st.button("🏃 Run PageSpeed Test (Mobile & Desktop)"):
                 if not urls_to_test:
                     st.warning("Please select at least one URL.")
                 else:
                     progress_psi = st.progress(0)
+                    status_text = st.empty()
                     results = []
                     
+                    total_steps = len(urls_to_test)
+                    
                     for i, u in enumerate(urls_to_test):
-                        res = run_psi_test(u, psi_api_key)
-                        res['url'] = u
-                        results.append(res)
-                        progress_psi.progress((i + 1) / len(urls_to_test))
+                        status_text.text(f"Testing {i+1}/{total_steps}: {u}...")
+                        
+                        # 1. Fetch Mobile Data
+                        mobile_res = run_psi_test(u, psi_api_key, "mobile")
+                        
+                        # 2. Fetch Desktop Data
+                        desktop_res = run_psi_test(u, psi_api_key, "desktop")
+                        
+                        # 3. Combine Data
+                        row = {'url': u}
+                        
+                        # Process Mobile keys
+                        if "error" in mobile_res:
+                            row['Mobile Error'] = mobile_res['error']
+                        else:
+                            for k, v in mobile_res.items():
+                                row[f"Mobile {k}"] = v
+                                
+                        # Process Desktop keys
+                        if "error" in desktop_res:
+                            row['Desktop Error'] = desktop_res['error']
+                        else:
+                            for k, v in desktop_res.items():
+                                row[f"Desktop {k}"] = v
+
+                        results.append(row)
+                        progress_psi.progress((i + 1) / total_steps)
                     
                     st.session_state.psi_results = results
+                    status_text.success("✅ Analysis Complete!")
             
             if st.session_state.psi_results:
                 psi_df = pd.DataFrame(st.session_state.psi_results)
-                cols = ['url', 'Score', 'LCP', 'FCP', 'CLS', 'INP', 'TTI']
-                available_cols = [c for c in cols if c in psi_df.columns]
-                st.dataframe(psi_df[available_cols], use_container_width=True)
+                
+                # Define preferred column order for readability
+                desired_order = [
+                    'url', 
+                    'Mobile Score', 'Desktop Score', 
+                    'Mobile LCP', 'Desktop LCP',
+                    'Mobile FCP', 'Desktop FCP',
+                    'Mobile CLS', 'Desktop CLS',
+                    'Mobile INP', 'Desktop INP'
+                ]
+                
+                # Filter to only show columns that actually exist in the data
+                final_cols = [c for c in desired_order if c in psi_df.columns]
+                # Add any error columns or extra columns at the end
+                remaining_cols = [c for c in psi_df.columns if c not in final_cols]
+                
+                st.dataframe(psi_df[final_cols + remaining_cols], use_container_width=True)
                 
                 csv_psi = psi_df.to_csv(index=False).encode('utf-8')
                 st.download_button("📥 Download PSI Report", csv_psi, "psi_report.csv", "text/csv")
@@ -1023,7 +1316,7 @@ if has_data and df is not None:
         
         c1, c2 = st.columns(2)
         with c1:
-            noindex_follow_df = df[df['is_noindex_follow'] == True][['url', 'meta_robots']]
+            noindex_follow_df = df[df['is_noindex_follow'] == 1][['url', 'meta_robots']]
             if not noindex_follow_df.empty:
                 st.warning(f"⚠️ Found {len(noindex_follow_df)} pages with 'noindex, follow'")
                 st.dataframe(noindex_follow_df, use_container_width=True)
@@ -1031,7 +1324,7 @@ if has_data and df is not None:
                 st.success("✅ No 'noindex, follow' pages.")
 
         with c2:
-            noindex_nofollow_df = df[df['is_noindex_nofollow'] == True][['url', 'meta_robots']]
+            noindex_nofollow_df = df[df['is_noindex_nofollow'] == 1][['url', 'meta_robots']]
             if not noindex_nofollow_df.empty:
                 st.error(f"⛔ Found {len(noindex_nofollow_df)} pages with 'noindex, nofollow'")
                 st.dataframe(noindex_nofollow_df, use_container_width=True)
@@ -1042,9 +1335,9 @@ if has_data and df is not None:
     st.markdown("---")
     st.header("📥 Full Report")
     
-    if st.session_state.storage_mode == "CSV" and os.path.exists(CSV_FILE):
-        with open(CSV_FILE, "rb") as file:
-            st.download_button("📊 Download Complete Crawl Data (CSV)", file, "battersea_full_data.csv", "text/csv")
+    if st.session_state.storage_mode == "SQLite" and os.path.exists(DB_FILE):
+        with open(DB_FILE, "rb") as file:
+            st.download_button("📊 Download Complete Database (SQLite)", file, "battersea_data.db", "application/octet-stream")
     else:
         csv_all = df.to_csv(index=False).encode('utf-8')
         st.download_button("📊 Download Complete Crawl Data", csv_all, "complete_crawl.csv", "text/csv")
