@@ -85,6 +85,8 @@ if 'gsc_sites_list' not in st.session_state:
     st.session_state.gsc_sites_list = []
 if 'gsc_merged_data' not in st.session_state:
     st.session_state.gsc_merged_data = pd.DataFrame()
+if 'content_audit_data' not in st.session_state:
+    st.session_state.content_audit_data = pd.DataFrame()
 
 
 # --- SQLITE HELPER FUNCTIONS ---
@@ -216,13 +218,23 @@ def list_gsc_sites(service):
         st.error(f"Error listing sites: {e}")
         return []
 
-def fetch_gsc_data(service, site_url, days=30):
-    end_date = datetime.now().strftime('%Y-%m-%d')
-    start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+# MODIFIED: Accepts start_date and end_date objects instead of just 'days'
+def fetch_gsc_data(service, site_url, start_date, end_date):
+    """Fetch Clicks & Impressions for a specific date range."""
     
+    # Format dates for API (YYYY-MM-DD)
+    # Ensure inputs are valid date objects before calling strftime
+    try:
+        s_date = start_date.strftime('%Y-%m-%d')
+        e_date = end_date.strftime('%Y-%m-%d')
+    except AttributeError:
+        # Fallback if raw strings are passed somehow
+        s_date = str(start_date)
+        e_date = str(end_date)
+
     request = {
-        'startDate': start_date,
-        'endDate': end_date,
+        'startDate': s_date,
+        'endDate': e_date,
         'dimensions': ['page'],
         'rowLimit': 25000
     }
@@ -395,6 +407,44 @@ def generate_ai_meta(provider, api_key, model_name, endpoint_url, prompt_text, s
         return f"Exception: {str(e)}"
     return "Unknown Error"
 
+def analyze_content_freshness(url, title, content, provider, api_key, model_name, endpoint_url):
+    """Uses AI to determine if content is Relevant, Stale, or Outdated."""
+    current_date = datetime.now().strftime("%B %Y")
+    
+    prompt = f"""
+    You are an expert SEO Content Strategist. 
+    Today's Date: {current_date}
+    
+    Analyze the following page content and determine its relevance for TODAY's users.
+    URL: {url}
+    Title: {title}
+    Content Snippet: {content[:1500]}
+    
+    Decision Criteria:
+    - KEEP: Content is evergreen, still accurate, or historically valuable.
+    - UPDATE: Content is good but contains old dates, old prices, or missing newer facts.
+    - REMOVE: Content is completely outdated (e.g., Covid-19 temporary rules, 2021 event guides, broken promotions).
+    
+    Provide your response in this EXACT format:
+    DECISION: [KEEP/UPDATE/REMOVE]
+    REASON: [Short explanation why]
+    ACTION: [What exactly to add or change, or why to delete]
+    """
+    
+    try:
+        response = generate_ai_meta(provider, api_key, model_name, endpoint_url, prompt, "You are a content auditor.")
+        lines = response.split('\n')
+        res_dict = {"URL": url}
+        for line in lines:
+            if line.startswith("DECISION:"): res_dict["Decision"] = line.replace("DECISION:", "").strip()
+            if line.startswith("REASON:"): res_dict["Reason"] = line.replace("REASON:", "").strip()
+            if line.startswith("ACTION:"): res_dict["Action Suggestion"] = line.replace("ACTION:", "").strip()
+        
+        if "Decision" not in res_dict: res_dict["Decision"] = "Unknown"
+        return res_dict
+    except:
+        return {"URL": url, "Decision": "Error", "Reason": "AI failed to respond", "Action Suggestion": "N/A"}
+
 # --- CRAWLER CLASS ---
 class UltraFrogCrawler:
     # MODIFIED: Added use_js parameter
@@ -521,17 +571,11 @@ class UltraFrogCrawler:
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
-                # Create a new context with a realistic user agent
                 context = browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
                 page = context.new_page()
-                
-                # Navigate and wait for network to settle
                 page.goto(url, wait_until="networkidle", timeout=30000) 
+                content = page.content() 
                 
-                content = page.content() # Get the rendered HTML
-                
-                # We need to mock a 'response' object to keep compatibility
-                # This is a simplified mock
                 class MockResponse:
                     def __init__(self, url, content, status_code):
                         self.url = url
@@ -540,10 +584,6 @@ class UltraFrogCrawler:
                         self.status_code = status_code
                         self.history = []
                         self.elapsed = type('obj', (object,), {'total_seconds': lambda: 1.0})
-                
-                # Currently simple status check (Playwright doesn't easily give status code on .content())
-                # but page.goto returns a response object
-                # For robust status, we'd need page.goto return value
                 
                 browser.close()
                 return MockResponse(url, content, 200), None
@@ -1066,7 +1106,17 @@ with st.sidebar:
             
             if st.session_state.gsc_sites_list:
                 gsc_property = st.selectbox("Select GSC Property", st.session_state.gsc_sites_list)
-                gsc_days = st.slider("Data Range (Days)", 7, 90, 28)
+                
+                # --- UPDATED: DATE PICKER ---
+                today = datetime.now().date()
+                default_start = today - timedelta(days=28)
+                
+                date_range = st.date_input(
+                    "📅 Select Date Range",
+                    value=(default_start, today),
+                    max_value=today,
+                    format="DD/MM/YYYY"
+                )
             else:
                 st.warning("Authenticated, but no sites found. Did you add the service account email to your GSC property?")
                 gsc_property = None
@@ -1235,11 +1285,11 @@ if has_data and df is not None:
         orphans = list(st.session_state.sitemap_urls_set - crawled_urls) if st.session_state.sitemap_urls_set else []
         st.metric("👻 Orphans", len(orphans))
     
-    # Tabs
-    tab1, tab2, tab3, tab4, tab5, tab6, tab_struct, tab7, tab8, tab9, tab10, tab11, tab13, tab14, tab15, tab16, tab_search, tab_interlink, tab_cannibal, tab_gsc = st.tabs([
-        "🔗 Internal", "🌐 External", "🖼️ Images", "📝 Titles", "📄 Meta", "🏷️ Counts", 
+    # Tabs - MODIFIED: Merged Meta/Titles and added Content Audit
+    tab1, tab2, tab3, tab_meta_titles, tab6, tab_struct, tab7, tab8, tab9, tab10, tab11, tab13, tab14, tab15, tab16, tab_search, tab_interlink, tab_cannibal, tab_gsc, tab_audit = st.tabs([
+        "🔗 Internal", "🌐 External", "🖼️ Images", "📝 Meta & Titles", "🏷️ Counts", 
         "🏗️ Structure", "🔄 Redirects", "📊 Status", "🎯 Canonicals", "📱 Social", "🚀 Perf", 
-        "👻 Orphans", "⛏️ Custom", "⚡ PSI", "🏗️ Schema", "🔍 Search Results", "💡 Interlink", "👯 Cannibalization", "📈 GSC Data"
+        "👻 Orphans", "⛏️ Custom", "⚡ PSI", "🏗️ Schema", "🔍 Search Results", "💡 Interlink", "👯 Cannibalization", "📈 GSC Data", "📅 Content Audit"
     ])
     
     status_lookup = df[['url', 'status_code']].drop_duplicates()
@@ -1619,17 +1669,17 @@ if has_data and df is not None:
         else:
             st.info("No images found.")
 
-    with tab4:
-        st.subheader("📝 Titles Analysis")
-        title_df = df[['url', 'title', 'title_length', 'h1_tags', 'scope_content']].copy()
-        title_df['status'] = title_df.apply(lambda row: '❌ Missing' if row['title_length']==0 else '✅ Good', axis=1)
-        st.dataframe(title_df[['url', 'title', 'title_length', 'status']], use_container_width=True)
-        csv = title_df[['url', 'title', 'title_length']].to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Titles", csv, "titles.csv", "text/csv")
+    with tab_meta_titles:
+        st.subheader("📝 Meta Tags & Titles Analysis")
+        # Combined DataFrame View
+        meta_view = df[['url', 'title', 'title_length', 'meta_description', 'meta_desc_length', 'h1_tags']].copy()
+        st.dataframe(meta_view, use_container_width=True)
+        csv_meta = meta_view.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download All Meta Data", csv_meta, "meta_titles.csv", "text/csv")
 
         st.markdown("---")
-        with st.expander("✨ AI Title Generator (Dynamic API)", expanded=False):
-            st.info("Generate missing SEO titles using any API (Gemini, Groq, OpenAI, Ollama).")
+        with st.expander("✨ AI Content Generator (Titles & Meta)", expanded=False):
+            st.info("Generate missing or improved tags using AI.")
             
             c1, c2 = st.columns(2)
             provider = c1.selectbox("Provider", ["Gemini", "OpenAI Compatible (Groq/Ollama/OpenAI)"])
@@ -1639,30 +1689,47 @@ if has_data and df is not None:
             model_name = c3.text_input("Model Name", value="gemini-1.5-flash" if provider=="Gemini" else "lama-3.1-8b-instant")
             endpoint = c4.text_input("Endpoint URL (OpenAI/Ollama Only)", value="https://api.groq.com/openai/v1/chat/completions")
             
-            mode_gen = st.radio("Generate for:", ["Only Missing Titles", "Regenerate All"], horizontal=True)
+            action_type = st.radio("I want to generate:", ["Titles Only", "Meta Descriptions Only"], horizontal=True)
+            filter_mode = st.radio("Generate for:", ["Only Missing Items (Empty)", "Regenerate All"], horizontal=True)
             
-            if st.button("🚀 Generate Titles"):
-                if mode_gen == "Only Missing Titles":
-                    targets = title_df[title_df['title_length'] == 0].copy()
-                else:
-                    targets = title_df.copy()
+            if st.button("🚀 Generate Content"):
+                # Filter Logic
+                if action_type == "Titles Only":
+                    if filter_mode == "Only Missing Items (Empty)":
+                        targets = meta_view[meta_view['title_length'] == 0].copy()
+                    else:
+                        targets = meta_view.copy()
+                else: # Meta Desc
+                    if filter_mode == "Only Missing Items (Empty)":
+                        targets = meta_view[meta_view['meta_desc_length'] == 0].copy()
+                    else:
+                        targets = meta_view.copy()
                 
                 if targets.empty:
                     st.warning("No pages match your criteria.")
                 else:
-                    st.write(f"Generating titles for {len(targets)} pages...")
+                    st.write(f"Generating for {len(targets)} pages...")
                     progress_gen = st.progress(0)
                     results_gen = []
                     
-                    def process_title(row):
-                        context = f"H1: {row.get('h1_tags', '')}\nContent: {str(row.get('scope_content', ''))[:800]}"
-                        prompt = f"Write a concise, high-CTR SEO Title (under 60 chars) for this page content:\n\n{context}"
+                    def process_gen_row(row):
+                        content_snippet = str(row.get('scope_content', df[df['url'] == row['url']]['scope_content'].values[0]))[:800]
+                        if action_type == "Titles Only":
+                            context = f"H1: {row.get('h1_tags', '')}\nContent: {content_snippet}"
+                            prompt = f"Write a concise, high-CTR SEO Title (under 60 chars) for this page content:\n\n{context}"
+                            col_name = "New AI Title"
+                            old_val = row['title']
+                        else:
+                            context = f"Title: {row.get('title', '')}\nContent: {content_snippet}"
+                            prompt = f"Write a persuasive SEO Meta Description (under 160 chars) for this page:\n\n{context}"
+                            col_name = "New AI Description"
+                            old_val = row['meta_description']
                         
-                        new_title = generate_ai_meta(provider, api_key_gen, model_name, endpoint, prompt)
-                        return {"URL": row['url'], "Old Title": row['title'], "New AI Title": new_title}
+                        generated = generate_ai_meta(provider, api_key_gen, model_name, endpoint, prompt)
+                        return {"URL": row['url'], "Old Value": old_val, col_name: generated}
 
                     with ThreadPoolExecutor(max_workers=5) as executor:
-                        futures = [executor.submit(process_title, row) for _, row in targets.iterrows()]
+                        futures = [executor.submit(process_gen_row, row) for _, row in targets.iterrows()]
                         for i, f in enumerate(as_completed(futures)):
                             res = f.result()
                             results_gen.append(res)
@@ -1672,61 +1739,7 @@ if has_data and df is not None:
                     st.success("✅ Generation Complete!")
                     st.dataframe(res_df, use_container_width=True)
                     csv_gen = res_df.to_csv(index=False).encode('utf-8')
-                    st.download_button("📥 Download Generated Titles", csv_gen, "ai_titles.csv", "text/csv")
-
-    with tab5:
-        st.subheader("📄 Meta Descriptions")
-        meta_df = df[['url', 'meta_description', 'meta_desc_length', 'title', 'scope_content']].copy()
-        st.dataframe(meta_df[['url', 'meta_description', 'meta_desc_length']], use_container_width=True)
-        csv = meta_df[['url', 'meta_description', 'meta_desc_length']].to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Meta", csv, "meta_desc.csv", "text/csv")
-
-        st.markdown("---")
-        with st.expander("✨ AI Description Generator (Dynamic API)", expanded=False):
-            st.info("Generate missing meta descriptions using any API.")
-            
-            c1, c2 = st.columns(2)
-            provider_m = c1.selectbox("Provider", ["Gemini", "OpenAI Compatible (Groq/Ollama/OpenAI)"], key="prov_m")
-            api_key_m = c2.text_input("API Key", type="password", key="key_m")
-            
-            c3, c4 = st.columns(2)
-            model_m = c3.text_input("Model Name", value="gemini-1.5-flash" if provider_m=="Gemini" else "llama3-8b-8192", key="mod_m")
-            endpoint_m = c4.text_input("Endpoint URL", value="https://api.groq.com/openai/v1/chat/completions", key="end_m")
-            
-            mode_m = st.radio("Generate for:", ["Only Missing Descriptions", "Regenerate All"], horizontal=True, key="rad_m")
-            
-            if st.button("🚀 Generate Descriptions"):
-                if mode_m == "Only Missing Descriptions":
-                    targets_m = meta_df[meta_df['meta_desc_length'] == 0].copy()
-                else:
-                    targets_m = meta_df.copy()
-                
-                if targets_m.empty:
-                    st.warning("No pages match your criteria.")
-                else:
-                    st.write(f"Generating descriptions for {len(targets_m)} pages...")
-                    progress_gen = st.progress(0)
-                    results_gen = []
-                    
-                    def process_meta(row):
-                        context = f"Title: {row.get('title', '')}\nContent: {str(row.get('scope_content', ''))[:800]}"
-                        prompt = f"Write a persuasive SEO Meta Description (under 160 chars) for this page:\n\n{context}"
-                        
-                        new_desc = generate_ai_meta(provider_m, api_key_m, model_m, endpoint_m, prompt)
-                        return {"URL": row['url'], "Old Desc": row['meta_description'], "New AI Desc": new_desc}
-
-                    with ThreadPoolExecutor(max_workers=5) as executor:
-                        futures = [executor.submit(process_meta, row) for _, row in targets_m.iterrows()]
-                        for i, f in enumerate(as_completed(futures)):
-                            res = f.result()
-                            results_gen.append(res)
-                            progress_gen.progress((i + 1) / len(targets_m))
-                    
-                    res_df = pd.DataFrame(results_gen)
-                    st.success("✅ Generation Complete!")
-                    st.dataframe(res_df, use_container_width=True)
-                    csv_gen = res_df.to_csv(index=False).encode('utf-8')
-                    st.download_button("📥 Download Generated Descriptions", csv_gen, "ai_descriptions.csv", "text/csv")
+                    st.download_button("📥 Download Generated Data", csv_gen, "ai_generated_tags.csv", "text/csv")
 
     with tab6:
         st.subheader("🏷️ Headers (H1-H4) Counts")
@@ -1858,8 +1871,14 @@ if has_data and df is not None:
             st.download_button("📥 Download Redirects", csv, "redirects.csv", "text/csv")
         else:
             st.success("No redirects found.")
-            
-            st.markdown("---")
+
+    with tab8:
+        st.subheader("📊 Status Codes")
+        st.dataframe(df[['url', 'status_code', 'indexability']], use_container_width=True)
+        csv = df[['url', 'status_code']].to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download Status", csv, "status_codes.csv", "text/csv")
+        
+        st.markdown("---")
         st.write("### 🤖 Indexing & Robots Directives")
         c1, c2 = st.columns(2)
         with c1:
@@ -1874,12 +1893,6 @@ if has_data and df is not None:
                 st.error(f"⛔ Found {len(noindex_nofollow_df)} pages with 'noindex, nofollow'")
                 st.dataframe(noindex_nofollow_df, use_container_width=True)
             else: st.success("✅ No 'noindex, nofollow' pages.")
-
-    with tab8:
-        st.subheader("📊 Status Codes")
-        st.dataframe(df[['url', 'status_code', 'indexability']], use_container_width=True)
-        csv = df[['url', 'status_code']].to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Status", csv, "status_codes.csv", "text/csv")
 
     with tab9:
         st.subheader("🎯 Canonicals")
@@ -2001,8 +2014,6 @@ if has_data and df is not None:
                 else: st.info("No Schema JSON found on this page.")
             except: st.text(str(schema_json_str))
 
-        
-
     with tab_search:
         st.subheader("🔍 Custom Search Results")
         s_conf = st.session_state.get('search_config', None)
@@ -2110,9 +2121,25 @@ if has_data and df is not None:
             st.info("👈 Please upload your JSON Key and select a property in the sidebar.")
         else:
             st.write("### 1. Performance Metrics")
-            if st.button("🔄 Fetch Performance (Clicks, Imp, CTR, Pos)"):
+            
+            # --- DATE VALIDATION LOGIC ---
+            valid_dates = False
+            start_d, end_d = None, None
+            
+            # Check if date_range exists in sidebar and has 2 values (Start & End)
+            if 'date_range' in locals() and isinstance(date_range, tuple) and len(date_range) == 2:
+                start_d, end_d = date_range
+                st.caption(f"Fetching data from: **{start_d}** to **{end_d}**")
+                valid_dates = True
+            elif 'date_range' not in locals():
+                 st.warning("⚠️ Date picker loading...")
+            else:
+                st.warning("⚠️ Please select both a Start Date and an End Date in the sidebar.")
+
+            if st.button("🔄 Fetch Performance (Clicks, Imp, CTR, Pos)", disabled=not valid_dates):
                 with st.spinner("Fetching performance data..."):
-                    gsc_data = fetch_gsc_data(st.session_state.gsc_service, gsc_property, gsc_days)
+                    # Pass the specific dates to the function
+                    gsc_data = fetch_gsc_data(st.session_state.gsc_service, gsc_property, start_d, end_d)
                     
                     if not gsc_data.empty:
                         st.success(f"Fetched data for {len(gsc_data)} URLs!")
@@ -2131,10 +2158,19 @@ if has_data and df is not None:
                             zero_clicks = merged_gsc[merged_gsc['GSC Clicks'].fillna(0) == 0]
                             st.metric("Pages in List with 0 Clicks", len(zero_clicks))
                             
-                            target_cols = ['url', 'GSC Clicks', 'GSC Impressions', 'GSC CTR', 'GSC Position']
-                            final_cols = [c for c in target_cols if c in merged_gsc.columns]
+                            # Clean up for display
+                            display_df = merged_gsc.copy()
+                            complex_cols = ['schema_dump', 'internal_links', 'external_links', 
+                                          'images', 'redirect_chain', 'header_structure', 'custom_extraction']
+                            for col in complex_cols:
+                                if col in display_df.columns:
+                                    display_df[col] = display_df[col].astype(str)
                             
-                            st.dataframe(merged_gsc[final_cols], use_container_width=True)
+                            # Filter Columns for Display
+                            target_cols = ['url', 'GSC Clicks', 'GSC Impressions', 'GSC CTR', 'GSC Position']
+                            final_cols = [c for c in target_cols if c in display_df.columns]
+                            
+                            st.dataframe(display_df[final_cols], use_container_width=True)
                             st.session_state.gsc_merged_data = merged_gsc
                         else:
                             st.dataframe(gsc_data, use_container_width=True)
@@ -2158,6 +2194,7 @@ if has_data and df is not None:
                 
                 col_i1, col_i2 = st.columns(2)
                 do_inspect = False
+                urls_to_run = []
                 
                 with col_i1:
                     specific_url = st.text_input("Inspect Single URL")
@@ -2196,6 +2233,63 @@ if has_data and df is not None:
                         st.download_button("📥 Download Inspection Report", csv_insp, "indexing_report.csv", "text/csv")
             else:
                 st.warning("⚠️ No URLs found to inspect. Please run a Crawl (List Mode) or Fetch Performance Data first.")
+
+    with tab_audit:
+        st.subheader("📅 AI Content Relevance & Freshness Auditor")
+        st.info("Identify 'Stale' or 'Zombie' pages that need to be updated or removed based on current real-world relevance.")
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            aud_provider = st.selectbox("AI Provider", ["Gemini", "OpenAI Compatible (Groq/Ollama)"], key="aud_p")
+            aud_key = st.text_input("API Key (or Ollama URL if empty)", type="password", key="aud_k")
+        with c2:
+            aud_model = st.text_input("Model", value="gemini-1.5-flash" if aud_provider=="Gemini" else "llama-3.3-70b-versatile", key="aud_m")
+            aud_url = st.text_input("Endpoint (if needed)", value="https://api.groq.com/openai/v1/chat/completions", key="aud_u")
+
+        audit_scope = st.radio("Audit Scope:", ["Top 10 High Traffic (GSC Needed)", "Custom List", "All Indexable Pages"], horizontal=True)
+
+        if st.button("🚀 Start Content Audit"):
+            targets = []
+            if audit_scope == "All Indexable Pages":
+                targets = df[df['indexability'] == 'Indexable'].to_dict('records')
+            elif audit_scope == "Top 10 High Traffic (GSC Needed)":
+                if 'gsc_merged_data' in st.session_state and not st.session_state.gsc_merged_data.empty:
+                    targets = st.session_state.gsc_merged_data.sort_values(by='GSC Clicks', ascending=False).head(10).to_dict('records')
+                else:
+                    st.error("Please fetch GSC Performance data first.")
+            else: # Custom List (placeholder logic, usually from file upload)
+                 st.info("Custom List logic would go here. Defaulting to first 5 indexable pages.")
+                 targets = df[df['indexability'] == 'Indexable'].head(5).to_dict('records')
+            
+            if targets:
+                progress_aud = st.progress(0)
+                audit_results = []
+                
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    futures = [executor.submit(analyze_content_freshness, t['url'], t.get('title', ''), t.get('scope_content', ''), aud_provider, aud_key, aud_model, aud_url) for t in targets]
+                    for i, f in enumerate(as_completed(futures)):
+                        audit_results.append(f.result())
+                        progress_aud.progress((i + 1) / len(targets))
+                
+                aud_res_df = pd.DataFrame(audit_results)
+                st.session_state.content_audit_data = aud_res_df
+                st.success("✅ Audit Complete!")
+
+        if 'content_audit_data' in st.session_state and not st.session_state.content_audit_data.empty:
+            res = st.session_state.content_audit_data
+            
+            m1, m2, m3 = st.columns(3)
+            m1.metric("KEEP", len(res[res['Decision'] == 'KEEP']))
+            m2.metric("UPDATE", len(res[res['Decision'] == 'UPDATE']), delta_color="off")
+            m3.metric("REMOVE", len(res[res['Decision'] == 'REMOVE']), delta="-"+str(len(res[res['Decision'] == 'REMOVE'])))
+            
+            st.dataframe(res, use_container_width=True, column_config={
+                "Decision": st.column_config.SelectboxColumn("Decision", options=["KEEP", "UPDATE", "REMOVE"]),
+                "URL": st.column_config.LinkColumn("Page URL")
+            })
+            
+            csv_aud = res.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download Audit Report", csv_aud, "content_audit.csv", "text/csv")
 
     st.markdown("---")
     st.header("📥 Full Report")
