@@ -2,7 +2,9 @@ streamlit
 pandas
 requests
 beautifulsoup4
-networkx
-pyvis
-lxml
+google-api-python-client
+google-auth
 scikit-learn
+playwright
+Pillow
+lxml
