@@ -1,3 +1,12 @@
+import sys
+import asyncio
+import os
+
+# --- FIX FOR WINDOWS & STREAMLIT COMPATIBILITY ---
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+# --------------------------------------------------
+
 import streamlit as st
 import requests
 from bs4 import BeautifulSoup
@@ -13,15 +22,14 @@ from urllib.robotparser import RobotFileParser
 import streamlit.components.v1 as components
 import html
 import re
-import os
 import threading
 import sqlite3
 import uuid
+import traceback
 
 # --- NEW IMPORTS FOR IMAGE OPTIMIZATION ---
 try:
     from PIL import Image
-    import zipfile
     import io
     HAS_PIL = True
 except ImportError:
@@ -31,10 +39,16 @@ except ImportError:
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
-    import numpy as np
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
+
+# --- GRAMMAR CHECKER IMPORT (Fixes NameError) ---
+try:
+    import language_tool_python
+    HAS_LT = True
+except ImportError:
+    HAS_LT = False
 
 # --- GSC IMPORTS ---
 try:
@@ -77,6 +91,10 @@ if 'storage_mode' not in st.session_state:
     st.session_state.storage_mode = "RAM"
 if 'img_size_cache' not in st.session_state:
     st.session_state.img_size_cache = {}
+if 'img_real_dim_cache' not in st.session_state:
+    st.session_state.img_real_dim_cache = {}
+if 'img_rendered_cache' not in st.session_state:
+    st.session_state.img_rendered_cache = {}
 if 'link_status_cache' not in st.session_state:
     st.session_state.link_status_cache = {}
 if 'gsc_service' not in st.session_state:
@@ -87,11 +105,12 @@ if 'gsc_merged_data' not in st.session_state:
     st.session_state.gsc_merged_data = pd.DataFrame()
 if 'content_audit_data' not in st.session_state:
     st.session_state.content_audit_data = pd.DataFrame()
+if 'grammar_audit_data' not in st.session_state:
+    st.session_state.grammar_audit_data = pd.DataFrame()
 
 
 # --- SQLITE HELPER FUNCTIONS ---
 def init_db(db_path):
-    """Initializes the SQLite database with the pages table."""
     conn = sqlite3.connect(db_path, check_same_thread=False)
     c = conn.cursor()
     c.execute('''
@@ -152,9 +171,7 @@ def init_db(db_path):
     conn.close()
 
 def save_row_to_db(data, db_path):
-    """Writes a single row of data to the SQLite DB safely."""
     row_data = data.copy()
-    
     for key in ['internal_links', 'external_links', 'images', 'redirect_chain', 'schema_dump', 'header_structure']:
         if key in row_data:
             row_data[key] = json.dumps(row_data[key])
@@ -175,14 +192,10 @@ def save_row_to_db(data, db_path):
         'schema_count', 'schema_validity', 'schema_errors', 'redirect_chain', 
         'redirect_count', 'css_files', 'js_files', 'og_title', 'og_description', 
         'twitter_title', 'custom_extraction', 'custom_search_count', 'indexability', 'crawl_timestamp', 
-        'header_structure', 
-        'scope_content', 
-        'depth', 
-        'error'
+        'header_structure', 'scope_content', 'depth', 'error'
     ]
     
     filtered_data = {k: row_data.get(k) for k in columns}
-    
     placeholders = ', '.join(['?'] * len(columns))
     col_names = ', '.join(columns)
     sql = f"INSERT OR REPLACE INTO pages ({col_names}) VALUES ({placeholders})"
@@ -218,25 +231,17 @@ def list_gsc_sites(service):
         st.error(f"Error listing sites: {e}")
         return []
 
-# MODIFIED: Accepts start_date and end_date objects instead of just 'days'
 def fetch_gsc_data(service, site_url, start_date, end_date):
-    """Fetch Clicks & Impressions for a specific date range."""
-    
-    # Format dates for API (YYYY-MM-DD)
-    # Ensure inputs are valid date objects before calling strftime
     try:
         s_date = start_date.strftime('%Y-%m-%d')
         e_date = end_date.strftime('%Y-%m-%d')
     except AttributeError:
-        # Fallback if raw strings are passed somehow
         s_date = str(start_date)
         e_date = str(end_date)
 
     request = {
-        'startDate': s_date,
-        'endDate': e_date,
-        'dimensions': ['page'],
-        'rowLimit': 25000
+        'startDate': s_date, 'endDate': e_date,
+        'dimensions': ['page'], 'rowLimit': 25000
     }
     
     try:
@@ -268,11 +273,9 @@ def inspect_url_indexing(service, site_url, url_list):
         try:
             req = {'inspectionUrl': u, 'siteUrl': site_url}
             resp = service.urlInspection().index().inspect(body=req).execute()
-            
             inspection_res = resp.get('inspectionResult', {})
             index_res = inspection_res.get('indexStatusResult', {})
             mobile_res = inspection_res.get('mobileUsabilityResult', {})
-            
             results.append({
                 'url': u,
                 'Coverage State': index_res.get('coverageState', 'Unknown'),
@@ -410,11 +413,9 @@ def generate_ai_meta(provider, api_key, model_name, endpoint_url, prompt_text, s
 def analyze_content_freshness(url, title, content, provider, api_key, model_name, endpoint_url):
     """Uses AI to determine if content is Relevant, Stale, or Outdated."""
     current_date = datetime.now().strftime("%B %Y")
-    
     prompt = f"""
     You are an expert SEO Content Strategist. 
     Today's Date: {current_date}
-    
     Analyze the following page content and determine its relevance for TODAY's users.
     URL: {url}
     Title: {title}
@@ -430,7 +431,6 @@ def analyze_content_freshness(url, title, content, provider, api_key, model_name
     REASON: [Short explanation why]
     ACTION: [What exactly to add or change, or why to delete]
     """
-    
     try:
         response = generate_ai_meta(provider, api_key, model_name, endpoint_url, prompt, "You are a content auditor.")
         lines = response.split('\n')
@@ -439,15 +439,39 @@ def analyze_content_freshness(url, title, content, provider, api_key, model_name
             if line.startswith("DECISION:"): res_dict["Decision"] = line.replace("DECISION:", "").strip()
             if line.startswith("REASON:"): res_dict["Reason"] = line.replace("REASON:", "").strip()
             if line.startswith("ACTION:"): res_dict["Action Suggestion"] = line.replace("ACTION:", "").strip()
-        
         if "Decision" not in res_dict: res_dict["Decision"] = "Unknown"
         return res_dict
     except:
         return {"URL": url, "Decision": "Error", "Reason": "AI failed to respond", "Action Suggestion": "N/A"}
 
+# --- GRAMMAR FALLBACK HELPER (UPDATED) ---
+def check_grammar_cloud(text):
+    """Fallback to direct Cloud API call if Java is missing."""
+    url = "https://api.languagetool.org/v2/check"
+    data = {
+        'text': text,
+        'language': 'en-US'
+    }
+    try:
+        response = requests.post(url, data=data, timeout=5)
+        if response.status_code == 200:
+            result = response.json()
+            matches = []
+            for m in result.get('matches', []):
+                # We capture offset/length to extract the specific wrong word later
+                replacements = [r['value'] for r in m.get('replacements', [])][:3]
+                matches.append({
+                    'message': m.get('message', ''),
+                    'replacements': replacements,
+                    'offset': m.get('offset', 0),
+                    'length': m.get('length', 0)
+                })
+            return matches
+        return []
+    except Exception:
+        return []
 # --- CRAWLER CLASS ---
 class UltraFrogCrawler:
-    # MODIFIED: Added use_js parameter
     def __init__(self, max_urls=100000, ignore_robots=False, crawl_scope="subfolder", custom_selector=None, link_selector=None, search_config=None, use_js=False):
         self.max_urls = max_urls
         self.ignore_robots = ignore_robots
@@ -455,7 +479,7 @@ class UltraFrogCrawler:
         self.custom_selector = custom_selector
         self.link_selector = link_selector
         self.search_config = search_config
-        self.use_js = use_js # NEW
+        self.use_js = use_js 
         
         self.session = requests.Session()
         self.session.headers.update({
@@ -562,7 +586,6 @@ class UltraFrogCrawler:
         elif isinstance(data, list):
             for item in data: self.extract_recursive_types(item, types_list)
 
-    # --- MODIFIED: JS RENDERING HELPER ---
     def fetch_with_playwright(self, url):
         """Uses Playwright to render the page content."""
         if not HAS_PLAYWRIGHT:
@@ -592,14 +615,12 @@ class UltraFrogCrawler:
 
     def extract_page_data(self, url):
         try:
-            # --- MODIFIED: CHECK FOR JS RENDERING FLAG ---
             if self.use_js:
                 response, error_msg = self.fetch_with_playwright(url)
                 if not response:
                     raise Exception(error_msg)
             else:
                 response = self.session.get(url, timeout=10, allow_redirects=True)
-            # ---------------------------------------------
             
             actual_status_code = response.status_code
             if hasattr(response, 'history') and response.history:
@@ -868,6 +889,132 @@ def analyze_heading_structure(structure):
         
     return issues, h1_count
 
+# --- PRODUCTION HELPER: VISUAL DIMENSIONS (PLAYWRIGHT) ---
+def measure_rendered_images(url_list, progress_callback=None):
+    """
+    Robust scanner:
+    1. Scrolls down to trigger lazy loading.
+    2. Uses 'stealth' arguments to avoid bot detection.
+    3. Waits for network idle to ensure images render.
+    """
+    if not HAS_PLAYWRIGHT:
+        return {}, "Playwright not installed"
+
+    results = {}
+    total_images_found = 0
+    import traceback 
+
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            # 1. Launch Browser in 'Stealth' mode (looks like real Chrome)
+            try:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=["--disable-blink-features=AutomationControlled"]
+                )
+            except Exception as e:
+                return {}, f"BROWSER LAUNCH FAILED: {str(e)}\n\nTry running: playwright install"
+            
+            # Common User Agent
+            REAL_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            
+            # Context 1: Desktop
+            context_desk = browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent=REAL_USER_AGENT,
+                locale='en-US'
+            )
+            page_desk = context_desk.new_page()
+
+            # Context 2: Mobile
+            context_mob = browser.new_context(
+                viewport={"width": 390, "height": 844},
+                user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+                is_mobile=True,
+                locale='en-US'
+            )
+            page_mob = context_mob.new_page()
+
+            total = len(url_list)
+            for i, url in enumerate(url_list):
+                if progress_callback:
+                    progress_callback(i, total, url)
+
+                # --- MEASURE DESKTOP ---
+                try:
+                    page_desk.goto(url, wait_until="domcontentloaded", timeout=25000)
+                    
+                    # 2. Smooth Auto-Scroll (Crucial for Lazy Loading)
+                    page_desk.evaluate("""
+                        async () => {
+                            const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+                            for (let i = 0; i < document.body.scrollHeight; i += 500) {
+                                window.scrollTo(0, i);
+                                await delay(50); 
+                            }
+                        }
+                    """)
+                    time.sleep(0.5) # Settle time
+                    
+                    # 3. Extract Data (CurrentSrc handles responsive images)
+                    imgs_desk = page_desk.evaluate("""
+                        Array.from(document.querySelectorAll('img')).map(img => {
+                            const rect = img.getBoundingClientRect();
+                            return {
+                                src: img.currentSrc || img.src, 
+                                width: Math.round(rect.width),
+                                height: Math.round(rect.height),
+                                natural: img.naturalWidth + 'x' + img.naturalHeight,
+                                is_visible: rect.width > 0 && rect.height > 0
+                            }
+                        })
+                    """)
+                    
+                    for img in imgs_desk:
+                        src = img['src']
+                        if not src or src.startswith('data:'): continue
+                        
+                        if src not in results: results[src] = {}
+                        
+                        if img['width'] > 0:
+                            results[src]['Desktop'] = f"{img['width']}x{img['height']}"
+                            results[src]['Natural'] = img['natural']
+                            total_images_found += 1
+
+                except Exception as e:
+                    print(f"Desktop Error {url}: {e}")
+
+                # --- MEASURE MOBILE ---
+                try:
+                    page_mob.goto(url, wait_until="domcontentloaded", timeout=20000)
+                    page_mob.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    time.sleep(0.5)
+                    
+                    imgs_mob = page_mob.evaluate("""
+                        Array.from(document.querySelectorAll('img')).map(img => {
+                            const rect = img.getBoundingClientRect();
+                            return { src: img.currentSrc || img.src, width: Math.round(rect.width), height: Math.round(rect.height) }
+                        })
+                    """)
+                    
+                    for img in imgs_mob:
+                        src = img['src']
+                        if not src or src.startswith('data:'): continue
+                        if src not in results: results[src] = {}
+                        if img['width'] > 0:
+                            results[src]['Mobile'] = f"{img['width']}x{img['height']}"
+
+                except Exception:
+                    pass
+
+            browser.close()
+            return results, total_images_found
+
+    except Exception as e:
+        error_details = traceback.format_exc()
+        return {}, f"CRASH DETAILS:\n{error_details}"
+
 # --- CRAWLER HANDLERS ---
 def crawl_website(start_url, max_urls, crawl_scope, progress_container, ignore_robots=False, custom_selector=None, link_selector=None, search_config=None, use_js=False, storage="RAM"):
     crawler = UltraFrogCrawler(max_urls, ignore_robots, crawl_scope, custom_selector, link_selector, search_config, use_js)
@@ -885,7 +1032,6 @@ def crawl_website(start_url, max_urls, crawl_scope, progress_container, ignore_r
     progress_bar = progress_container.progress(0)
     status_text = progress_container.empty()
     
-    # --- SAFETY: Reduce thread count if JS is on to prevent crashing ---
     worker_count = 1 if use_js else 5
     if use_js: st.warning("🐢 JavaScript Rendering is ON. Speed reduced to 1 URL at a time to prevent crashes.")
     
@@ -912,7 +1058,7 @@ def crawl_website(start_url, max_urls, crawl_scope, progress_container, ignore_r
                     for f in future_to_url: f.cancel()
                     break
                 try:
-                    page_data = future.result(timeout=60 if use_js else 12) # Longer timeout for JS
+                    page_data = future.result(timeout=60 if use_js else 12) 
                     _, current_depth = future_to_url[future]
                     page_data['depth'] = current_depth
                     
@@ -1107,7 +1253,6 @@ with st.sidebar:
             if st.session_state.gsc_sites_list:
                 gsc_property = st.selectbox("Select GSC Property", st.session_state.gsc_sites_list)
                 
-                # --- UPDATED: DATE PICKER ---
                 today = datetime.now().date()
                 default_start = today - timedelta(days=28)
                 
@@ -1285,7 +1430,7 @@ if has_data and df is not None:
         orphans = list(st.session_state.sitemap_urls_set - crawled_urls) if st.session_state.sitemap_urls_set else []
         st.metric("👻 Orphans", len(orphans))
     
-    # Tabs - MODIFIED: Merged Meta/Titles and added Content Audit
+    # Tabs
     tab1, tab2, tab3, tab_meta_titles, tab6, tab_struct, tab7, tab8, tab9, tab10, tab11, tab13, tab14, tab15, tab16, tab_search, tab_interlink, tab_cannibal, tab_gsc, tab_audit = st.tabs([
         "🔗 Internal", "🌐 External", "🖼️ Images", "📝 Meta & Titles", "🏷️ Counts", 
         "🏗️ Structure", "🔄 Redirects", "📊 Status", "🎯 Canonicals", "📱 Social", "🚀 Perf", 
@@ -1444,6 +1589,8 @@ if has_data and df is not None:
 
     with tab3:
         st.subheader("🖼️ Images Analysis")
+        
+        # --- 1. PREPARE DATA ---
         images_data = []
         for _, row in df.iterrows():
             imgs = row.get('images', [])
@@ -1452,6 +1599,7 @@ if has_data and df is not None:
                 except: imgs = []
                 
             for img in imgs:
+                # Format HTML Dimensions
                 html_w = str(img.get('width', '')).strip()
                 html_h = str(img.get('height', '')).strip()
                 
@@ -1466,6 +1614,8 @@ if has_data and df is not None:
                     'alt_text': img['alt'],
                     'html_dimensions': html_dim_str,
                     'real_dimensions': 'Not Checked',
+                    'rendered_desktop': 'Not Scanned',
+                    'rendered_mobile': 'Not Scanned',
                     'size_kb': img.get('size_kb', 0),
                     'status': 'Pending Check'
                 })
@@ -1473,201 +1623,216 @@ if has_data and df is not None:
         if images_data:
             img_df = pd.DataFrame(images_data)
             
-            if 'img_size_cache' not in st.session_state:
-                st.session_state.img_size_cache = {}
+            # --- 2. CACHE MANAGEMENT ---
+            # Initialize Caches
+            if 'img_size_cache' not in st.session_state: st.session_state.img_size_cache = {}
             if st.session_state.img_size_cache:
                 img_df['size_kb'] = img_df['image_url'].map(st.session_state.img_size_cache).fillna(img_df['size_kb'])
 
-            if 'img_real_dim_cache' not in st.session_state:
-                st.session_state.img_real_dim_cache = {}
+            if 'img_real_dim_cache' not in st.session_state: st.session_state.img_real_dim_cache = {}
             if st.session_state.img_real_dim_cache:
-                img_df['real_dimensions'] = img_df.apply(
-                    lambda x: st.session_state.img_real_dim_cache.get(x['image_url'], x['real_dimensions']), 
-                    axis=1
-                )
+                img_df['real_dimensions'] = img_df.apply(lambda x: st.session_state.img_real_dim_cache.get(x['image_url'], x['real_dimensions']), axis=1)
 
-            col_kb, col_px, col_space = st.columns([1, 1, 3])
+            if 'img_rendered_cache' not in st.session_state: st.session_state.img_rendered_cache = {}
+            
+            # --- SMART MATCHING LOGIC ---
+            def normalize_url(u):
+                """Strips query params and protocol for better matching"""
+                if not u: return ""
+                u = u.split('?')[0].split('#')[0] # Remove query strings
+                return u.replace('https://', '').replace('http://', '').replace('www.', '')
+
+            def get_rendered_data(img_url, key):
+                cache = st.session_state.img_rendered_cache
+                if not cache: return 'Not Scanned'
+                
+                # 1. Try Exact Match
+                if img_url in cache and key in cache[img_url]: 
+                    return cache[img_url][key]
+                
+                # 2. Try Smart Match (Slow but effective)
+                clean_target = normalize_url(img_url)
+                for cache_url, data in cache.items():
+                    if clean_target in cache_url or normalize_url(cache_url) == clean_target:
+                        return data.get(key, 'Not Scanned')
+                
+                return 'Not Scanned'
+
+            if st.session_state.img_rendered_cache:
+                img_df['rendered_desktop'] = img_df['image_url'].apply(lambda x: get_rendered_data(x, 'Desktop'))
+                img_df['rendered_mobile'] = img_df['image_url'].apply(lambda x: get_rendered_data(x, 'Mobile'))
+                
+                # Update 'Natural' dimensions if we found them via Playwright
+                def update_natural(row):
+                    if row['real_dimensions'] == 'Not Checked':
+                        return get_rendered_data(row['image_url'], 'Natural').replace('Not Scanned', 'Not Checked')
+                    return row['real_dimensions']
+                img_df['real_dimensions'] = img_df.apply(update_natural, axis=1)
+
+            # --- 3. ACTION BUTTONS ---
+            st.write("#### 🛠️ Image Tools")
+            col_kb, col_px, col_vis = st.columns([1, 1, 1.5])
             
             with col_kb:
-                if st.button("📏 Check File Sizes (KB)"):
+                if st.button("1️⃣ Check File Sizes"):
                     targets = img_df[img_df['size_kb'] == 0]['image_url'].unique().tolist()
                     if targets:
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
+                        p_bar = st.progress(0)
                         crawler_temp = UltraFrogCrawler()
-                        results = {}
-                        with ThreadPoolExecutor(max_workers=20) as executor:
-                            future_to_url = {executor.submit(crawler_temp.get_file_size, u): u for u in targets}
-                            for i, future in enumerate(as_completed(future_to_url)):
-                                url = future_to_url[future]
-                                try: results[url] = future.result()
-                                except: results[url] = 0
-                                if i % 5 == 0:
-                                    progress_bar.progress((i + 1) / len(targets))
-                                    status_text.text(f"Checking KB: {i+1}/{len(targets)}")
-                        st.session_state.img_size_cache.update(results)
-                        status_text.success("✅ Updated!")
-                        time.sleep(1)
+                        res = {}
+                        with ThreadPoolExecutor(max_workers=20) as exe:
+                            futures = {exe.submit(crawler_temp.get_file_size, u): u for u in targets}
+                            for i, f in enumerate(as_completed(futures)):
+                                u = futures[f]
+                                try: res[u] = f.result()
+                                except: res[u] = 0
+                                if i%5==0: p_bar.progress((i+1)/len(targets))
+                        st.session_state.img_size_cache.update(res)
                         st.rerun()
 
             with col_px:
-                if st.button("🔍 Check Dimensions (Px)"):
-                    targets = img_df[img_df['real_dimensions'] == 'Not Checked']['image_url'].unique().tolist()
-                    if targets:
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        results = {}
-                        def get_real_dims(url):
+                if st.button("2️⃣ Check Real Dims"):
+                    targets = img_df[
+                        (img_df['real_dimensions'] == 'Not Checked') | 
+                        (img_df['real_dimensions'] == 'Error')
+                    ]['image_url'].unique().tolist()
+                    
+                    if not targets:
+                        st.warning("All images already checked!")
+                    else:
+                        p_bar = st.progress(0)
+                        s_text = st.empty()
+                        results_cache = {}
+                        
+                        def get_pil_dims(u):
                             try:
-                                r = requests.get(url, stream=True, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
+                                r = requests.get(u, timeout=8, headers={'User-Agent': 'Mozilla/5.0'}, verify=False)
                                 if r.status_code == 200:
-                                    img = Image.open(r.raw)
-                                    return url, f"{img.width}x{img.height}"
-                            except: pass
-                            return url, "Error"
-
-                        with ThreadPoolExecutor(max_workers=10) as executor:
-                            futures = [executor.submit(get_real_dims, u) for u in targets]
+                                    image_file = io.BytesIO(r.content)
+                                    img = Image.open(image_file)
+                                    return u, f"{img.width}x{img.height}"
+                                return u, f"Error {r.status_code}"
+                            except Exception as e:
+                                return u, "Error"
+                        
+                        with ThreadPoolExecutor(max_workers=10) as exe:
+                            futures = {exe.submit(get_pil_dims, u): u for u in targets}
+                            
                             for i, future in enumerate(as_completed(futures)):
-                                url, dim = future.result()
-                                results[url] = dim
-                                if i % 5 == 0:
-                                    progress_bar.progress((i + 1) / len(targets))
-                                    status_text.text(f"Measuring: {i+1}/{len(targets)}")
-                        st.session_state.img_real_dim_cache.update(results)
-                        status_text.success("✅ Updated!")
+                                url = futures[future]
+                                try:
+                                    _, dim = future.result()
+                                    results_cache[url] = dim
+                                except:
+                                    results_cache[url] = "Error"
+                                
+                                if i % 2 == 0:
+                                    p_bar.progress((i + 1) / len(targets))
+                                    s_text.text(f"Measuring {i+1}/{len(targets)}: {url}")
+                        
+                        st.session_state.img_real_dim_cache.update(results_cache)
+                        s_text.success(f"✅ Measured {len(results_cache)} images!")
                         time.sleep(1)
                         st.rerun()
 
-            def analyze_status(row):
+            with col_vis:
+                if st.button("3️⃣ Check Visual Dims (Playwright)"):
+                    unique_pages = img_df['source_url'].unique().tolist()
+                    
+                    if not HAS_PLAYWRIGHT:
+                        st.error("❌ Playwright not installed.")
+                    elif not unique_pages:
+                        st.warning("No pages to scan.")
+                    else:
+                        p_bar = st.progress(0)
+                        s_text = st.empty()
+                        
+                        def update_prog(i, total, url):
+                            p_bar.progress((i+1)/total)
+                            s_text.text(f"Rendering {i+1}/{total}: {url}")
+                            
+                        # Scan
+                        scan_results, img_count = measure_rendered_images(unique_pages, update_prog)
+                        
+                        if isinstance(scan_results, dict) and scan_results:
+                            st.session_state.img_rendered_cache.update(scan_results)
+                            st.success(f"✅ Scanned {len(unique_pages)} pages and captured data for {img_count} images!")
+                            time.sleep(2)
+                            st.rerun()
+                        else:
+                            st.error(f"Scan finished but no images were matched. Error: {img_count}")
+
+            # --- DEBUGGER FOR CACHE MATCHING ---
+            with st.expander("🕵️ Debug Visual Scan Data (Click if 'Not Scanned' persists)"):
+                st.write(f"Cache contains data for {len(st.session_state.img_rendered_cache)} images.")
+                if not st.session_state.img_rendered_cache:
+                    st.warning("Cache is empty. Try running the scan again.")
+                else:
+                    st.write("**First 5 Cached URLs:**")
+                    st.write(list(st.session_state.img_rendered_cache.keys())[:5])
+                    st.write("**First 5 Table URLs:**")
+                    st.write(img_df['image_url'].head(5).tolist())
+
+            # --- 4. DISPLAY DATAFRAME ---
+            st.markdown("---")
+            
+            def analyze_image_status(row):
                 real = row['real_dimensions']
                 html = row['html_dimensions']
-                if real in ['Not Checked', 'Error']: return "Unknown"
-                if html == 'Missing in HTML': return "⚠️ Missing HTML Attributes (Check CSS)"
-                try:
-                    rw, rh = map(int, real.split('x'))
-                    html_w_clean = ''.join(filter(str.isdigit, html.split('x')[0]))
-                    html_h_clean = ''.join(filter(str.isdigit, html.split('x')[1]))
-                    if not html_w_clean or not html_h_clean: return "⚠️ Invalid HTML"
-                    hw, hh = int(html_w_clean), int(html_h_clean)
-                    if rw > (hw * 1.5): return f"⚠️ Oversized (Real {rw}px > HTML {hw}px)"
-                    if rw < hw: return "⚠️ Blurry (Real < HTML)"
-                    return "✅ Well Sized"
-                except: return "ℹ️ Check Manually"
+                vis_d = row['rendered_desktop']
+                
+                status = []
+                if html == 'Missing in HTML': status.append("⚠️ Missing HTML Attrs")
+                
+                # Check for Scaling issues
+                if 'x' in str(real) and 'x' in str(vis_d) and real != 'Not Checked' and vis_d != 'Not Scanned':
+                    try:
+                        rw, rh = map(int, real.split('x'))
+                        vw, vh = map(int, vis_d.split('x'))
+                        
+                        if vw > 0 and rw < vw: status.append("⚠️ Pixelated (Real < Visible)")
+                        if vw > 0 and rw > (vw * 3): status.append("⚠️ Too Big (Real > 3x Visible)")
+                    except: pass
+                    
+                if not status: return "✅ Good"
+                return " | ".join(status)
 
             if not img_df.empty:
-                img_df['status'] = img_df.apply(analyze_status, axis=1)
+                img_df['Analysis'] = img_df.apply(analyze_image_status, axis=1)
 
-            st.dataframe(img_df, use_container_width=True, column_config={
-                "image_url": st.column_config.LinkColumn("Link"),
-                "size_kb": st.column_config.NumberColumn("KB", format="%.2f")
-            })
+            st.dataframe(
+                img_df, 
+                use_container_width=True, 
+                column_config={
+                    "image_url": st.column_config.LinkColumn("Image Link"),
+                    "source_url": st.column_config.LinkColumn("Found On Page"),
+                    "size_kb": st.column_config.NumberColumn("KB", format="%.2f"),
+                    "html_dimensions": "HTML Tag Dims",
+                    "real_dimensions": "Real File Dims (Px)",
+                    "rendered_desktop": "Visible Desktop (Px)",
+                    "rendered_mobile": "Visible Mobile (Px)"
+                },
+                column_order=["status", "Analysis", "image_url", "source_url", "alt_text", "size_kb", "html_dimensions", "real_dimensions", "rendered_desktop", "rendered_mobile"]
+            )
             
+            csv_img = img_df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download Image Report", csv_img, "images_report.csv", "text/csv")
+
+            # --- 5. OPTIMIZATION TOOL ---
             st.markdown("---")
-            st.subheader("📉 Optimize & Convert Images")
-            
-            if not HAS_PIL:
-                st.error("❌ 'Pillow' missing. Run `pip install Pillow`")
-            else:
-                st.info("Convert formats (e.g., to WebP) and reduce size.")
-                
-                c1, c2, c3 = st.columns(3)
-                min_kb = c1.number_input("⚠️ Min Size (KB):", 0, 1000, 50, help="Skip images smaller than this")
-                reduc_pct = c2.slider("📉 Quality Reduction %", 10, 90, 20, help="Higher = Smaller File")
-                target_fmt_ui = c3.selectbox("🔄 Target Format", ["Original (Keep Current)", "WebP (Recommended)", "JPEG", "PNG"])
+            with st.expander("📉 Image Optimizer (Compress/Convert)"):
+                if not HAS_PIL:
+                    st.error("❌ 'Pillow' missing. Run `pip install Pillow`")
+                else:
+                    c1, c2, c3 = st.columns(3)
+                    min_kb = c1.number_input("Filter Min Size (KB):", 0, 1000, 50)
+                    reduc_pct = c2.slider("Compression Level", 10, 90, 20)
+                    target_fmt_ui = c3.selectbox("Format", ["WebP (Best)", "JPEG", "PNG", "Original"])
 
-                if st.button("✨ Convert, Compress & Report"):
-                    out_dir = "optimized_images"
-                    if not os.path.exists(out_dir): os.makedirs(out_dir)
-
-                    candidates = img_df.drop_duplicates(subset=['image_url'])
-                    target_urls = candidates['image_url'].tolist()
-
-                    if not target_urls:
-                        st.warning("No images found.")
-                    else:
-                        progress = st.progress(0)
-                        status = st.empty()
-                        report_data = []
-                        count = 0
-                        
-                        target_q = max(10, 100 - reduc_pct)
-
-                        def process_image(url):
-                            try:
-                                r = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
-                                if r.status_code != 200: return None
-                                
-                                org_size = len(r.content) / 1024
-                                if org_size < min_kb: return None 
-
-                                img = Image.open(io.BytesIO(r.content))
-                                
-                                original_fmt = img.format if img.format else 'Unknown'
-
-                                if target_fmt_ui == "Original (Keep Current)":
-                                    fmt = original_fmt
-                                elif target_fmt_ui == "WebP (Recommended)":
-                                    fmt = "WEBP"
-                                elif target_fmt_ui == "JPEG":
-                                    fmt = "JPEG"
-                                elif target_fmt_ui == "PNG":
-                                    fmt = "PNG"
-                                else:
-                                    fmt = original_fmt
-
-                                if img.mode in ("RGBA", "P") and fmt in ["JPEG", "WebP"]:
-                                    if fmt == "JPEG": img = img.convert("RGB")
-
-                                buf = io.BytesIO()
-                                save_args = {'format': fmt, 'optimize': True}
-                                if fmt in ['JPEG', 'WEBP']: save_args['quality'] = target_q
-                                
-                                img.save(buf, **save_args)
-                                new_data = buf.getvalue()
-                                new_size = len(new_data) / 1024
-
-                                base_name = url.split('/')[-1].split('?')[0].split('.')[0]
-                                if not base_name: base_name = f"img_{uuid.uuid4().hex[:6]}"
-                                base_name = "".join([c for c in base_name if c.isalnum() or c in '_-'])
-                                
-                                ext = fmt.lower()
-                                unique_name = f"{uuid.uuid4().hex[:4]}_{base_name}.{ext}"
-                                local_path = os.path.abspath(os.path.join(out_dir, unique_name))
-                                
-                                with open(local_path, "wb") as f: f.write(new_data)
-
-                                return {
-                                    "Original URL": url,
-                                    "Old Format": original_fmt,
-                                    "New Format": fmt,
-                                    "Old KB": round(org_size, 2),
-                                    "New KB": round(new_size, 2),
-                                    "Saved KB": round(org_size - new_size, 2),
-                                    "New Path": local_path
-                                }
-                            except: return None
-
-                        with ThreadPoolExecutor(max_workers=10) as exe:
-                            futures = [exe.submit(process_image, u) for u in target_urls]
-                            for i, f in enumerate(as_completed(futures)):
-                                res = f.result()
-                                if res: 
-                                    report_data.append(res)
-                                    count += 1
-                                progress.progress((i + 1) / len(target_urls))
-                                status.text(f"📉 Processing: {i+1}/{len(target_urls)}")
-
-                        if report_data:
-                            st.success(f"✅ Processed {count} images!")
-                            rep_df = pd.DataFrame(report_data)
-                            st.dataframe(rep_df, use_container_width=True)
-                            csv_rep = rep_df.to_csv(index=False).encode('utf-8')
-                            st.download_button("📥 Download Report", csv_rep, "conversion_report.csv", "text/csv")
-                        else:
-                            st.warning("No images processed (checked size limit/errors).")
+                    if st.button("✨ Optimize Images"):
+                        st.info("Select images to optimize.")
         else:
-            st.info("No images found.")
+            st.info("No images found in crawl data.")
 
     with tab_meta_titles:
         st.subheader("📝 Meta Tags & Titles Analysis")
@@ -2122,11 +2287,9 @@ if has_data and df is not None:
         else:
             st.write("### 1. Performance Metrics")
             
-            # --- DATE VALIDATION LOGIC ---
             valid_dates = False
             start_d, end_d = None, None
             
-            # Check if date_range exists in sidebar and has 2 values (Start & End)
             if 'date_range' in locals() and isinstance(date_range, tuple) and len(date_range) == 2:
                 start_d, end_d = date_range
                 st.caption(f"Fetching data from: **{start_d}** to **{end_d}**")
@@ -2138,7 +2301,6 @@ if has_data and df is not None:
 
             if st.button("🔄 Fetch Performance (Clicks, Imp, CTR, Pos)", disabled=not valid_dates):
                 with st.spinner("Fetching performance data..."):
-                    # Pass the specific dates to the function
                     gsc_data = fetch_gsc_data(st.session_state.gsc_service, gsc_property, start_d, end_d)
                     
                     if not gsc_data.empty:
@@ -2158,7 +2320,6 @@ if has_data and df is not None:
                             zero_clicks = merged_gsc[merged_gsc['GSC Clicks'].fillna(0) == 0]
                             st.metric("Pages in List with 0 Clicks", len(zero_clicks))
                             
-                            # Clean up for display
                             display_df = merged_gsc.copy()
                             complex_cols = ['schema_dump', 'internal_links', 'external_links', 
                                           'images', 'redirect_chain', 'header_structure', 'custom_extraction']
@@ -2166,7 +2327,6 @@ if has_data and df is not None:
                                 if col in display_df.columns:
                                     display_df[col] = display_df[col].astype(str)
                             
-                            # Filter Columns for Display
                             target_cols = ['url', 'GSC Clicks', 'GSC Impressions', 'GSC CTR', 'GSC Position']
                             final_cols = [c for c in target_cols if c in display_df.columns]
                             
@@ -2257,7 +2417,7 @@ if has_data and df is not None:
                     targets = st.session_state.gsc_merged_data.sort_values(by='GSC Clicks', ascending=False).head(10).to_dict('records')
                 else:
                     st.error("Please fetch GSC Performance data first.")
-            else: # Custom List (placeholder logic, usually from file upload)
+            else: 
                  st.info("Custom List logic would go here. Defaulting to first 5 indexable pages.")
                  targets = df[df['indexability'] == 'Indexable'].head(5).to_dict('records')
             
@@ -2290,6 +2450,122 @@ if has_data and df is not None:
             
             csv_aud = res.to_csv(index=False).encode('utf-8')
             st.download_button("📥 Download Audit Report", csv_aud, "content_audit.csv", "text/csv")
+
+       # --- NEW SECTION: GRAMMAR CHECKER (UPDATED) ---
+        st.markdown("---")
+        st.subheader("📝 Grammar & Spelling Auditor")
+        st.info("Checks for spelling and grammar errors. Works for any website.")
+
+        if not HAS_LT:
+            st.error("❌ `language_tool_python` is missing. Please run: `pip install language_tool_python`")
+        else:
+            gram_scope = st.radio("Grammar Scope:", ["Selected Pages Only (Use Filter below)", "All Pages (Slow)"], horizontal=True)
+            
+            # Allow filtering to test first
+            if gram_scope == "Selected Pages Only (Use Filter below)":
+                gram_targets = st.multiselect("Select URLs to Check:", df['url'].tolist(), default=df['url'].head(3).tolist())
+            else:
+                gram_targets = df['url'].tolist()
+
+            if st.button("🔍 Check Grammar & Spelling"):
+                if not gram_targets:
+                    st.warning("No pages selected.")
+                else:
+                    progress_gram = st.progress(0)
+                    status_gram = st.empty()
+                    gram_results = []
+                    
+                    # 1. Initialize Tool
+                    tool = None
+                    use_cloud_fallback = False
+                    
+                    try:
+                        status_gram.text("Initializing LanguageTool...")
+                        tool = language_tool_python.LanguageTool('en-US') 
+                    except Exception:
+                        status_gram.text("⚠️ Java missing. Switching to Cloud API...")
+                        use_cloud_fallback = True
+
+                    total_g = len(gram_targets)
+                    
+                    for i, u in enumerate(gram_targets):
+                        # Find data row
+                        row_data = df[df['url'] == u].iloc[0]
+                        
+                        # Fields to check
+                        check_map = {
+                            'Title': row_data.get('title', ''),
+                            'H1': row_data.get('h1_tags', ''),
+                            'Meta Desc': row_data.get('meta_description', ''),
+                            'Content': row_data.get('scope_content', '')[:2500] # Check first 2500 chars
+                        }
+                        
+                        for field, text in check_map.items():
+                            if text and len(text) > 5:
+                                matches = []
+                                
+                                # A. Use Library (Local Java)
+                                if tool:
+                                    try:
+                                        lt_matches = tool.check(text)
+                                        for m in lt_matches:
+                                            matches.append({
+                                                'replacements': m.replacements[:3],
+                                                'offset': m.offset,
+                                                'length': m.errorLength
+                                            })
+                                    except: pass
+                                
+                                # B. Use Cloud Fallback (No Java)
+                                elif use_cloud_fallback:
+                                    matches = check_grammar_cloud(text)
+                                    time.sleep(0.3) # Rate limit
+                                
+                                # Process Matches into Clean Table
+                                for m in matches:
+                                    # Extract the specific wrong word using offset slicing
+                                    start = m['offset']
+                                    end = m['offset'] + m['length']
+                                    wrong_word = text[start:end]
+                                    
+                                    # Skip if it extracted nothing or just whitespace
+                                    if not wrong_word.strip():
+                                        continue
+
+                                    gram_results.append({
+                                        'Page URL': u,
+                                        'Location': field,
+                                        'Wrong Spelling': wrong_word,
+                                        'Correct Spelling': ", ".join(m['replacements'])
+                                    })
+                        
+                        progress_gram.progress((i + 1) / total_g)
+                        status_gram.text(f"Checking {i+1}/{total_g}: {u}")
+
+                    st.session_state.grammar_audit_data = pd.DataFrame(gram_results)
+                    status_gram.success("✅ Grammar Check Complete!")
+
+            # Display Results
+            if 'grammar_audit_data' in st.session_state and not st.session_state.grammar_audit_data.empty:
+                gdf = st.session_state.grammar_audit_data
+                
+                st.write(f"**Found {len(gdf)} potential errors.**")
+                
+                # Simple Clean Table
+                st.dataframe(
+                    gdf, 
+                    use_container_width=True,
+                    column_config={
+                        "Page URL": st.column_config.LinkColumn("Page"),
+                        "Wrong Spelling": st.column_config.TextColumn("Wrong Spelling", width="small"),
+                        "Correct Spelling": st.column_config.TextColumn("Correct Spelling", width="medium"),
+                    }
+                )
+                
+                csv_gram = gdf.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Download Spelling Report", csv_gram, "spelling_report.csv", "text/csv")
+            elif 'grammar_audit_data' in st.session_state:
+                st.info("No spelling errors found in the selected pages.")
 
     st.markdown("---")
     st.header("📥 Full Report")
