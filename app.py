@@ -351,11 +351,21 @@ def generate_interlink_suggestions(df, min_score=40, max_suggestions=10):
 
 def analyze_content_cannibalization(df, merge_threshold=0.50, duplicate_threshold=0.85):
     if df.empty: return pd.DataFrame()
-    df['analysis_text'] = df['title'].fillna('') + " " + df['scope_content'].fillna(df['meta_description'].fillna(''))
-    valid_df = df[df['analysis_text'].str.strip().str.len() > 10].copy().reset_index(drop=True)
+    
+    # 1. Filter out empty/thin pages to reduce noise
+    valid_df = df[df['scope_content'].str.len() > 100].copy().reset_index(drop=True)
     if len(valid_df) < 2: return pd.DataFrame()
 
-    tfidf = TfidfVectorizer(stop_words='english', min_df=2)
+    # 2. Create "Weighted" Content for comparison
+    # We repeat Title and H1 3 times so they are more important than body text
+    valid_df['analysis_text'] = (
+        (valid_df['title'].fillna('') + " ") * 3 + 
+        (valid_df['h1_tags'].fillna('') + " ") * 3 + 
+        valid_df['scope_content'].fillna('').str[:5000] # Limit body to 5000 chars
+    )
+
+    # 3. Calculate Similarity (TF-IDF)
+    tfidf = TfidfVectorizer(stop_words='english', min_df=1)
     try:
         tfidf_matrix = tfidf.fit_transform(valid_df['analysis_text'])
     except: return pd.DataFrame()
@@ -364,21 +374,32 @@ def analyze_content_cannibalization(df, merge_threshold=0.50, duplicate_threshol
     results = []
     num_rows = len(valid_df)
     
+    # 4. Compare every page against every other page
     for i in range(num_rows):
         for j in range(i + 1, num_rows):
             score = cosine_sim[i, j]
-            if score >= merge_threshold:
+            
+            # Skip if score is too low
+            if score < merge_threshold: continue
+            
+            # Determine Action based on thresholds
+            if score >= duplicate_threshold:
+                action = "🚨 Remove/Redirect (Duplicate)"
+                reason = "Content is nearly identical (>{}%)".format(int(duplicate_threshold*100))
+            else:
                 action = "🤝 Merge Content"
-                if score >= duplicate_threshold:
-                    action = "🚨 Remove/Redirect (Duplicate)"
-                results.append({
-                    'Page A': valid_df.iloc[i]['url'],
-                    'Page A Title': valid_df.iloc[i]['title'],
-                    'Page B': valid_df.iloc[j]['url'],
-                    'Page B Title': valid_df.iloc[j]['title'],
-                    'Similarity': score,
-                    'Recommendation': action
-                })
+                reason = "Topics overlap significantly (>{}%)".format(int(merge_threshold*100))
+
+            results.append({
+                'Page A': valid_df.iloc[i]['url'],
+                'Page A Title': valid_df.iloc[i]['title'],
+                'Page B': valid_df.iloc[j]['url'],
+                'Page B Title': valid_df.iloc[j]['title'],
+                'Similarity': round(score * 100, 1),
+                'Recommendation': action,
+                'Reason': reason
+            })
+            
     return pd.DataFrame(results).sort_values(by='Similarity', ascending=False)
 
 def generate_ai_meta(provider, api_key, model_name, endpoint_url, prompt_text, system_instruction="You are an SEO expert."):
@@ -1085,7 +1106,19 @@ def crawl_website(start_url, max_urls, crawl_scope, progress_container, ignore_r
     return True
 
 def crawl_from_list(url_list, progress_container, ignore_robots=False, custom_selector=None, link_selector=None, search_config=None, use_js=False, storage="RAM"):
-    crawler = UltraFrogCrawler(len(url_list), ignore_robots, custom_selector=custom_selector, link_selector=link_selector, search_config=search_config, use_js=use_js)
+    # --- FIX: Deduplicate the input list immediately ---
+    # 1. Strip whitespace and remove empty lines
+    clean_urls = [u.strip() for u in url_list if u.strip()]
+    # 2. Convert to set to remove duplicates, then back to list
+    unique_urls = list(set(clean_urls))
+    
+    # Show a message if duplicates were removed
+    if len(clean_urls) > len(unique_urls):
+        diff = len(clean_urls) - len(unique_urls)
+        st.toast(f"🧹 Removed {diff} duplicate URLs from your list.", icon="ℹ️")
+
+    # Initialize crawler with the CORRECT unique count
+    crawler = UltraFrogCrawler(len(unique_urls), ignore_robots, custom_selector=custom_selector, link_selector=link_selector, search_config=search_config, use_js=use_js)
     
     if storage == "SQLite":
         init_db(st.session_state.db_file) 
@@ -1095,9 +1128,13 @@ def crawl_from_list(url_list, progress_container, ignore_robots=False, custom_se
     st.session_state.total_crawled_count = 0
     progress_bar = progress_container.progress(0)
     status_text = progress_container.empty()
-    valid_urls = [url.strip() for url in url_list if crawler.can_fetch(url.strip())]
     
-    if not valid_urls: return False
+    # Filter valid URLs (Robots.txt check)
+    valid_urls = [url for url in unique_urls if crawler.can_fetch(url)]
+    
+    if not valid_urls: 
+        st.error("No valid URLs found (check robots.txt or your list).")
+        return False
     
     worker_count = 1 if use_js else 5
     if use_js: st.warning("🐢 JavaScript Rendering is ON. Speed reduced to 1 URL at a time.")
@@ -1122,6 +1159,7 @@ def crawl_from_list(url_list, progress_container, ignore_robots=False, custom_se
                         st.session_state.crawl_data.append(page_data)
 
                     st.session_state.total_crawled_count += 1
+                    # Progress based on UNIQUE count
                     progress = st.session_state.total_crawled_count / len(valid_urls)
                     progress_bar.progress(progress)
                     status_text.text(f"🚀 Processed: {st.session_state.total_crawled_count}/{len(valid_urls)}")
@@ -1430,15 +1468,18 @@ if has_data and df is not None:
         orphans = list(st.session_state.sitemap_urls_set - crawled_urls) if st.session_state.sitemap_urls_set else []
         st.metric("👻 Orphans", len(orphans))
     
-    # Tabs
-    tab1, tab2, tab3, tab_meta_titles, tab6, tab_struct, tab7, tab8, tab9, tab10, tab11, tab13, tab14, tab15, tab16, tab_search, tab_interlink, tab_cannibal, tab_gsc, tab_audit = st.tabs([
-        "🔗 Internal", "🌐 External", "🖼️ Images", "📝 Meta & Titles", "🏷️ Counts", 
-        "🏗️ Structure", "🔄 Redirects", "📊 Status", "🎯 Canonicals", "📱 Social", "🚀 Perf", 
+    # Tabs - MODIFIED: Merged "Counts" and "Structure" into "Header Analysis"
+    tab1, tab2, tab3, tab_meta_titles, tab_headers, tab7, tab8, tab9, tab10, tab11, tab13, tab14, tab15, tab16, tab_search, tab_interlink, tab_cannibal, tab_gsc, tab_audit = st.tabs([
+        "🔗 Internal", "🌐 External", "🖼️ Images", "📝 Meta & Titles", "🏗️ Header Analysis", 
+        "🔄 Redirects", "📊 Status", "🎯 Canonicals", "📱 Social", "🚀 Perf", 
         "👻 Orphans", "⛏️ Custom", "⚡ PSI", "🏗️ Schema", "🔍 Search Results", "💡 Interlink", "👯 Cannibalization", "📈 GSC Data", "📅 Content Audit"
     ])
     
     status_lookup = df[['url', 'status_code']].drop_duplicates()
     status_lookup.columns = ['Destination URL', 'Status Code']
+
+   # --- ADD THIS IMPORT AT THE TOP IF MISSING ---
+    import difflib 
 
     with tab1:
         st.subheader("🔗 Internal Links Analysis")
@@ -1460,9 +1501,22 @@ if has_data and df is not None:
                 if 'rel_status' not in final_links.columns: final_links['rel_status'] = 'dofollow'
                 if 'target' not in final_links.columns: final_links['target'] = '_self'
                 
+                # Ensure all columns are present
                 final_links = final_links[['Source URL', 'url', 'anchor_text', 'rel_status', 'target', 'placement', 'css_path']]
                 final_links.columns = ['Source URL', 'Destination URL', 'Anchor Text', 'Link Type', 'Target', 'Placement', 'CSS Path']
                 
+                # --- ADD INLINKS & OUTLINKS COLUMNS ---
+                counts_lookup = df[['url', 'inlinks_count', 'internal_links_count']].copy()
+                counts_lookup.columns = ['Source URL', 'Source Inlinks', 'Source Outlinks']
+                final_links = pd.merge(final_links, counts_lookup, on='Source URL', how='left')
+                
+                # --- ADD LINK SCOPE ---
+                final_links['Link Scope'] = final_links.apply(
+                    lambda x: '🔄 Same Page' if x['Source URL'] == x['Destination URL'] else '➡️ Different Page', 
+                    axis=1
+                )
+
+                # Merge with Status Codes
                 final_links = pd.merge(final_links, status_lookup, on='Destination URL', how='left')
                 
                 if 'link_status_cache' not in st.session_state:
@@ -1473,13 +1527,16 @@ if has_data and df is not None:
                 )
                 final_links['Status Code'] = final_links['Status Code'].fillna('Not Crawled').astype(str)
 
-                col_btn, col_info = st.columns([1, 3])
-                uncrawled_list = final_links[final_links['Status Code'] == 'Not Crawled']['Destination URL'].unique().tolist()
+                # --- TOOLBAR ---
+                st.write("### 🛠️ Link Tools")
+                c_btn1, c_btn2 = st.columns([1, 1])
                 
-                if col_btn.button("🔍 Check Internal Statuses"):
+                # Button 1: Status Check
+                if c_btn1.button("🔍 Check Status Codes"):
+                    uncrawled_list = final_links[final_links['Status Code'] == 'Not Crawled']['Destination URL'].unique().tolist()
                     if uncrawled_list:
-                        progress_bar = col_info.progress(0)
-                        status_text = col_info.empty()
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
                         temp_crawler = UltraFrogCrawler()
                         results = {}
                         
@@ -1489,8 +1546,7 @@ if has_data and df is not None:
                                 if r.status_code == 405:
                                     r = temp_crawler.session.get(url, timeout=5, stream=True)
                                 return url, r.status_code
-                            except:
-                                return url, "Error"
+                            except: return url, "Error"
 
                         with ThreadPoolExecutor(max_workers=20) as executor:
                             futures = [executor.submit(fetch_status, u) for u in uncrawled_list]
@@ -1502,21 +1558,79 @@ if has_data and df is not None:
                                     status_text.text(f"Checking: {u}")
                         
                         st.session_state.link_status_cache.update(results)
-                        status_text.success("✅ Internal statuses updated!")
-                        time.sleep(1)
                         st.rerun()
                     else:
-                        col_info.info("All internal links have status codes.")
+                        st.info("All statuses already checked.")
 
-                st.dataframe(final_links, use_container_width=True)
+                # Button 2: Anchor Context Analysis
+                calc_relevance = c_btn2.button("🧠 Analyze Anchor Relevance (0-100)")
                 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Nofollow Links", len(final_links[final_links['Link Type'].str.contains('nofollow')]))
-                c2.metric("Sponsored Links", len(final_links[final_links['Link Type'].str.contains('sponsored')]))
-                c3.metric("Broken Links (4xx/5xx)", len(final_links[final_links['Status Code'].str.match(r'4|5', na=False)]))
+                if calc_relevance:
+                    with st.spinner("Comparing Anchor Text vs. Target URL Slug..."):
+                        def get_anchor_score(row):
+                            anchor = str(row['Anchor Text']).lower().strip()
+                            url = str(row['Destination URL']).lower().strip()
+                            
+                            parsed = urlparse(url)
+                            path = parsed.path
+                            if '.' in path.split('/')[-1]: path = os.path.splitext(path)[0]
+                            slug = path.replace('-', ' ').replace('_', ' ').replace('/', ' ').strip()
+                            
+                            if not slug or slug == "":
+                                if "home" in anchor or "brand" in anchor: return 100
+                                return 50 
+                            
+                            generics = ['click here', 'read more', 'learn more', 'here', 'website', 'link']
+                            if anchor in generics: return 10
+                            
+                            score = difflib.SequenceMatcher(None, anchor, slug).ratio()
+                            return int(score * 100)
+
+                        final_links['Relevance Score'] = final_links.apply(get_anchor_score, axis=1)
+                        st.success("Analysis Complete!")
+
+                # --- DISPLAY ---
+                st.markdown("---")
+                
+                col_config = {
+                    "Source URL": st.column_config.LinkColumn("From Page"),
+                    "Destination URL": st.column_config.LinkColumn("To Page"),
+                    "Link Scope": st.column_config.TextColumn("Relationship", width="small"),
+                    "Source Inlinks": st.column_config.NumberColumn("Page Inlinks", help="Total incoming links to the Source URL"),
+                    "Source Outlinks": st.column_config.NumberColumn("Page Outlinks", help="Total outgoing links from the Source URL"),
+                }
+                
+                # CORRECTED ORDER: Included Target, Placement, CSS Path
+                cols_order = [
+                    'Source URL', 'Source Inlinks', 'Source Outlinks', 
+                    'Destination URL', 'Link Scope', 'Anchor Text', 'Link Type', 
+                    'Target', 'Placement', 'CSS Path', 'Status Code'
+                ]
+                
+                if 'Relevance Score' in final_links.columns:
+                    col_config["Relevance Score"] = st.column_config.ProgressColumn(
+                        "Anchor Match %", format="%d", min_value=0, max_value=100
+                    )
+                    cols_order.append('Relevance Score')
+                    final_links = final_links.sort_values(by="Relevance Score", ascending=True)
+
+                existing_cols = [c for c in cols_order if c in final_links.columns]
+                
+                st.dataframe(
+                    final_links[existing_cols], 
+                    use_container_width=True, 
+                    column_config=col_config
+                )
+                
+                # Stats
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Total Links", len(final_links))
+                c2.metric("Self-Referencing", len(final_links[final_links['Link Scope'].str.contains('Same')]))
+                c3.metric("Nofollow", len(final_links[final_links['Link Type'].str.contains('nofollow')]))
+                c4.metric("Broken", len(final_links[final_links['Status Code'].str.match(r'4|5', na=False)]))
                 
                 csv = final_links.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Download Internal Links", csv, "internal_links.csv", "text/csv")
+                st.download_button("📥 Download Link Report", csv, "internal_links.csv", "text/csv")
             else:
                 st.warning("No internal links found.")
 
@@ -1599,7 +1713,6 @@ if has_data and df is not None:
                 except: imgs = []
                 
             for img in imgs:
-                # Format HTML Dimensions
                 html_w = str(img.get('width', '')).strip()
                 html_h = str(img.get('height', '')).strip()
                 
@@ -1624,7 +1737,6 @@ if has_data and df is not None:
             img_df = pd.DataFrame(images_data)
             
             # --- 2. CACHE MANAGEMENT ---
-            # Initialize Caches
             if 'img_size_cache' not in st.session_state: st.session_state.img_size_cache = {}
             if st.session_state.img_size_cache:
                 img_df['size_kb'] = img_df['image_url'].map(st.session_state.img_size_cache).fillna(img_df['size_kb'])
@@ -1635,34 +1747,25 @@ if has_data and df is not None:
 
             if 'img_rendered_cache' not in st.session_state: st.session_state.img_rendered_cache = {}
             
-            # --- SMART MATCHING LOGIC ---
+            # Smart Matching Logic
             def normalize_url(u):
-                """Strips query params and protocol for better matching"""
                 if not u: return ""
-                u = u.split('?')[0].split('#')[0] # Remove query strings
+                u = u.split('?')[0].split('#')[0]
                 return u.replace('https://', '').replace('http://', '').replace('www.', '')
 
             def get_rendered_data(img_url, key):
                 cache = st.session_state.img_rendered_cache
                 if not cache: return 'Not Scanned'
-                
-                # 1. Try Exact Match
-                if img_url in cache and key in cache[img_url]: 
-                    return cache[img_url][key]
-                
-                # 2. Try Smart Match (Slow but effective)
+                if img_url in cache and key in cache[img_url]: return cache[img_url][key]
                 clean_target = normalize_url(img_url)
                 for cache_url, data in cache.items():
                     if clean_target in cache_url or normalize_url(cache_url) == clean_target:
                         return data.get(key, 'Not Scanned')
-                
                 return 'Not Scanned'
 
             if st.session_state.img_rendered_cache:
                 img_df['rendered_desktop'] = img_df['image_url'].apply(lambda x: get_rendered_data(x, 'Desktop'))
                 img_df['rendered_mobile'] = img_df['image_url'].apply(lambda x: get_rendered_data(x, 'Mobile'))
-                
-                # Update 'Natural' dimensions if we found them via Playwright
                 def update_natural(row):
                     if row['real_dimensions'] == 'Not Checked':
                         return get_rendered_data(row['image_url'], 'Natural').replace('Not Scanned', 'Not Checked')
@@ -1696,14 +1799,9 @@ if has_data and df is not None:
                         (img_df['real_dimensions'] == 'Not Checked') | 
                         (img_df['real_dimensions'] == 'Error')
                     ]['image_url'].unique().tolist()
-                    
-                    if not targets:
-                        st.warning("All images already checked!")
-                    else:
+                    if targets:
                         p_bar = st.progress(0)
-                        s_text = st.empty()
                         results_cache = {}
-                        
                         def get_pil_dims(u):
                             try:
                                 r = requests.get(u, timeout=8, headers={'User-Agent': 'Mozilla/5.0'}, verify=False)
@@ -1712,66 +1810,36 @@ if has_data and df is not None:
                                     img = Image.open(image_file)
                                     return u, f"{img.width}x{img.height}"
                                 return u, f"Error {r.status_code}"
-                            except Exception as e:
-                                return u, "Error"
+                            except: return u, "Error"
                         
                         with ThreadPoolExecutor(max_workers=10) as exe:
                             futures = {exe.submit(get_pil_dims, u): u for u in targets}
-                            
                             for i, future in enumerate(as_completed(futures)):
                                 url = futures[future]
-                                try:
-                                    _, dim = future.result()
-                                    results_cache[url] = dim
-                                except:
-                                    results_cache[url] = "Error"
-                                
-                                if i % 2 == 0:
-                                    p_bar.progress((i + 1) / len(targets))
-                                    s_text.text(f"Measuring {i+1}/{len(targets)}: {url}")
-                        
+                                try: results_cache[url] = future.result()[1]
+                                except: results_cache[url] = "Error"
+                                if i % 2 == 0: p_bar.progress((i + 1) / len(targets))
                         st.session_state.img_real_dim_cache.update(results_cache)
-                        s_text.success(f"✅ Measured {len(results_cache)} images!")
-                        time.sleep(1)
                         st.rerun()
 
             with col_vis:
                 if st.button("3️⃣ Check Visual Dims (Playwright)"):
                     unique_pages = img_df['source_url'].unique().tolist()
-                    
-                    if not HAS_PLAYWRIGHT:
-                        st.error("❌ Playwright not installed.")
-                    elif not unique_pages:
-                        st.warning("No pages to scan.")
+                    if not HAS_PLAYWRIGHT: st.error("❌ Playwright not installed.")
+                    elif not unique_pages: st.warning("No pages to scan.")
                     else:
                         p_bar = st.progress(0)
                         s_text = st.empty()
-                        
                         def update_prog(i, total, url):
                             p_bar.progress((i+1)/total)
                             s_text.text(f"Rendering {i+1}/{total}: {url}")
-                            
-                        # Scan
-                        scan_results, img_count = measure_rendered_images(unique_pages, update_prog)
                         
+                        scan_results, img_count = measure_rendered_images(unique_pages, update_prog)
                         if isinstance(scan_results, dict) and scan_results:
                             st.session_state.img_rendered_cache.update(scan_results)
-                            st.success(f"✅ Scanned {len(unique_pages)} pages and captured data for {img_count} images!")
-                            time.sleep(2)
+                            st.success(f"✅ Scanned {len(unique_pages)} pages!")
+                            time.sleep(1)
                             st.rerun()
-                        else:
-                            st.error(f"Scan finished but no images were matched. Error: {img_count}")
-
-            # --- DEBUGGER FOR CACHE MATCHING ---
-            with st.expander("🕵️ Debug Visual Scan Data (Click if 'Not Scanned' persists)"):
-                st.write(f"Cache contains data for {len(st.session_state.img_rendered_cache)} images.")
-                if not st.session_state.img_rendered_cache:
-                    st.warning("Cache is empty. Try running the scan again.")
-                else:
-                    st.write("**First 5 Cached URLs:**")
-                    st.write(list(st.session_state.img_rendered_cache.keys())[:5])
-                    st.write("**First 5 Table URLs:**")
-                    st.write(img_df['image_url'].head(5).tolist())
 
             # --- 4. DISPLAY DATAFRAME ---
             st.markdown("---")
@@ -1784,12 +1852,10 @@ if has_data and df is not None:
                 status = []
                 if html == 'Missing in HTML': status.append("⚠️ Missing HTML Attrs")
                 
-                # Check for Scaling issues
                 if 'x' in str(real) and 'x' in str(vis_d) and real != 'Not Checked' and vis_d != 'Not Scanned':
                     try:
                         rw, rh = map(int, real.split('x'))
                         vw, vh = map(int, vis_d.split('x'))
-                        
                         if vw > 0 and rw < vw: status.append("⚠️ Pixelated (Real < Visible)")
                         if vw > 0 and rw > (vw * 3): status.append("⚠️ Too Big (Real > 3x Visible)")
                     except: pass
@@ -1807,12 +1873,7 @@ if has_data and df is not None:
                     "image_url": st.column_config.LinkColumn("Image Link"),
                     "source_url": st.column_config.LinkColumn("Found On Page"),
                     "size_kb": st.column_config.NumberColumn("KB", format="%.2f"),
-                    "html_dimensions": "HTML Tag Dims",
-                    "real_dimensions": "Real File Dims (Px)",
-                    "rendered_desktop": "Visible Desktop (Px)",
-                    "rendered_mobile": "Visible Mobile (Px)"
-                },
-                column_order=["status", "Analysis", "image_url", "source_url", "alt_text", "size_kb", "html_dimensions", "real_dimensions", "rendered_desktop", "rendered_mobile"]
+                }
             )
             
             csv_img = img_df.to_csv(index=False).encode('utf-8')
@@ -1820,19 +1881,168 @@ if has_data and df is not None:
 
             # --- 5. OPTIMIZATION TOOL ---
             st.markdown("---")
-            with st.expander("📉 Image Optimizer (Compress/Convert)"):
-                if not HAS_PIL:
-                    st.error("❌ 'Pillow' missing. Run `pip install Pillow`")
-                else:
-                    c1, c2, c3 = st.columns(3)
-                    min_kb = c1.number_input("Filter Min Size (KB):", 0, 1000, 50)
-                    reduc_pct = c2.slider("Compression Level", 10, 90, 20)
-                    target_fmt_ui = c3.selectbox("Format", ["WebP (Best)", "JPEG", "PNG", "Original"])
+            st.subheader("📉 Optimize & Resize Images")
+            
+            if not HAS_PIL:
+                st.error("❌ 'Pillow' library missing. Run `pip install Pillow`")
+            else:
+                st.info("Resize images to match their rendered size (Step 1) and then compress them (Step 2).")
+                
+                c1, c2, c3, c4 = st.columns(4)
+                min_kb = c1.number_input("Filter Min KB:", 0, 10000, 100)
+                reduc_pct = c2.slider("Quality %", 10, 90, 50, help="Lower = Smaller File")
+                target_fmt_ui = c3.selectbox("Format", ["WebP", "JPEG", "PNG", "Original"])
+                
+                resize_mode = c4.selectbox("Resize To:", ["Original Size Only (No Resize)", "Desktop Rendered Size", "Mobile Rendered Size", "Both Desktop & Mobile"])
 
-                    if st.button("✨ Optimize Images"):
-                        st.info("Select images to optimize.")
+                if st.button("✨ Optimize Images"):
+                    out_dir = "optimized_images"
+                    if not os.path.exists(out_dir): os.makedirs(out_dir)
+
+                    # Filter candidates
+                    candidates = img_df[img_df['size_kb'] >= min_kb].drop_duplicates(subset=['image_url'])
+                    
+                    if candidates.empty:
+                        st.warning("No images found matching your size filter.")
+                    else:
+                        progress = st.progress(0)
+                        status = st.empty()
+                        report_data = []
+                        
+                        target_urls = candidates['image_url'].tolist()
+                        
+                        # Process Single Image Variant
+                        def process_variant(img_obj, url, variant_label, target_w, target_h, original_kb, original_dims_str, old_fmt):
+                            try:
+                                # 1. Resize if dimensions provided
+                                if target_w and target_h:
+                                    img_obj = img_obj.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                                
+                                new_dims_str = f"{img_obj.width}x{img_obj.height}"
+                                
+                                # 2. Format & Compress
+                                if target_fmt_ui == "Original": fmt = old_fmt
+                                elif target_fmt_ui == "WebP": fmt = "WEBP"
+                                elif target_fmt_ui == "JPEG": fmt = "JPEG"
+                                elif target_fmt_ui == "PNG": fmt = "PNG"
+                                else: fmt = old_fmt
+
+                                if img_obj.mode in ("RGBA", "P") and fmt in ["JPEG"]:
+                                    img_obj = img_obj.convert("RGB")
+                                
+                                buf = io.BytesIO()
+                                save_args = {'format': fmt, 'optimize': True}
+                                if fmt in ['JPEG', 'WEBP']: save_args['quality'] = reduc_pct
+                                
+                                img_obj.save(buf, **save_args)
+                                new_data = buf.getvalue()
+                                new_size_kb = len(new_data) / 1024
+
+                                # 3. Save
+                                base_name = url.split('/')[-1].split('?')[0].split('.')[0]
+                                if not base_name: base_name = f"img_{uuid.uuid4().hex[:6]}"
+                                base_name = "".join([c for c in base_name if c.isalnum() or c in '_-'])
+                                
+                                suffix = f"_{variant_label.lower()}" if variant_label != "Original" else ""
+                                filename = f"{base_name}{suffix}.{fmt.lower()}"
+                                local_path = os.path.abspath(os.path.join(out_dir, filename))
+                                
+                                with open(local_path, "wb") as f: f.write(new_data)
+                                
+                                return {
+                                    "Original URL": url,
+                                    "Variant": variant_label,
+                                    "Old Size KB": round(original_kb, 2),
+                                    "New Size KB": round(new_size_kb, 2),
+                                    "Before Dimension": original_dims_str,
+                                    "New Dimension": new_dims_str,
+                                    "Old Format": old_fmt,
+                                    "New Format": fmt,
+                                    "Path": local_path
+                                }
+                            except Exception as e:
+                                return None
+
+                        # Main Processing Loop
+                        def process_image_row(row_tuple):
+                            url = row_tuple.image_url
+                            
+                            # Get Rendered Data from DF row
+                            desk_render = row_tuple.rendered_desktop
+                            mob_render = row_tuple.rendered_mobile
+                            
+                            try:
+                                r = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'}, verify=False)
+                                if r.status_code != 200: return []
+                                
+                                # Capture Original Data
+                                original_kb = len(r.content) / 1024
+                                img_org = Image.open(io.BytesIO(r.content))
+                                original_dims_str = f"{img_org.width}x{img_org.height}"
+                                old_fmt = img_org.format if img_org.format else 'JPEG'
+
+                                results = []
+                                tasks = []
+                                
+                                # Define Tasks based on Selection
+                                if resize_mode == "Original Size Only (No Resize)":
+                                    tasks.append((None, None, "Original"))
+                                    
+                                elif resize_mode == "Desktop Rendered Size":
+                                    if desk_render and 'x' in desk_render and desk_render != 'Not Scanned':
+                                        dw, dh = map(int, desk_render.split('x'))
+                                        tasks.append((dw, dh, "Desktop"))
+                                    else:
+                                        tasks.append((None, None, "Skipped (Missing Data)"))
+                                        
+                                elif resize_mode == "Mobile Rendered Size":
+                                    if mob_render and 'x' in mob_render and mob_render != 'Not Scanned':
+                                        mw, mh = map(int, mob_render.split('x'))
+                                        tasks.append((mw, mh, "Mobile"))
+                                    else:
+                                        tasks.append((None, None, "Skipped (Missing Data)"))
+
+                                elif resize_mode == "Both Desktop & Mobile":
+                                    if desk_render and 'x' in desk_render and desk_render != 'Not Scanned':
+                                        dw, dh = map(int, desk_render.split('x'))
+                                        tasks.append((dw, dh, "Desktop"))
+                                    else:
+                                        tasks.append((None, None, "Skipped (Missing Data)"))
+                                    
+                                    if mob_render and 'x' in mob_render and mob_render != 'Not Scanned':
+                                        mw, mh = map(int, mob_render.split('x'))
+                                        tasks.append((mw, mh, "Mobile"))
+
+                                # Execute Tasks
+                                for w, h, label in tasks:
+                                    # Always pass a copy so the original stays clean for the next loop
+                                    res = process_variant(img_org.copy(), url, label, w, h, original_kb, original_dims_str, old_fmt)
+                                    if res: results.append(res)
+                                    
+                                return results
+
+                            except Exception: return []
+
+                        with ThreadPoolExecutor(max_workers=5) as exe:
+                            futures = [exe.submit(process_image_row, row) for row in candidates.itertuples()]
+                            for i, f in enumerate(as_completed(futures)):
+                                res_list = f.result()
+                                if res_list: report_data.extend(res_list)
+                                progress.progress((i + 1) / len(candidates))
+                                status.text(f"Processing: {i+1}/{len(candidates)}")
+
+                        if report_data:
+                            st.success(f"✅ Generated {len(report_data)} optimized images!")
+                            rep_df = pd.DataFrame(report_data)
+                            st.dataframe(rep_df, use_container_width=True)
+                            
+                            # CSV Export
+                            csv_rep = rep_df.to_csv(index=False).encode('utf-8')
+                            st.download_button("📥 Download Full Report", csv_rep, "conversion_report.csv", "text/csv")
+                        else:
+                            st.warning("No images processed successfully.")
         else:
-            st.info("No images found in crawl data.")
+            st.info("No images found.")
 
     with tab_meta_titles:
         st.subheader("📝 Meta Tags & Titles Analysis")
@@ -1906,24 +2116,20 @@ if has_data and df is not None:
                     csv_gen = res_df.to_csv(index=False).encode('utf-8')
                     st.download_button("📥 Download Generated Data", csv_gen, "ai_generated_tags.csv", "text/csv")
 
-    with tab6:
-        st.subheader("🏷️ Headers (H1-H4) Counts")
-        header_df = df[['url', 'depth', 'inlinks_count', 'h1_count', 'h1_tags', 'h2_count']].copy()
-        st.dataframe(header_df, use_container_width=True)
-        csv = header_df.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Headers", csv, "headers.csv", "text/csv")
-
-    with tab_struct:
-        st.subheader("🏗️ Heading Hierarchy Analysis")
+    with tab_headers:
+        st.subheader("🏗️ Header Architecture & Counts")
         
         if 'header_structure' in df.columns:
-            struct_df = df[['url', 'header_structure']].copy()
+            # 1. Prepare Data
+            struct_df = df[['url', 'h1_count', 'h2_count', 'h3_count', 'h4_count', 'h1_tags', 'header_structure']].copy()
+            
+            analyzed_data = []
+            problematic_urls = []
             bad_h1_count = 0
             broken_struct_count = 0
-            analyzed_data = []
-            problematic_urls = []  
             
-            for idx, row in struct_df.iterrows():
+            # 2. Run Analysis Loop
+            def get_struct_status(row):
                 struct = row['header_structure']
                 if isinstance(struct, str):
                     try: struct = json.loads(struct)
@@ -1931,99 +2137,139 @@ if has_data and df is not None:
                 
                 issues, h1_c = analyze_heading_structure(struct)
                 
-                has_error = False
-                if h1_c != 1: 
-                    bad_h1_count += 1
-                    has_error = True
-                if any("Skipped" in i for i in issues): 
-                    broken_struct_count += 1
-                    has_error = True
+                # Logic for counters
+                has_h1_issue = h1_c != 1
+                has_hierarchy_issue = any("Skipped" in i for i in issues)
                 
-                if has_error:
-                    problematic_urls.append({
-                        'URL': row['url'],
-                        'H1 Count': h1_c,
-                        'Issues': " | ".join(issues)
-                    })
+                if has_h1_issue: 
+                    # We can't modify external variable easily in apply, so we handle counting differently or just use this for the DF
+                    pass 
                 
+                status_label = "✅ Perfect"
+                if has_h1_issue and has_hierarchy_issue: status_label = "❌ H1 & Hierarchy Errors"
+                elif has_h1_issue: status_label = "❌ Bad H1 Count"
+                elif has_hierarchy_issue: status_label = "⚠️ Skipped Levels"
+                
+                # Store for Visual Inspector
                 analyzed_data.append({
                     'url': row['url'],
                     'structure': struct,
                     'issues': issues,
-                    'h1_count': h1_c
+                    'h1_count': h1_c,
+                    'status': status_label
                 })
+                
+                if has_h1_issue or has_hierarchy_issue:
+                    problematic_urls.append({
+                        'URL': row['url'],
+                        'H1 Count': h1_c,
+                        'Hierarchy Issues': " | ".join(issues)
+                    })
+                    
+                return status_label
 
-            m1, m2, m3 = st.columns(3)
+            # Apply Analysis
+            struct_df['Hierarchy Status'] = struct_df.apply(get_struct_status, axis=1)
+            
+            # Calculate Counts from the processed data
+            bad_h1_count = len(struct_df[struct_df['h1_count'] != 1])
+            broken_struct_count = len(struct_df[struct_df['Hierarchy Status'].str.contains("Skipped")])
+
+            # 3. Top Metrics
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric("Total Pages", len(df))
             m2.metric("❌ Bad H1 Usage", bad_h1_count, help="Pages with 0 or >1 H1 tags")
-            m3.metric("⚠️ Broken Hierarchy", broken_struct_count, help="Pages skipping levels (e.g. H2->H4)")
+            m3.metric("⚠️ Broken Levels", broken_struct_count, help="Pages skipping levels (e.g. H2->H4)")
+            m4.metric("✅ Perfect Structure", len(df) - len(problematic_urls))
 
             st.divider()
 
-            if problematic_urls:
-                st.write("### 🚨 Problematic Pages Report")
-                st.dataframe(
-                    pd.DataFrame(problematic_urls), 
-                    use_container_width=True,
-                    column_config={
-                        "URL": st.column_config.LinkColumn("URL"),
-                        "Issues": st.column_config.TextColumn("Issues Identified", width="large"),
-                    }
-                )
-            else:
-                st.success("✨ No hierarchy issues found across all pages!")
+            # 4. Main Data Table (Merged View)
+            st.write("### 📊 Overview Table")
+            
+            # Reorder columns for readability
+            cols_to_show = ['Hierarchy Status', 'url', 'h1_count', 'h2_count', 'h3_count', 'h1_tags']
+            st.dataframe(
+                struct_df[cols_to_show],
+                use_container_width=True,
+                column_config={
+                    "url": st.column_config.LinkColumn("Page URL"),
+                    "h1_tags": st.column_config.TextColumn("H1 Text", width="large"),
+                    "Hierarchy Status": st.column_config.TextColumn("Status", width="medium"),
+                }
+            )
+            
+            csv = struct_df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download Header Report", csv, "header_analysis.csv", "text/csv")
 
             st.divider()
 
-            st.write("### 🔍 Visual Hierarchy Inspector")
+            # 5. Visual Hierarchy Inspector (The "Deep Dive")
+            c_insp, c_tree = st.columns([1, 2])
             
-            filter_mode = st.radio("Show:", ["All Pages", "Only Pages with Issues"], horizontal=True)
-            
-            if filter_mode == "Only Pages with Issues":
-                dropdown_options = [d['URL'] for d in problematic_urls]
-            else:
-                dropdown_options = [d['url'] for d in analyzed_data]
-            
-            if not dropdown_options:
-                st.info("No pages match the filter.")
-                selected_page_url = None
-            else:
-                selected_page_url = st.selectbox("Select Page to Inspect:", dropdown_options, key="struct_select")
-
-            if selected_page_url:
-                page_data = next((item for item in analyzed_data if item['url'] == selected_page_url), None)
+            with c_insp:
+                st.write("### 🔍 Visual Inspector")
+                st.info("Select a page to visualize its Heading Tree (DOM).")
                 
-                if page_data:
-                    if page_data['issues']:
-                        for issue in page_data['issues']:
-                            if "❌" in issue: st.error(issue)
-                            else: st.warning(issue)
-                    else:
-                        st.success("✅ Perfect Heading Structure!")
+                filter_mode = st.radio("Filter List:", ["All Pages", "Only Pages with Issues"], horizontal=True)
+                
+                if filter_mode == "Only Pages with Issues":
+                    options = [d['URL'] for d in problematic_urls]
+                else:
+                    options = [d['url'] for d in analyzed_data]
+                
+                if not options:
+                    st.warning("No pages match this filter.")
+                    selected_page = None
+                else:
+                    selected_page = st.selectbox("Select Page:", options, key="merged_struct_select")
 
-                    st.markdown("#### DOM Tree:")
-                    st.markdown("""
-                    <style>
-                    .header-node { padding: 4px; border-left: 2px solid #ddd; margin-bottom: 2px; }
-                    .header-tag { font-weight: bold; color: #555; font-size: 0.8em; margin-right: 8px; }
-                    .header-text { font-family: sans-serif; }
-                    </style>
-                    """, unsafe_allow_html=True)
-
-                    if not page_data['structure']:
-                        st.info("No headers found on this page.")
+            with c_tree:
+                if selected_page:
+                    page_data = next((item for item in analyzed_data if item['url'] == selected_page), None)
                     
-                    for h in page_data['structure']:
-                        indent = (h['level'] - 1) * 20
-                        tag_color = "#e63946" if h['level'] == 1 else "#457b9d"
+                    if page_data:
+                        st.markdown(f"**Analysis for:** `{selected_page}`")
                         
-                        st.markdown(
-                            f"<div class='header-node' style='margin-left: {indent}px; border-left-color: {tag_color};'>"
-                            f"<span class='header-tag' style='color:{tag_color}'>{h['tag'].upper()}</span>"
-                            f"<span class='header-text'>{h['text']}</span>"
-                            f"</div>", 
-                            unsafe_allow_html=True
-                        )
+                        # Show Issues Badge
+                        if page_data['issues']:
+                            for issue in page_data['issues']:
+                                if "❌" in issue: st.error(issue)
+                                else: st.warning(issue)
+                        else:
+                            st.success("✅ Structure is perfectly logical.")
+
+                        # Render Tree
+                        st.markdown("#### 🌳 Heading Tree")
+                        st.markdown("""
+                        <style>
+                        .header-node { padding: 3px 8px; border-left: 3px solid #ddd; margin-bottom: 3px; font-family: monospace; }
+                        .h1-node { border-left-color: #ff4b4b; background-color: #ff4b4b1a; font-weight: bold; }
+                        .h2-node { border-left-color: #ffbd45; background-color: #ffbd451a; }
+                        .h3-node { border-left-color: #92c5de; }
+                        .h4-node { border-left-color: #e0e0e0; color: #666; }
+                        </style>
+                        """, unsafe_allow_html=True)
+
+                        if not page_data['structure']:
+                            st.info("No headers found on this page.")
+                        
+                        for h in page_data['structure']:
+                            lvl = h['level']
+                            indent = (lvl - 1) * 20
+                            # CSS Class based on level
+                            css_class = "header-node"
+                            if lvl == 1: css_class += " h1-node"
+                            elif lvl == 2: css_class += " h2-node"
+                            elif lvl == 3: css_class += " h3-node"
+                            elif lvl >= 4: css_class += " h4-node"
+                            
+                            st.markdown(
+                                f"<div class='{css_class}' style='margin-left: {indent}px;'>"
+                                f"<span>{h['tag'].upper()}</span>: {h['text']}"
+                                f"</div>", 
+                                unsafe_allow_html=True
+                            )
         else:
             st.warning("Header structure data not available. Please re-crawl the site.")
 
@@ -2242,40 +2488,88 @@ if has_data and df is not None:
     
     with tab_cannibal:
         st.subheader("👯 Content Similarity & Pruning")
-        st.info("Finds pages that are too similar. Helps you merge thin content or remove duplicates.")
+        st.markdown("""
+        **Two-Step Pruning Strategy:**
+        1. **Duplicates (High Match):** Pages that are copies. Action: *Delete or 301 Redirect.*
+        2. **Cannibalization (Medium Match):** Different pages fighting for the same topic. Action: *Merge content.*
+        """)
+        
         if not HAS_SKLEARN:
-            st.error("❌ 'scikit-learn' is not installed. Please run: `pip install scikit-learn` in your terminal to use AI features.")
+            st.error("❌ 'scikit-learn' is not installed. Please run: `pip install scikit-learn`")
         else:
             col1, col2 = st.columns(2)
-            merge_thresh = col1.slider("Merge Threshold %", 30, 90, 50, help="Lower = Find loosely related topics.")
-            dupe_thresh = col2.slider("Duplicate Threshold %", 80, 100, 85, help="Higher = Find exact matches only.")
+            
+            # --- RESTORED SLIDERS ---
+            merge_thresh = col1.slider("Merge Threshold % (Topic Overlap)", 30, 90, 60, help="Finds pages that talk about similar things.")
+            dupe_thresh = col2.slider("Duplicate Threshold % (Exact Copies)", 80, 100, 90, help="Finds pages that are almost identical.")
             
             if st.button("🔍 Analyze Content Similarity"):
-                with st.spinner("Comparing every page against every other page..."):
-                    cannibal_df = analyze_content_cannibalization(df, merge_threshold=merge_thresh/100, duplicate_threshold=dupe_thresh/100)
-                    st.session_state.cannibal_data = cannibal_df
+                with st.spinner("Comparing semantic fingerprints (Title + H1 + Body)..."):
+                    if 'scope_content' not in df.columns:
+                        st.error("Please re-crawl the website to capture content data.")
+                    else:
+                        cannibal_df = analyze_content_cannibalization(df, merge_threshold=merge_thresh/100, duplicate_threshold=dupe_thresh/100)
+                        st.session_state.cannibal_data = cannibal_df
             
-            if 'cannibal_data' in st.session_state and not st.session_state.cannibal_data.empty:
+            # --- DISPLAY RESULTS ---
+            if 'cannibal_data' in st.session_state:
                 data = st.session_state.cannibal_data
-                duplicates = data[data['Recommendation'].str.contains("Remove")]
-                st.write("### 🚨 High Risk: Duplicates to Remove")
-                if not duplicates.empty:
-                    st.error(f"Found {len(duplicates)} pairs that look nearly identical.")
-                    st.dataframe(duplicates, use_container_width=True)
+                
+                if data.empty:
+                    st.success("✅ No similarity found above your thresholds.")
                 else:
-                    st.success("✅ No exact duplicates found.")
+                    # SECTION 1: DUPLICATES (TO REMOVE)
+                    duplicates = data[data['Recommendation'].str.contains("Remove")]
+                    st.write("### 🚨 1. Duplicates (High Risk - Remove/Redirect)")
+                    if not duplicates.empty:
+                        st.error(f"Found {len(duplicates)} pages that look like copies.")
+                        st.dataframe(
+                            duplicates, 
+                            use_container_width=True,
+                            column_config={
+                                "Similarity": st.column_config.ProgressColumn("Match %", format="%.1f%%", min_value=0, max_value=100),
+                                "Page A": st.column_config.LinkColumn("Page A"),
+                                "Page B": st.column_config.LinkColumn("Page B"),
+                            }
+                        )
+                    else:
+                        st.info("No exact duplicates found.")
 
-                st.divider()
-                mergers = data[data['Recommendation'].str.contains("Merge")]
-                st.write("### 🤝 Opportunities: Topics to Merge")
-                if not mergers.empty:
-                    st.warning(f"Found {len(mergers)} pairs covering similar topics. Consider combining them.")
-                    st.dataframe(mergers, use_container_width=True)
-                else:
-                    st.info("No obvious merge candidates found with current settings.")
+                    st.divider()
+
+                    # SECTION 2: MERGERS (TO COMBINE)
+                    mergers = data[data['Recommendation'].str.contains("Merge")]
+                    st.write("### 🤝 2. Merge Opportunities (Keyword Cannibalization)")
+                    if not mergers.empty:
+                        st.warning(f"Found {len(mergers)} pages covering similar topics.")
+                        st.caption("These pages are likely competing for the same keywords. Pick the strongest one and merge the others into it.")
+                        st.dataframe(
+                            mergers, 
+                            use_container_width=True,
+                            column_config={
+                                "Similarity": st.column_config.ProgressColumn("Match %", format="%.1f%%", min_value=0, max_value=100),
+                                "Page A": st.column_config.LinkColumn("Page A"),
+                                "Page B": st.column_config.LinkColumn("Page B"),
+                            }
+                        )
+                    else:
+                        st.info("No merge opportunities found with current settings.")
                     
-            elif 'cannibal_data' in st.session_state:
-                 st.info("No similarities found above the threshold.")
+                    st.divider()
+                    
+                    # Filter for Mergers
+                    mergers = data[data['Recommendation'].str.contains("Merge")]
+                    if not mergers.empty:
+                        st.warning(f"🤝 Found {len(mergers)} pages covering similar topics (Keyword Cannibalization).")
+                        st.dataframe(
+                            mergers, 
+                            use_container_width=True,
+                            column_config={
+                                "Similarity Score": st.column_config.ProgressColumn("Similarity", format="%.1f%%", min_value=0, max_value=100),
+                                "Page A": st.column_config.LinkColumn("Keep This?"),
+                                "Page B": st.column_config.LinkColumn("Redirect This?"),
+                            }
+                        )
 
     with tab_gsc:
         st.subheader("📈 Google Search Console Analysis")
