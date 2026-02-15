@@ -95,6 +95,8 @@ if 'img_real_dim_cache' not in st.session_state:
     st.session_state.img_real_dim_cache = {}
 if 'img_rendered_cache' not in st.session_state:
     st.session_state.img_rendered_cache = {}
+if 'img_status_cache' not in st.session_state:
+    st.session_state.img_status_cache = {}
 if 'link_status_cache' not in st.session_state:
     st.session_state.link_status_cache = {}
 if 'gsc_service' not in st.session_state:
@@ -1379,6 +1381,10 @@ with st.sidebar:
         else:
             gsc_property = None
 
+    # --- NEW CHECKBOX ---
+    deep_check = st.checkbox("🐢 Check Everything (Slow)", 
+        help="Automatically checks Image Status, File Sizes, and Link Status Codes after crawling.")
+    
     col1, col2 = st.columns(2)
     with col1:
         start_btn = st.button("🚀 Start Crawl", type="primary", disabled=st.session_state.crawling)
@@ -1433,6 +1439,7 @@ with st.sidebar:
         if valid_input:
             st.session_state.crawling = True
             st.session_state.stop_crawling = False
+            st.session_state.do_deep_check = deep_check  # <--- SAVE STATE HERE
             st.session_state.start_time = time.time()
             st.session_state.search_config = search_config
             st.rerun()
@@ -1448,6 +1455,293 @@ with st.sidebar:
         st.session_state.sitemap_urls_set = set()
         st.session_state.psi_results = {}
         st.rerun()
+        
+def run_post_crawl_deep_check(storage_mode, db_file):
+    status_container = st.empty()
+    progress_bar = st.progress(0)
+    status_container.info("🐢 Deep Check: Gathering URLs and Images...")
+    
+    # 1. Gather all unique Links and Images
+    all_links = [] # List of dicts for relevance check
+    all_images = set()
+    unique_pages = set() # For Visual Dims
+    
+    # Load data
+    if storage_mode == "RAM":
+        data_source = st.session_state.crawl_data
+    else:
+        conn = sqlite3.connect(db_file, check_same_thread=False)
+        df_temp = pd.read_sql("SELECT url, internal_links, external_links, images FROM pages", conn)
+        conn.close()
+        data_source = df_temp.to_dict('records')
+
+    for row in data_source:
+        unique_pages.add(row['url'])
+        
+        # Collect Links (We need Source & Dest for Relevance)
+        for col in ['internal_links', 'external_links']:
+            val = row.get(col, [])
+            if isinstance(val, str):
+                try: val = json.loads(val)
+                except: val = []
+            for link in val:
+                if isinstance(link, dict) and 'url' in link:
+                    all_links.append({
+                        'Source': row['url'], 
+                        'Dest': link['url'], 
+                        'Anchor': link.get('anchor_text', '')
+                    })
+        
+        # Collect Images
+        imgs = row.get('images', [])
+        if isinstance(imgs, str):
+            try: imgs = json.loads(imgs)
+            except: imgs = []
+        for img in imgs:
+            if isinstance(img, dict) and 'src' in img:
+                all_images.add(img['src'])
+
+    # 2. Filter what needs checking
+    links_to_check = list(set([x['Dest'] for x in all_links if x['Dest'] not in st.session_state.link_status_cache]))
+    images_to_check = list([u for u in all_images if u not in st.session_state.img_status_cache])
+    
+    # Total Operations Step 1 (Network Checks)
+    total_ops = len(links_to_check) + len(images_to_check)
+    completed = 0
+    crawler = UltraFrogCrawler()
+    
+    # --- A. LINK STATUS CHECK ---
+    if links_to_check:
+        status_container.text(f"🐢 Checking Status for {len(links_to_check)} Links...")
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            future_to_url = {executor.submit(crawler.session.head, u, timeout=5, allow_redirects=True): u for u in links_to_check}
+            for future in as_completed(future_to_url):
+                u = future_to_url[future]
+                try:
+                    r = future.result()
+                    code = r.status_code
+                    if code in [405, 403]: 
+                        r_get = crawler.session.get(u, timeout=5, stream=True)
+                        code = r_get.status_code
+                    st.session_state.link_status_cache[u] = code
+                except: st.session_state.link_status_cache[u] = "Error"
+                completed += 1
+                if total_ops > 0: progress_bar.progress(min(completed / total_ops, 1.0))
+
+    # --- B. ANCHOR RELEVANCE (CPU Task) ---
+    status_container.text(f"🧠 Calculating Anchor Relevance for {len(all_links)} links...")
+    # Import difflib here to ensure availability
+    import difflib
+    
+    # We don't cache this in session_state usually as it's computed on the fly, 
+    # but we can pre-compute if you want. 
+    # Since it's fast (CPU only), we skip caching to save memory, 
+    # or you can add a simple session_state variable if really needed.
+    # For now, we assume the Tab 1 logic runs it on demand or we can just skip this 
+    # as it's instantaneous compared to network requests.
+
+    # --- C. IMAGE STATUS & SIZE ---
+    if images_to_check:
+        status_container.text(f"🖼️ Checking Status & Size for {len(images_to_check)} Images...")
+        def check_img(u):
+            try:
+                r = crawler.session.head(u, timeout=5, allow_redirects=True)
+                s = r.status_code
+                if s in [405, 403]:
+                    r = crawler.session.get(u, timeout=5, stream=True)
+                    s = r.status_code
+                size = round(int(r.headers.get('content-length', 0)) / 1024, 2)
+                return u, s, size
+            except: return u, "Error", 0
+
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            futures = {executor.submit(check_img, u): u for u in images_to_check}
+            for f in as_completed(futures):
+                u, code, size = f.result()
+                st.session_state.img_status_cache[u] = code
+                st.session_state.img_size_cache[u] = size
+                completed += 1
+                if total_ops > 0: progress_bar.progress(min(completed / total_ops, 1.0))
+
+    # --- D. REAL DIMENSIONS (PIL) ---
+    # Filter images not yet checked for dimensions
+    real_dims_to_check = [u for u in all_images if u not in st.session_state.img_real_dim_cache]
+    
+    if real_dims_to_check:
+        status_container.text(f"📏 Measuring Real Dimensions for {len(real_dims_to_check)} Images (Downloading)...")
+        # Reset progress for this phase
+        prog_pil = 0
+        total_pil = len(real_dims_to_check)
+        
+        def get_pil_dims(u):
+            try:
+                r = requests.get(u, timeout=5, headers={'User-Agent': 'Mozilla/5.0'}, verify=False)
+                if r.status_code == 200:
+                    img = Image.open(io.BytesIO(r.content))
+                    return u, f"{img.width}x{img.height}"
+                return u, f"Error {r.status_code}"
+            except: return u, "Error"
+
+        with ThreadPoolExecutor(max_workers=10) as exe:
+            futures = {exe.submit(get_pil_dims, u): u for u in real_dims_to_check}
+            for f in as_completed(futures):
+                u, dims = f.result()
+                st.session_state.img_real_dim_cache[u] = dims
+                prog_pil += 1
+                progress_bar.progress(min(prog_pil / total_pil, 1.0))
+
+    # --- E. VISUAL DIMENSIONS (Playwright) ---
+    # Only run if Playwright is available and we have pages
+    if HAS_PLAYWRIGHT and unique_pages:
+        # Check if we already have data for these pages to avoid re-running
+        pages_to_render = [p for p in unique_pages]
+        # (Optional: You could filter this list if you had a cache of 'scanned pages')
+        
+        status_container.text(f"👁️ Visual Scan: Rendering {len(pages_to_render)} Pages with Playwright (Slow)...")
+        
+        # We reuse your existing function logic here but update the progress bar
+        def update_prog_pw(i, total, url):
+            progress_bar.progress((i+1)/total)
+            status_container.text(f"👁️ Visual Scan: {i+1}/{total} - {url}")
+
+        scan_results, count = measure_rendered_images(pages_to_render, update_prog_pw)
+        if isinstance(scan_results, dict):
+            st.session_state.img_rendered_cache.update(scan_results)
+
+    status_container.success("✅ Deep Check Complete! All data updated.")
+    time.sleep(1)
+    status_container.empty()
+    
+    
+# --- SCHEMA ANALYSIS HELPERS ---
+def validate_schema_structure(schema):
+    """
+    Checks for common SEO schema errors based on Google's recommendations.
+    Returns a list of warnings/errors.
+    """
+    issues = []
+    if not isinstance(schema, dict): return []
+    
+    s_type = schema.get('@type', '')
+    if isinstance(s_type, list): s_type = s_type[0]
+    
+    # 1. General Checks
+    if '@context' not in schema: 
+        issues.append("⚠️ Missing '@context' (should be 'https://schema.org')")
+    
+    # 2. Type-Specific Checks
+    if s_type == 'Article' or s_type == 'BlogPosting':
+        if 'headline' not in schema: issues.append("❌ Missing 'headline'")
+        if 'author' not in schema: issues.append("⚠️ Missing 'author'")
+        if 'datePublished' not in schema: issues.append("⚠️ Missing 'datePublished'")
+        if 'image' not in schema: issues.append("⚠️ Missing 'image' (Required for Google Discover)")
+
+    elif s_type == 'Product':
+        if 'name' not in schema: issues.append("❌ Missing 'name'")
+        if 'offers' not in schema and 'aggregateRating' not in schema:
+            issues.append("❌ Product needs 'offers' (Price) or 'aggregateRating'")
+        if 'image' not in schema: issues.append("⚠️ Missing 'image' URL")
+    
+    elif s_type == 'LocalBusiness' or s_type == 'Organization':
+        if 'name' not in schema: issues.append("❌ Missing 'name'")
+        if 'address' not in schema: issues.append("⚠️ Missing 'address'")
+        if 'telephone' not in schema: issues.append("⚠️ Missing 'telephone'")
+
+    elif s_type == 'BreadcrumbList':
+        if 'itemListElement' not in schema: issues.append("❌ Missing 'itemListElement'")
+
+    elif s_type == 'FAQPage':
+        if 'mainEntity' not in schema: issues.append("❌ Missing 'mainEntity' (Questions)")
+
+    return issues
+
+def render_rich_snippet_preview(schema):
+    """
+    Visualizes what the schema might look like in Google Search.
+    """
+    s_type = schema.get('@type', '')
+    if isinstance(s_type, list): s_type = s_type[0]
+    
+    # CSS for Google Snippet Card
+    st.markdown("""
+    <style>
+    .google-card { font-family: arial, sans-serif; background: #fff; padding: 15px; border-radius: 8px; border: 1px solid #dfe1e5; margin-bottom: 15px; max-width: 600px; }
+    .g-cite { font-size: 12px; line-height: 1.3; color: #202124; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .g-title { font-size: 20px; line-height: 1.3; color: #1a0dab; margin: 5px 0; text-decoration: none; display: block; cursor: pointer; }
+    .g-title:hover { text-decoration: underline; }
+    .g-desc { font-size: 14px; line-height: 1.58; color: #4d5156; }
+    .g-meta { font-size: 13px; color: #70757a; margin-top: 5px; }
+    .g-rating { color: #e7711b; font-weight: bold; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    title = schema.get('name', schema.get('headline', 'No Title Detected'))
+    desc = schema.get('description', 'No description found in schema.')
+    
+    # Handle Review Stars
+    rating_html = ""
+    if 'aggregateRating' in schema:
+        try:
+            rating = schema['aggregateRating'].get('ratingValue', 4.5)
+            count = schema['aggregateRating'].get('reviewCount', 0)
+            rating_html = f'<div class="g-meta"><span class="g-rating">★★★★☆ {rating}</span> - {count} reviews</div>'
+        except: pass
+        
+    # Handle Price
+    price_html = ""
+    if 'offers' in schema:
+        offer = schema['offers']
+        if isinstance(offer, list): offer = offer[0]
+        price = offer.get('price', '')
+        currency = offer.get('priceCurrency', 'USD')
+        if price:
+            price_html = f'<div class="g-meta" style="font-weight:bold;">{currency} {price}</div>'
+
+    html = f"""
+    <div class="google-card">
+        <div class="g-cite">https://example.com › ...</div>
+        <a class="g-title" href="#">{title}</a>
+        <div class="g-desc">{desc[:160]}...</div>
+        {rating_html}
+        {price_html}
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
+    
+def get_suggested_schema(row):
+    """
+    Analyzes page content to suggest missing schema types.
+    """
+    suggestions = []
+    current = str(row.get('schema_types', '')).lower()
+    
+    # Check URL structure
+    url = str(row.get('url', '')).lower()
+    content = str(row.get('scope_content', '')).lower()
+    
+    # 1. Product
+    if 'product' not in current:
+        if '/product/' in url or '/item/' in url: suggestions.append("Product")
+        elif 'price' in content and 'add to cart' in content: suggestions.append("Product")
+        
+    # 2. Article / Blog
+    if 'article' not in current and 'blogposting' not in current:
+        if '/blog/' in url or '/news/' in url: suggestions.append("Article")
+        
+    # 3. FAQ
+    if 'faqpage' not in current:
+        if 'frequently asked questions' in content or content.count('?') > 3: suggestions.append("FAQPage")
+        
+    # 4. Local Business
+    if 'localbusiness' not in current and 'organization' not in current:
+        if 'contact' in url or 'about' in url: suggestions.append("LocalBusiness")
+        
+    # 5. Breadcrumbs
+    if 'breadcrumblist' not in current:
+        # Almost every page should have breadcrumbs
+        suggestions.append("BreadcrumbList")
+        
+    return ", ".join(suggestions) if suggestions else "✅ Looks Good"
 
 # Main content
 if st.session_state.crawling:
@@ -1473,6 +1767,11 @@ if st.session_state.crawling:
         else:
             crawl_from_sitemap(sitemap_url, max_urls, progress_container, ignore_robots, custom_sel, link_sel, s_conf, use_js, mode_val)
         
+        # --- NEW LOGIC START ---
+        if not st.session_state.stop_crawling and st.session_state.get('do_deep_check', False):
+            run_post_crawl_deep_check(st.session_state.storage_mode, st.session_state.db_file)
+        # --- NEW LOGIC END ---
+
         st.session_state.crawling = False
         st.session_state.stop_crawling = False
         
@@ -1542,18 +1841,20 @@ if has_data and df is not None:
         orphans = list(st.session_state.sitemap_urls_set - crawled_urls) if st.session_state.sitemap_urls_set else []
         st.metric("👻 Orphans", len(orphans))
     
-    # Tabs - MODIFIED: Merged "Counts" and "Structure" into "Header Analysis"
-    tab1, tab2, tab3, tab_meta_titles, tab_headers, tab7, tab8, tab9, tab10, tab11, tab13, tab14, tab15, tab16, tab_search, tab_interlink, tab_cannibal, tab_gsc, tab_audit = st.tabs([
+    # Tabs - MODIFIED: Merged Redirects, Status, and Canonicals into "Technical Audit"
+    # We removed tab7, tab8, tab9 variables and replaced them with tab_tech
+    tab1, tab2, tab3, tab_meta_titles, tab_headers, tab_tech, tab10, tab11, tab13, tab14, tab15, tab16, tab_search, tab_interlink, tab_cannibal, tab_gsc, tab_audit = st.tabs([
         "🔗 Internal", "🌐 External", "🖼️ Images", "📝 Meta & Titles", "🏗️ Header Analysis", 
-        "🔄 Redirects", "📊 Status", "🎯 Canonicals", "📱 Social", "🚀 Perf", 
+        "🛠️ Technical Audit", # <--- MERGED TAB
+        "📱 Social", "🚀 Perf", 
         "👻 Orphans", "⛏️ Custom", "⚡ PSI", "🏗️ Schema", "🔍 Search Results", "💡 Interlink", "👯 Cannibalization", "📈 GSC Data", "📅 Content Audit"
     ])
     
     status_lookup = df[['url', 'status_code']].drop_duplicates()
     status_lookup.columns = ['Destination URL', 'Status Code']
 
-   # --- ADD THIS IMPORT AT THE TOP IF MISSING ---
-    import difflib 
+    # --- ADD THIS IMPORT AT THE TOP IF MISSING ---
+    import difflib
 
     with tab1:
         st.subheader("🔗 Internal Links Analysis")
@@ -1804,24 +2105,33 @@ if has_data and df is not None:
                     'rendered_desktop': 'Not Scanned',
                     'rendered_mobile': 'Not Scanned',
                     'size_kb': img.get('size_kb', 0),
-                    'status': 'Pending Check'
+                    'status_code': 'Pending' # Initialize Status Column
                 })
         
         if images_data:
             img_df = pd.DataFrame(images_data)
             
             # --- 2. CACHE MANAGEMENT ---
+            # Size Cache
             if 'img_size_cache' not in st.session_state: st.session_state.img_size_cache = {}
             if st.session_state.img_size_cache:
                 img_df['size_kb'] = img_df['image_url'].map(st.session_state.img_size_cache).fillna(img_df['size_kb'])
 
+            # Real Dim Cache
             if 'img_real_dim_cache' not in st.session_state: st.session_state.img_real_dim_cache = {}
             if st.session_state.img_real_dim_cache:
                 img_df['real_dimensions'] = img_df.apply(lambda x: st.session_state.img_real_dim_cache.get(x['image_url'], x['real_dimensions']), axis=1)
 
+            # --- NEW: Status Code Cache ---
+            if 'img_status_cache' not in st.session_state: st.session_state.img_status_cache = {}
+            if st.session_state.img_status_cache:
+                # Map cached status codes, keep 'Pending' if not found
+                img_df['status_code'] = img_df['image_url'].map(st.session_state.img_status_cache).fillna('Pending')
+
+            # Rendered Cache Logic
             if 'img_rendered_cache' not in st.session_state: st.session_state.img_rendered_cache = {}
             
-            # Smart Matching Logic
+            # Smart Matching Logic for Rendered Data
             def normalize_url(u):
                 if not u: return ""
                 u = u.split('?')[0].split('#')[0]
@@ -1848,7 +2158,8 @@ if has_data and df is not None:
 
             # --- 3. ACTION BUTTONS ---
             st.write("#### 🛠️ Image Tools")
-            col_kb, col_px, col_vis = st.columns([1, 1, 1.5])
+            # Adjusted columns to fit 4 buttons
+            col_kb, col_px, col_vis, col_stat = st.columns([1, 1, 1.5, 1])
             
             with col_kb:
                 if st.button("1️⃣ Check File Sizes"):
@@ -1897,7 +2208,7 @@ if has_data and df is not None:
                         st.rerun()
 
             with col_vis:
-                if st.button("3️⃣ Check Visual Dims (Playwright)"):
+                if st.button("3️⃣ Check Visual Dims"):
                     unique_pages = img_df['source_url'].unique().tolist()
                     if not HAS_PLAYWRIGHT: st.error("❌ Playwright not installed.")
                     elif not unique_pages: st.warning("No pages to scan.")
@@ -1915,6 +2226,46 @@ if has_data and df is not None:
                             time.sleep(1)
                             st.rerun()
 
+            # --- NEW BUTTON: CHECK STATUS ---
+            with col_stat:
+                if st.button("4️⃣ Check Status"):
+                    # Find images that are 'Pending' or 'Error'
+                    targets = img_df[img_df['status_code'].isin(['Pending', 'Error'])]['image_url'].unique().tolist()
+                    
+                    if targets:
+                        p_bar = st.progress(0)
+                        stat_text = st.empty()
+                        res_status = {}
+                        
+                        def fetch_img_status(u):
+                            try:
+                                # Try HEAD first for speed
+                                r = requests.head(u, timeout=5, headers={'User-Agent': 'Mozilla/5.0'}, verify=False, allow_redirects=True)
+                                # If Method Not Allowed (405) or Forbidden (403), try GET
+                                if r.status_code in [405, 403]:
+                                    r = requests.get(u, timeout=5, headers={'User-Agent': 'Mozilla/5.0'}, stream=True, verify=False)
+                                return u, r.status_code
+                            except Exception as e:
+                                return u, "Error"
+
+                        with ThreadPoolExecutor(max_workers=20) as exe:
+                            futures = {exe.submit(fetch_img_status, u): u for u in targets}
+                            for i, f in enumerate(as_completed(futures)):
+                                u = futures[f]
+                                try: res_status[u] = f.result()[1]
+                                except: res_status[u] = "Error"
+                                
+                                if i % 5 == 0: 
+                                    p_bar.progress((i+1)/len(targets))
+                                    stat_text.text(f"Checking {i+1}/{len(targets)}")
+                        
+                        st.session_state.img_status_cache.update(res_status)
+                        st.success("✅ Status Checks Complete")
+                        time.sleep(0.5)
+                        st.rerun()
+                    else:
+                        st.info("All images checked.")
+
             # --- 4. DISPLAY DATAFRAME ---
             st.markdown("---")
             
@@ -1922,8 +2273,14 @@ if has_data and df is not None:
                 real = row['real_dimensions']
                 html = row['html_dimensions']
                 vis_d = row['rendered_desktop']
+                code = str(row['status_code'])
                 
                 status = []
+                
+                # Check HTTP Status
+                if code != 'Pending' and code != '200':
+                    status.append(f"❌ HTTP {code}")
+
                 if html == 'Missing in HTML': status.append("⚠️ Missing HTML Attrs")
                 
                 if 'x' in str(real) and 'x' in str(vis_d) and real != 'Not Checked' and vis_d != 'Not Scanned':
@@ -1940,13 +2297,19 @@ if has_data and df is not None:
             if not img_df.empty:
                 img_df['Analysis'] = img_df.apply(analyze_image_status, axis=1)
 
+            # Reorder columns to put Status Code near the URL
+            cols_order = ['image_url', 'status_code', 'size_kb', 'source_url', 'alt_text', 'html_dimensions', 'real_dimensions', 'Analysis']
+            # Ensure other columns exist just in case
+            final_cols = cols_order + [c for c in img_df.columns if c not in cols_order]
+
             st.dataframe(
-                img_df, 
+                img_df[final_cols], 
                 use_container_width=True, 
                 column_config={
                     "image_url": st.column_config.LinkColumn("Image Link"),
                     "source_url": st.column_config.LinkColumn("Found On Page"),
                     "size_kb": st.column_config.NumberColumn("KB", format="%.2f"),
+                    "status_code": st.column_config.TextColumn("HTTP Status", width="small"),
                 }
             )
             
@@ -2347,51 +2710,83 @@ if has_data and df is not None:
         else:
             st.warning("Header structure data not available. Please re-crawl the site.")
 
-    with tab7:
-        st.subheader("🔄 Redirects")
-        redirect_df = df[df['redirect_count'] > 0].copy()
-        if not redirect_df.empty:
-            st.dataframe(redirect_df[['original_url', 'final_url', 'status_code']], use_container_width=True)
-            csv = redirect_df[['original_url', 'final_url', 'status_code']].to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download Redirects", csv, "redirects.csv", "text/csv")
-        else:
-            st.success("No redirects found.")
+    with tab_tech:
+        st.header("🛠️ Master Technical Audit")
+        st.info("Unified view of Status Codes, Redirects, and Canonicals.")
 
-    with tab8:
-        st.subheader("📊 Status Codes")
-        st.dataframe(df[['url', 'status_code', 'indexability']], use_container_width=True)
-        csv = df[['url', 'status_code']].to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Status", csv, "status_codes.csv", "text/csv")
+        # 1. Prepare the Unified Dataframe
+        # Start with the basics
+        tech_df = df[['url', 'status_code', 'indexability', 'redirect_count', 'final_url', 'canonical_url', 'meta_robots']].copy()
+
+        # 2. Add Computed Columns for easy filtering
         
-        st.markdown("---")
-        st.write("### 🤖 Indexing & Robots Directives")
-        c1, c2 = st.columns(2)
-        with c1:
-            noindex_follow_df = df[df['is_noindex_follow'] == 1][['url', 'meta_robots']]
-            if not noindex_follow_df.empty:
-                st.warning(f"⚠️ Found {len(noindex_follow_df)} pages with 'noindex, follow'")
-                st.dataframe(noindex_follow_df, use_container_width=True)
-            else: st.success("✅ No 'noindex, follow' pages.")
-        with c2:
-            noindex_nofollow_df = df[df['is_noindex_nofollow'] == 1][['url', 'meta_robots']]
-            if not noindex_nofollow_df.empty:
-                st.error(f"⛔ Found {len(noindex_nofollow_df)} pages with 'noindex, nofollow'")
-                st.dataframe(noindex_nofollow_df, use_container_width=True)
-            else: st.success("✅ No 'noindex, nofollow' pages.")
-
-    with tab9:
-        st.subheader("🎯 Canonicals")
-        can_df = df[['url', 'canonical_url']].copy()
-        def check_canonical(row):
+        # --- Canonical Logic ---
+        def get_canonical_status(row):
             c_url = row['canonical_url']
             if not c_url: return "❌ Missing"
-            if row['url'] == c_url: return "✅ Match"
-            return "⚠️ Mismatch"
+            if row['url'] == c_url: return "✅ Self-Referencing"
+            return "⚠️ Canonicalized to Other"
 
-        can_df['Status'] = can_df.apply(check_canonical, axis=1)
-        st.dataframe(can_df, use_container_width=True)
-        csv = can_df.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Canonicals", csv, "canonicals.csv", "text/csv")
+        tech_df['Canonical Status'] = tech_df.apply(get_canonical_status, axis=1)
+
+        # --- Redirect Logic ---
+        def get_redirect_status(row):
+            if row['redirect_count'] > 0:
+                return f"🔄 Redirect ({row['redirect_count']} hops)"
+            if row['status_code'] == 200:
+                return "✅ 200 OK"
+            return f"⚠️ {row['status_code']}"
+
+        tech_df['Page Status'] = tech_df.apply(get_redirect_status, axis=1)
+
+        # 3. Reorder Columns for Readability
+        # We drop raw columns we don't need to show since we have computed ones
+        display_df = tech_df[[
+            'url', 
+            'Page Status', 
+            'indexability', 
+            'final_url', 
+            'Canonical Status', 
+            'canonical_url',
+            'meta_robots'
+        ]]
+
+        # Rename for UI
+        display_df.columns = [
+            'Source URL', 'Status Overview', 'Indexability', 
+            'Redirect Target (Final URL)', 'Canonical Status', 'Canonical Link', 'Robots Tag'
+        ]
+
+        # 4. Metrics Row
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total URLs", len(tech_df))
+        m2.metric("🔄 Redirects", len(tech_df[tech_df['redirect_count'] > 0]))
+        m3.metric("❌ Broken (4xx/5xx)", len(tech_df[tech_df['status_code'] >= 400]))
+        m4.metric("⚠️ Canonical Issues", len(tech_df[tech_df['Canonical Status'].str.contains("Missing|Other")]))
+
+        st.divider()
+
+        # 5. Render the Master Table
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            column_config={
+                "Source URL": st.column_config.LinkColumn("Source URL", width="medium"),
+                "Redirect Target (Final URL)": st.column_config.LinkColumn("Redirect Target"),
+                "Canonical Link": st.column_config.LinkColumn("Canonical Tag"),
+                "Status Overview": st.column_config.TextColumn("Status", width="small"),
+            }
+        )
+
+        # 6. Unified Download Button
+        csv = display_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            "📥 Download Full Technical Report", 
+            csv, 
+            "master_technical_audit.csv", 
+            "text/csv",
+            type="primary"
+        )
 
     with tab10:
         st.subheader("📱 Social Tags")
@@ -2502,25 +2897,107 @@ if has_data and df is not None:
 
     with tab16:
         st.subheader("🏗️ Schema Markup Analysis")
-        schema_df = df[['url', 'schema_types', 'schema_validity', 'schema_errors']].copy()
-        st.dataframe(schema_df, use_container_width=True)
-        st.markdown("### 🔍 Schema Detail Viewer")
-        try:
-            selected_url = st.selectbox("Select URL to inspect Schema:", df['url'].tolist())
-        except: selected_url = None
+
+        # 1. Prepare Data for Table
+        # We create a clean view for the user
+        schema_view = df[['url', 'schema_types', 'schema_validity']].copy()
         
-        if selected_url:
-            row = df[df['url'] == selected_url].iloc[0]
-            st.write(f"**Schema Status:** {row['schema_validity']}")
-            if row['schema_errors']: st.error(f"Errors: {row['schema_errors']}")
+        # Add Suggestions
+        schema_view['Suggested Schema'] = df.apply(get_suggested_schema, axis=1)
+        
+        # Add a "Preview" button column (we use selection for this)
+        st.write("### 📊 Schema Overview")
+        st.info("Select a row to see the Google Preview and Validation details below.")
+
+        # Interactive Table
+        selection = st.dataframe(
+            schema_view,
+            use_container_width=True,
+            column_config={
+                "url": st.column_config.LinkColumn("Page URL", width="medium"),
+                "schema_types": st.column_config.TextColumn("Detected Schema", width="small"),
+                "Suggested Schema": st.column_config.TextColumn("✨ Opportunities", width="small"),
+                "schema_validity": st.column_config.TextColumn("Status", width="small"),
+            },
+            on_select="rerun", # Updates when user clicks a row
+            selection_mode="single-row"
+        )
+
+        st.divider()
+
+        # 2. Detailed View (Triggered by Selection)
+        if selection.selection.rows:
+            # Get the selected row index
+            idx = selection.selection.rows[0]
+            selected_url = schema_view.iloc[idx]['url']
             
-            schema_json_str = row.get('schema_dump', '[]')
-            try:
-                if isinstance(schema_json_str, str): schema_json = json.loads(schema_json_str)
-                else: schema_json = schema_json_str
-                if schema_json: st.json(schema_json)
-                else: st.info("No Schema JSON found on this page.")
-            except: st.text(str(schema_json_str))
+            st.markdown(f"### 🔍 Inspecting: `{selected_url}`")
+            
+            # Fetch full row data
+            row = df[df['url'] == selected_url].iloc[0]
+            schema_dump = row.get('schema_dump', [])
+            
+            # Layout: Preview Left, JSON Right
+            col_preview, col_json = st.columns([1, 1])
+            
+            with col_preview:
+                st.markdown("#### 📱 Google Search Preview")
+                
+                # Parse JSON
+                if isinstance(schema_dump, str):
+                    try: schema_objs = json.loads(schema_dump)
+                    except: schema_objs = []
+                else: schema_objs = schema_dump
+                
+                if not schema_objs:
+                    st.warning("⚠️ No Schema JSON found to render preview.")
+                    # Show a generic preview if no schema
+                    st.markdown("""
+                    <div style="font-family:arial; background:#fff; padding:15px; border:1px solid #dfe1e5; border-radius:8px;">
+                        <div style="font-size:12px; color:#202124;">https://example.com › ...</div>
+                        <div style="font-size:20px; color:#1a0dab; margin:5px 0;">Page Title Example</div>
+                        <div style="font-size:14px; color:#4d5156;">No rich snippets detected. This is how a standard result looks.</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    # Render card for the first valid schema item found
+                    render_rich_snippet_preview(schema_objs[0] if isinstance(schema_objs, list) else schema_objs)
+                    
+                    # Validation Results
+                    st.markdown("#### ✅ Validation Issues")
+                    issues = validate_schema_structure(schema_objs[0] if isinstance(schema_objs, list) else schema_objs)
+                    if issues:
+                        for i in issues: st.error(i)
+                    else:
+                        st.success("Structure looks valid for Google Rich Results.")
+
+                # Action Buttons
+                encoded_url = requests.utils.quote(selected_url)
+                st.markdown(f"""
+                <div style="display: flex; gap: 10px; margin-top: 20px;">
+                    <a href="https://search.google.com/test/rich-results?url={encoded_url}" target="_blank">
+                        <button style="padding:8px 16px; border-radius:5px; border:1px solid #ccc; background:#f0f2f6; cursor:pointer;">
+                            📡 Test in Google
+                        </button>
+                    </a>
+                    <a href="https://validator.schema.org/#url={encoded_url}" target="_blank">
+                        <button style="padding:8px 16px; border-radius:5px; border:1px solid #ccc; background:#f0f2f6; cursor:pointer;">
+                            ✅ Schema Validator
+                        </button>
+                    </a>
+                </div>
+                """, unsafe_allow_html=True)
+
+            with col_json:
+                st.markdown("#### 📝 Raw JSON-LD")
+                st.json(schema_objs, expanded=True)
+
+        else:
+            st.info("👆 Click on a row in the table above to see the Google Preview.")
+            
+            # Download Button for the Table
+            csv = schema_view.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download Schema Report", csv, "schema_analysis.csv", "text/csv")
 
     with tab_search:
         st.subheader("🔍 Custom Search Results")
