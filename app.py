@@ -711,10 +711,33 @@ class UltraFrogCrawler:
             h3_tags = [self.smart_clean(h3.get_text()) for h3 in soup.find_all('h3')]
             h4_tags = [self.smart_clean(h4.get_text()) for h4 in soup.find_all('h4')]
             
-            custom_data = ""
-            if self.custom_selector:
-                custom_elements = soup.select(self.custom_selector)
-                custom_data = "; ".join([self.smart_clean(el.get_text()) for el in custom_elements])
+            # --- IMPROVED CUSTOM EXTRACTION (MULTI-RULE) ---
+            custom_data_dict = {}
+            # self.custom_selector is now expected to be a list of dicts (the rules)
+            if self.custom_selector and isinstance(self.custom_selector, list):
+                for rule in self.custom_selector:
+                    try:
+                        elements = soup.select(rule['selector'])
+                        values = []
+                        for el in elements:
+                            val = ""
+                            if rule['type'] == "Text Content":
+                                val = self.smart_clean(el.get_text())
+                            elif rule['type'] == "Inner HTML":
+                                val = str(el.encode_contents().decode('utf-8')).strip()
+                            elif rule['type'] == "HTML Element":
+                                val = str(el).strip()
+                            elif rule['type'] == "Attribute Value":
+                                val = el.get(rule['attribute'], '')
+                            
+                            if val: values.append(str(val))
+                        
+                        custom_data_dict[rule['name']] = "; ".join(values) if values else ""
+                    except Exception:
+                        custom_data_dict[rule['name']] = "Error"
+
+            # Convert to JSON string for storage
+            custom_extraction_json = json.dumps(custom_data_dict)
 
             internal_links = []
             external_links = []
@@ -832,7 +855,7 @@ class UltraFrogCrawler:
                 'og_title': soup.find('meta', attrs={'property': 'og:title'}).get('content', '') if soup.find('meta', attrs={'property': 'og:title'}) else '',
                 'og_description': soup.find('meta', attrs={'property': 'og:description'}).get('content', '') if soup.find('meta', attrs={'property': 'og:description'}) else '',
                 'twitter_title': soup.find('meta', attrs={'name': 'twitter:title'}).get('content', '') if soup.find('meta', attrs={'name': 'twitter:title'}) else '',
-                'custom_extraction': custom_data,
+                'custom_extraction': custom_extraction_json,  # Updated variable name
                 'custom_search_count': custom_search_count,
                 'indexability': self.get_indexability_status(actual_status_code, robots_content),
                 'crawl_timestamp': datetime.now().isoformat(), 
@@ -1245,7 +1268,57 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("⛏️ Custom Extraction")
-    custom_selector = st.text_input("Data Selector (Optional)", placeholder=".price, h1, #sku", help="Extract text from specific elements")
+    
+    # Initialize session state for rules if not present
+    if 'extraction_rules' not in st.session_state:
+        st.session_state.extraction_rules = []
+
+    with st.expander("⚙️ Configure Extraction Rules", expanded=False):
+        st.caption("Add multiple rules like Screaming Frog.")
+        
+        # Inputs for new rule
+        c_name, c_css = st.columns([1, 2])
+        new_name = c_name.text_input("Label (e.g. Date)", key="new_rule_name")
+        new_selector = c_css.text_input("CSS Selector", key="new_rule_css", placeholder="meta[property='...']")
+        
+        c_type, c_attr = st.columns([1, 1])
+        new_type = c_type.selectbox("Extract:", ["Text Content", "Attribute Value", "Inner HTML", "HTML Element"], key="new_rule_type")
+        new_attr = ""
+        if new_type == "Attribute Value":
+            new_attr = c_attr.text_input("Attribute Name", placeholder="content, href, src", key="new_rule_attr")
+
+        if st.button("➕ Add Rule"):
+            if new_name and new_selector:
+                if new_type == "Attribute Value" and not new_attr:
+                    st.error("Attribute Name required.")
+                else:
+                    rule = {
+                        "name": new_name,
+                        "selector": new_selector,
+                        "type": new_type,
+                        "attribute": new_attr
+                    }
+                    st.session_state.extraction_rules.append(rule)
+                    st.success(f"Added: {new_name}")
+            else:
+                st.warning("Label and Selector required.")
+
+        # Display current rules
+        if st.session_state.extraction_rules:
+            st.write("---")
+            st.write("**Active Rules:**")
+            for i, rule in enumerate(st.session_state.extraction_rules):
+                desc = f"**{rule['name']}**: `{rule['selector']}`"
+                c_desc, c_del = st.columns([4, 1])
+                c_desc.markdown(desc)
+                if c_del.button("🗑️", key=f"del_rule_{i}"):
+                    st.session_state.extraction_rules.pop(i)
+                    st.rerun()
+
+    # Define custom_selector variable to prevent errors elsewhere, 
+    # though we will use session_state in the main loop.
+    custom_selector = None 
+
     
     st.subheader("🎯 Link Scope (Optional)")
     link_selector = st.text_input("Link Area Selector", placeholder=".sidebar, #footer, .content", help="Only extract links found inside this element")
@@ -1382,7 +1455,8 @@ if st.session_state.crawling:
     progress_container = st.container()
     
     try:
-        custom_sel = custom_selector if custom_selector else None
+        # Pass the list of rules from session state
+        custom_sel = st.session_state.extraction_rules if 'extraction_rules' in st.session_state and st.session_state.extraction_rules else None
         link_sel = link_selector if link_selector else None
         mode_val = st.session_state.storage_mode
         s_conf = st.session_state.get('search_config', None)
@@ -2343,13 +2417,36 @@ if has_data and df is not None:
 
     with tab14:
         st.subheader("⛏️ Custom Extracted Data")
-        if custom_selector:
-            st.info(f"Results for Selector: `{custom_selector}`")
-            st.dataframe(df[['url', 'custom_extraction']], use_container_width=True)
-            csv = df[['url', 'custom_extraction']].to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download Custom Data", csv, "custom_data.csv", "text/csv")
+        
+        if 'custom_extraction' not in df.columns:
+            st.info("No custom data found. Add rules in the sidebar and start a crawl.")
         else:
-            st.info("Enter a CSS Selector in the sidebar to extract custom data.")
+            try:
+                # Filter rows that have data
+                valid_custom = df[df['custom_extraction'].notna() & (df['custom_extraction'] != '')].copy()
+                
+                if valid_custom.empty:
+                    st.warning("No data extracted yet.")
+                else:
+                    # Parse JSON
+                    json_data = valid_custom['custom_extraction'].apply(
+                        lambda x: json.loads(x) if isinstance(x, str) and x.startswith('{') else {}
+                    ).tolist()
+                    
+                    # Create dataframe from list of dicts
+                    extracted_df = pd.DataFrame(json_data)
+                    
+                    # Combine with URL
+                    result_df = pd.concat([valid_custom['url'].reset_index(drop=True), extracted_df], axis=1)
+                    
+                    st.write(f"**Found data for {len(result_df)} URLs**")
+                    st.dataframe(result_df, use_container_width=True)
+                    
+                    csv = result_df.to_csv(index=False).encode('utf-8')
+                    st.download_button("📥 Download Custom Data", csv, "custom_extraction.csv", "text/csv")
+            except Exception as e:
+                st.error(f"Error parsing data: {e}")
+                st.dataframe(df[['url', 'custom_extraction']], use_container_width=True)
 
     with tab15:
         st.subheader("⚡ Google PageSpeed Insights (PSI)")
