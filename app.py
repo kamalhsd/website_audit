@@ -14,7 +14,7 @@ import pandas as pd
 from urllib.parse import urljoin, urlparse
 import time
 from collections import deque, Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import json
 from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
@@ -1131,18 +1131,15 @@ def crawl_website(start_url, max_urls, crawl_scope, progress_container, ignore_r
     return True
 
 def crawl_from_list(url_list, progress_container, ignore_robots=False, custom_selector=None, link_selector=None, search_config=None, use_js=False, storage="RAM"):
-    # --- FIX: Deduplicate the input list immediately ---
-    # 1. Strip whitespace and remove empty lines
+    # 1. Clean and Deduplicate
     clean_urls = [u.strip() for u in url_list if u.strip()]
-    # 2. Convert to set to remove duplicates, then back to list
     unique_urls = list(set(clean_urls))
     
-    # Show a message if duplicates were removed
     if len(clean_urls) > len(unique_urls):
         diff = len(clean_urls) - len(unique_urls)
-        st.toast(f"🧹 Removed {diff} duplicate URLs from your list.", icon="ℹ️")
+        st.toast(f"🧹 Removed {diff} duplicate URLs.", icon="ℹ️")
 
-    # Initialize crawler with the CORRECT unique count
+    # Initialize Crawler
     crawler = UltraFrogCrawler(len(unique_urls), ignore_robots, custom_selector=custom_selector, link_selector=link_selector, search_config=search_config, use_js=use_js)
     
     if storage == "SQLite":
@@ -1154,41 +1151,77 @@ def crawl_from_list(url_list, progress_container, ignore_robots=False, custom_se
     progress_bar = progress_container.progress(0)
     status_text = progress_container.empty()
     
-    # Filter valid URLs (Robots.txt check)
+    # 2. Filter Valid URLs
     valid_urls = [url for url in unique_urls if crawler.can_fetch(url)]
     
     if not valid_urls: 
         st.error("No valid URLs found (check robots.txt or your list).")
         return False
     
-    worker_count = 1 if use_js else 5
+    # Decrease workers slightly to prevent socket exhaustion on Windows
+    worker_count = 1 if use_js else 10 
     if use_js: st.warning("🐢 JavaScript Rendering is ON. Speed reduced to 1 URL at a time.")
 
+    # 3. Process in Batches
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         for i in range(0, len(valid_urls), 25):
             if st.session_state.stop_crawling: break
+            
+            # Create batch
             batch = valid_urls[i:i + 25]
+            
+            # Map futures to URLs so we know which URL failed if a timeout occurs
             future_to_url = {executor.submit(crawler.extract_page_data, url): url for url in batch}
             
             for future in as_completed(future_to_url):
+                url = future_to_url[future]
+                
                 if st.session_state.stop_crawling:
                     for f in future_to_url: f.cancel()
                     break
+                
                 try:
-                    page_data = future.result(timeout=60 if use_js else 12)
+                    # --- CRITICAL FIX: HARD TIMEOUT ENFORCEMENT ---
+                    # Set a strict timeout (e.g., 15 seconds for requests, 65 for JS)
+                    # If the crawler takes longer, we kill it and move on.
+                    wait_time = 65 if use_js else 15
+                    page_data = future.result(timeout=wait_time)
+                    
                     page_data['depth'] = 0 
                     
+                    # Save Successful Data
                     if storage == "SQLite":
                         save_row_to_db(page_data, st.session_state.db_file) 
                     else:
                         st.session_state.crawl_data.append(page_data)
 
-                    st.session_state.total_crawled_count += 1
-                    # Progress based on UNIQUE count
-                    progress = st.session_state.total_crawled_count / len(valid_urls)
-                    progress_bar.progress(progress)
-                    status_text.text(f"🚀 Processed: {st.session_state.total_crawled_count}/{len(valid_urls)}")
-                except Exception as e: st.error(f"Error: {e}")
+                except TimeoutError:
+                    # This catches the "Stuck" URLs
+                    print(f"Skipping {url} due to TIMEOUT")
+                    # Create a dummy error record so the database knows it failed
+                    error_data = {
+                        'url': url, 'status_code': 0, 'error': 'Timeout - Skipped',
+                        'title': 'Skipped', 'depth': 0, 'crawl_timestamp': datetime.now().isoformat()
+                    }
+                    if storage == "SQLite": save_row_to_db(error_data, st.session_state.db_file)
+                    else: st.session_state.crawl_data.append(error_data)
+
+                except Exception as e:
+                    # This catches crashes
+                    print(f"Skipping {url} due to ERROR: {e}")
+                    error_data = {
+                        'url': url, 'status_code': 0, 'error': str(e),
+                        'title': 'Error', 'depth': 0, 'crawl_timestamp': datetime.now().isoformat()
+                    }
+                    if storage == "SQLite": save_row_to_db(error_data, st.session_state.db_file)
+                    else: st.session_state.crawl_data.append(error_data)
+
+                # Update Progress regardless of success or failure
+                st.session_state.total_crawled_count += 1
+                progress = st.session_state.total_crawled_count / len(valid_urls)
+                progress_bar.progress(min(progress, 1.0))
+                status_text.text(f"🚀 Processed: {st.session_state.total_crawled_count}/{len(valid_urls)}")
+
     return True
 
 def crawl_from_sitemap(sitemap_url, max_urls, progress_container, ignore_robots=False, custom_selector=None, link_selector=None, search_config=None, use_js=False, storage="RAM"):
