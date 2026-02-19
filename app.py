@@ -1,3 +1,5 @@
+import textstat
+import networkx as nx
 import sys
 import asyncio
 import os
@@ -493,6 +495,58 @@ def check_grammar_cloud(text):
         return []
     except Exception:
         return []
+        
+def calculate_internal_pagerank(df):
+    """Calculates PageRank (Link Juice) for all pages in the DF."""
+    try:
+        # 1. Create a directed graph
+        G = nx.DiGraph()
+        
+        # 2. Add nodes and edges
+        for _, row in df.iterrows():
+            source = row['url']
+            G.add_node(source)
+            
+            # Parse internal links safely
+            links = row.get('internal_links', [])
+            if isinstance(links, str):
+                try: links = json.loads(links)
+                except: links = []
+            elif isinstance(links, list):
+                pass
+            else:
+                links = []
+                
+            for link in links:
+                if isinstance(link, dict):
+                    target = link.get('url')
+                    if target:
+                        G.add_edge(source, target)
+        
+        # 3. Calculate PageRank (damping factor 0.85 is standard Google)
+        try:
+            pagerank_scores = nx.pagerank(G, alpha=0.85, max_iter=100)
+        except:
+            return {}
+        
+        # 4. Normalize scores (0-100) for easier reading
+        if not pagerank_scores: return {}
+        
+        max_score = max(pagerank_scores.values())
+        min_score = min(pagerank_scores.values())
+        
+        # Avoid division by zero
+        if max_score == min_score: return {k: 50 for k in pagerank_scores}
+
+        normalized_scores = {
+            k: int(((v - min_score) / (max_score - min_score)) * 100) 
+            for k, v in pagerank_scores.items()
+        }
+        
+        return normalized_scores
+    except Exception as e:
+        st.error(f"PageRank Error: {e}")
+        return {}
 # --- CRAWLER CLASS ---
 class UltraFrogCrawler:
     def __init__(self, max_urls=100000, ignore_robots=False, crawl_scope="subfolder", custom_selector=None, link_selector=None, search_config=None, use_js=False):
@@ -1874,13 +1928,11 @@ if has_data and df is not None:
         orphans = list(st.session_state.sitemap_urls_set - crawled_urls) if st.session_state.sitemap_urls_set else []
         st.metric("👻 Orphans", len(orphans))
     
-    # Tabs - MODIFIED: Merged Redirects, Status, and Canonicals into "Technical Audit"
-    # We removed tab7, tab8, tab9 variables and replaced them with tab_tech
-    tab1, tab2, tab3, tab_meta_titles, tab_headers, tab_tech, tab10, tab11, tab13, tab14, tab15, tab16, tab_search, tab_interlink, tab_cannibal, tab_gsc, tab_audit = st.tabs([
+    # Locate your existing st.tabs line and replace it with this:
+    tab1, tab2, tab3, tab_meta_titles, tab_headers, tab_tech, tab10, tab11, tab13, tab14, tab15, tab16, tab_search, tab_interlink, tab_cannibal, tab_gsc, tab_audit, tab_competitor = st.tabs([
         "🔗 Internal", "🌐 External", "🖼️ Images", "📝 Meta & Titles", "🏗️ Header Analysis", 
-        "🛠️ Technical Audit", # <--- MERGED TAB
-        "📱 Social", "🚀 Perf", 
-        "👻 Orphans", "⛏️ Custom", "⚡ PSI", "🏗️ Schema", "🔍 Search Results", "💡 Interlink", "👯 Cannibalization", "📈 GSC Data", "📅 Content Audit"
+        "🛠️ Technical Audit", "📱 Social", "🚀 Perf", 
+        "👻 Orphans", "⛏️ Custom", "⚡ PSI", "🏗️ Schema", "🔍 Search Results", "💡 Interlink", "👯 Cannibalization", "📈 GSC Data", "📅 Content Audit", "⚔️ Competitor Analysis"
     ])
     
     status_lookup = df[['url', 'status_code']].drop_duplicates()
@@ -1891,6 +1943,8 @@ if has_data and df is not None:
 
     with tab1:
         st.subheader("🔗 Internal Links Analysis")
+        
+        # --- PART 1: EXISTING LINKS ANALYSIS ---
         if link_selector:
             st.info(f"Showing links extracted ONLY from: `{link_selector}`")
         
@@ -1901,24 +1955,26 @@ if has_data and df is not None:
             exploded = exploded.dropna(subset=['internal_links'])
             
             if not exploded.empty:
+                # Process Link Data
                 links_data = pd.json_normalize(exploded['internal_links'])
                 exploded = exploded.reset_index(drop=True)
                 links_data = links_data.reset_index(drop=True)
                 final_links = pd.concat([exploded['Source URL'], links_data], axis=1)
                 
+                # Fill Defaults
                 if 'rel_status' not in final_links.columns: final_links['rel_status'] = 'dofollow'
                 if 'target' not in final_links.columns: final_links['target'] = '_self'
                 
-                # Ensure all columns are present
+                # Column Cleanup
                 final_links = final_links[['Source URL', 'url', 'anchor_text', 'rel_status', 'target', 'placement', 'css_path']]
                 final_links.columns = ['Source URL', 'Destination URL', 'Anchor Text', 'Link Type', 'Target', 'Placement', 'CSS Path']
                 
-                # --- ADD INLINKS & OUTLINKS COLUMNS ---
+                # Add Inlinks/Outlinks
                 counts_lookup = df[['url', 'inlinks_count', 'internal_links_count']].copy()
                 counts_lookup.columns = ['Source URL', 'Source Inlinks', 'Source Outlinks']
                 final_links = pd.merge(final_links, counts_lookup, on='Source URL', how='left')
                 
-                # --- ADD LINK SCOPE ---
+                # Add Scope (Self-ref vs Different)
                 final_links['Link Scope'] = final_links.apply(
                     lambda x: '🔄 Same Page' if x['Source URL'] == x['Destination URL'] else '➡️ Different Page', 
                     axis=1
@@ -1926,10 +1982,7 @@ if has_data and df is not None:
 
                 # Merge with Status Codes
                 final_links = pd.merge(final_links, status_lookup, on='Destination URL', how='left')
-                
-                if 'link_status_cache' not in st.session_state:
-                    st.session_state.link_status_cache = {}
-                
+                if 'link_status_cache' not in st.session_state: st.session_state.link_status_cache = {}
                 final_links['Status Code'] = final_links.apply(
                     lambda x: st.session_state.link_status_cache.get(x['Destination URL'], x['Status Code']), axis=1
                 )
@@ -1937,100 +1990,58 @@ if has_data and df is not None:
 
                 # --- TOOLBAR ---
                 st.write("### 🛠️ Link Tools")
-                c_btn1, c_btn2 = st.columns([1, 1])
+                c_btn1, c_btn2, c_btn3 = st.columns([1, 1, 1])
                 
-                # Button 1: Status Check
-                if c_btn1.button("🔍 Check Status Codes"):
-                    uncrawled_list = final_links[final_links['Status Code'] == 'Not Crawled']['Destination URL'].unique().tolist()
-                    if uncrawled_list:
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
-                        temp_crawler = UltraFrogCrawler()
-                        results = {}
-                        
-                        def fetch_status(url):
-                            try:
-                                r = temp_crawler.session.head(url, timeout=5, allow_redirects=True)
-                                if r.status_code == 405:
-                                    r = temp_crawler.session.get(url, timeout=5, stream=True)
-                                return url, r.status_code
-                            except: return url, "Error"
-
-                        with ThreadPoolExecutor(max_workers=20) as executor:
-                            futures = [executor.submit(fetch_status, u) for u in uncrawled_list]
-                            for i, future in enumerate(as_completed(futures)):
-                                u, code = future.result()
-                                results[u] = code
-                                if i % 5 == 0:
-                                    progress_bar.progress((i + 1) / len(uncrawled_list))
-                                    status_text.text(f"Checking: {u}")
-                        
-                        st.session_state.link_status_cache.update(results)
+                # 1. Authority Button
+                if c_btn3.button("📊 Calculate Page Authority"):
+                    with st.spinner("Calculating PageRank..."):
+                        scores = calculate_internal_pagerank(df)
+                        st.session_state['pagerank_scores'] = scores
+                        st.success("Calculated!")
                         st.rerun()
-                    else:
-                        st.info("All statuses already checked.")
 
-                # Button 2: Anchor Context Analysis
-                calc_relevance = c_btn2.button("🧠 Analyze Anchor Relevance (0-100)")
-                
-                if calc_relevance:
-                    with st.spinner("Comparing Anchor Text vs. Target URL Slug..."):
-                        def get_anchor_score(row):
-                            anchor = str(row['Anchor Text']).lower().strip()
-                            url = str(row['Destination URL']).lower().strip()
-                            
-                            parsed = urlparse(url)
-                            path = parsed.path
-                            if '.' in path.split('/')[-1]: path = os.path.splitext(path)[0]
-                            slug = path.replace('-', ' ').replace('_', ' ').replace('/', ' ').strip()
-                            
-                            if not slug or slug == "":
-                                if "home" in anchor or "brand" in anchor: return 100
-                                return 50 
-                            
-                            generics = ['click here', 'read more', 'learn more', 'here', 'website', 'link']
-                            if anchor in generics: return 10
-                            
-                            score = difflib.SequenceMatcher(None, anchor, slug).ratio()
-                            return int(score * 100)
+                # Merge Authority if exists
+                if 'pagerank_scores' in st.session_state:
+                    scores = st.session_state['pagerank_scores']
+                    final_links['Target Authority'] = final_links['Destination URL'].map(scores).fillna(0).astype(int)
 
-                        final_links['Relevance Score'] = final_links.apply(get_anchor_score, axis=1)
-                        st.success("Analysis Complete!")
+                # 2. Status Check Button
+                if c_btn1.button("🔍 Check Status Codes"):
+                    uncrawled = final_links[final_links['Status Code'] == 'Not Crawled']['Destination URL'].unique().tolist()
+                    if uncrawled:
+                        p_bar = st.progress(0)
+                        temp_crawl = UltraFrogCrawler()
+                        res = {}
+                        def fetch(u):
+                            try:
+                                r = temp_crawl.session.head(u, timeout=5)
+                                if r.status_code == 405: r = temp_crawl.session.get(u, timeout=5, stream=True)
+                                return u, r.status_code
+                            except: return u, "Error"
+                        
+                        with ThreadPoolExecutor(max_workers=20) as exc:
+                            fut = [exc.submit(fetch, u) for u in uncrawled]
+                            for i, f in enumerate(as_completed(fut)):
+                                u, c = f.result()
+                                res[u] = c
+                                if i%5==0: p_bar.progress((i+1)/len(uncrawled))
+                        
+                        st.session_state.link_status_cache.update(res)
+                        st.rerun()
 
-                # --- DISPLAY ---
-                st.markdown("---")
-                
+                # --- MAIN TABLE DISPLAY ---
                 col_config = {
                     "Source URL": st.column_config.LinkColumn("From Page"),
                     "Destination URL": st.column_config.LinkColumn("To Page"),
-                    "Link Scope": st.column_config.TextColumn("Relationship", width="small"),
-                    "Source Inlinks": st.column_config.NumberColumn("Page Inlinks", help="Total incoming links to the Source URL"),
-                    "Source Outlinks": st.column_config.NumberColumn("Page Outlinks", help="Total outgoing links from the Source URL"),
+                    "Target Authority": st.column_config.ProgressColumn("Authority", format="%d", min_value=0, max_value=100),
                 }
                 
-                # CORRECTED ORDER: Included Target, Placement, CSS Path
-                cols_order = [
-                    'Source URL', 'Source Inlinks', 'Source Outlinks', 
-                    'Destination URL', 'Link Scope', 'Anchor Text', 'Link Type', 
-                    'Target', 'Placement', 'CSS Path', 'Status Code'
-                ]
-                
-                if 'Relevance Score' in final_links.columns:
-                    col_config["Relevance Score"] = st.column_config.ProgressColumn(
-                        "Anchor Match %", format="%d", min_value=0, max_value=100
-                    )
-                    cols_order.append('Relevance Score')
-                    final_links = final_links.sort_values(by="Relevance Score", ascending=True)
-
+                cols_order = ['Source URL', 'Source Inlinks', 'Source Outlinks', 'Destination URL', 'Target Authority', 'Link Scope', 'Anchor Text', 'Status Code']
                 existing_cols = [c for c in cols_order if c in final_links.columns]
                 
-                st.dataframe(
-                    final_links[existing_cols], 
-                    use_container_width=True, 
-                    column_config=col_config
-                )
+                st.dataframe(final_links[existing_cols], use_container_width=True, column_config=col_config)
                 
-                # Stats
+                # Stats Row
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Total Links", len(final_links))
                 c2.metric("Self-Referencing", len(final_links[final_links['Link Scope'].str.contains('Same')]))
@@ -2039,8 +2050,56 @@ if has_data and df is not None:
                 
                 csv = final_links.to_csv(index=False).encode('utf-8')
                 st.download_button("📥 Download Link Report", csv, "internal_links.csv", "text/csv")
+
             else:
                 st.warning("No internal links found.")
+
+        # --- PART 2: AI OPPORTUNITIES (MOVED HERE) ---
+        st.markdown("---")
+        st.header("💡 AI Internal Link Opportunities")
+        st.info("Find pages that *should* link to each other based on content similarity.")
+
+        if not HAS_SKLEARN:
+            st.error("❌ 'scikit-learn' library missing. Install it to use this feature.")
+        else:
+            c_ai1, c_ai2 = st.columns([1, 1])
+            min_score = c_ai1.slider("Minimum Relevance Score", 0, 100, 50)
+            max_links = c_ai2.number_input("Max Suggestions per Page", 1, 20, 5)
+            
+            if st.button("🚀 Generate Link Suggestions"):
+                with st.spinner("Analyzing content semantics..."):
+                    if 'scope_content' not in df.columns:
+                        st.error("Please re-crawl to capture content data.")
+                    else:
+                        suggestions_df = generate_interlink_suggestions(df, min_score=min_score, max_suggestions=max_links)
+                        if not suggestions_df.empty:
+                            # Merge Authority if available
+                            if 'pagerank_scores' in st.session_state:
+                                scores = st.session_state['pagerank_scores']
+                                suggestions_df['Target Authority'] = suggestions_df['Suggested Target URL'].map(scores).fillna(0).astype(int)
+                            
+                            st.session_state.interlink_opportunities = suggestions_df
+                            st.success(f"Found {len(suggestions_df)} opportunities!")
+                        else:
+                            st.warning("No suggestions found. Try lowering the score.")
+
+            # Display Suggestions
+            if 'interlink_opportunities' in st.session_state and not st.session_state.interlink_opportunities.empty:
+                res_df = st.session_state.interlink_opportunities
+                
+                ai_col_config = {
+                    "Relevance Score": st.column_config.ProgressColumn("Relevance", format="%.1f%%", min_value=0, max_value=100),
+                    "Suggested Target URL": st.column_config.LinkColumn("Target Page"),
+                    "Source URL": st.column_config.LinkColumn("Source Page"),
+                }
+                
+                if 'Target Authority' in res_df.columns:
+                    ai_col_config["Target Authority"] = st.column_config.ProgressColumn("Target Auth", format="%d", min_value=0, max_value=100)
+
+                st.dataframe(res_df, column_config=ai_col_config, use_container_width=True)
+                
+                csv_ai = res_df.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Download Suggestions", csv_ai, "link_opportunities.csv", "text/csv")
 
     with tab2:
         st.subheader("🌐 External Links Analysis")
@@ -3042,56 +3101,7 @@ if has_data and df is not None:
             found_df = df[df['custom_search_count'] > 0][['url', 'custom_search_count']].copy()
             st.dataframe(found_df, use_container_width=True)
         else:
-            st.warning("No search was configured.")
-
-    with tab_interlink:
-        st.subheader("💡 AI Internal Link Opportunities")
-        if not HAS_SKLEARN:
-            st.error("❌ 'scikit-learn' is not installed. Please run: `pip install scikit-learn` in your terminal to use AI features.")
-        else:
-            st.markdown("""
-            **How this works:**
-            1. We analyze the content inside your **Link Area Selector** (or Body text if empty).
-            2. We compare it against the **Title & H1** of every other page.
-            3. We suggest links where the content is highly relevant to another page's topic.
-            """)
-            c1, c2, c3 = st.columns(3)
-            min_score = c1.slider("Minimum Relevance Score", 0, 100, 50, help="Higher = More relevant matches only")
-            max_links = c2.number_input("Max Suggestions per Page", 1, 20, 5)
-            
-            if st.button("🚀 Generate Suggestions"):
-                with st.spinner("Analyzing semantics and calculating relevance scores..."):
-                    if 'scope_content' not in df.columns:
-                        st.error("Please re-crawl the website to capture content data for analysis.")
-                    else:
-                        suggestions_df = generate_interlink_suggestions(df, min_score=min_score, max_suggestions=max_links)
-                        if not suggestions_df.empty:
-                            st.success(f"Found {len(suggestions_df)} new linking opportunities!")
-                            st.session_state.interlink_opportunities = suggestions_df
-                        else:
-                            st.warning("No suggestions found. Try lowering the relevance score.")
-            
-            if 'interlink_opportunities' in st.session_state and not st.session_state.interlink_opportunities.empty:
-                res_df = st.session_state.interlink_opportunities
-                search_url = st.text_input("Filter by Source URL", placeholder="/blog/my-post")
-                if search_url:
-                    res_df = res_df[res_df['Source URL'].str.contains(search_url, case=False)]
-                
-                st.dataframe(
-                    res_df,
-                    column_config={
-                        "Relevance Score": st.column_config.ProgressColumn(
-                            "Relevance",
-                            format="%.1f%%",
-                            min_value=0,
-                            max_value=100,
-                        ),
-                        "Suggested Target URL": st.column_config.LinkColumn("Target Link"),
-                    },
-                    use_container_width=True
-                )
-                csv = res_df.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Download Suggestions CSV", csv, "interlink_opportunities.csv", "text/csv")
+            st.warning("No search was configured.") 
     
     with tab_cannibal:
         st.subheader("👯 Content Similarity & Pruning")
@@ -3294,7 +3304,205 @@ if has_data and df is not None:
                         st.download_button("📥 Download Inspection Report", csv_insp, "indexing_report.csv", "text/csv")
             else:
                 st.warning("⚠️ No URLs found to inspect. Please run a Crawl (List Mode) or Fetch Performance Data first.")
+    
+    with tab_competitor:
+        st.subheader("⚔️ Competitor Deep Analysis")
+        st.info("Compare your page against top competitors to find content gaps and keyword opportunities.")
 
+        # --- INPUTS ---
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            my_url_input = st.text_input("Your Page URL", placeholder="https://mysite.com/page")
+            keywords_input = st.text_area("Target Keywords (Comma separated)", placeholder="seo tools, website crawler, python seo script")
+        with c2:
+            competitors_input = st.text_area("Competitor URLs (1 per line, max 5)", placeholder="https://competitor1.com/page\nhttps://competitor2.com/page", height=135)
+
+        if st.button("🚀 Run Deep Analysis"):
+            if not my_url_input or not competitors_input or not keywords_input:
+                st.error("⚠️ Please fill in all fields (Your URL, Keywords, and Competitors).")
+            else:
+                # 1. Prepare Data
+                comps = [u.strip() for u in competitors_input.split('\n') if u.strip()]
+                keywords = [k.strip().lower() for k in keywords_input.split(',') if k.strip()]
+                
+                # Combine lists (Your URL is first)
+                all_urls = [my_url_input] + comps
+                
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                results_data = []
+                
+                # Re-use your existing crawler class
+                crawler_comp = UltraFrogCrawler() 
+                
+                # 2. Crawl All Pages
+                with ThreadPoolExecutor(max_workers=5) as executor:
+                    # Submit all URLs for crawling
+                    future_to_url = {executor.submit(crawler_comp.extract_page_data, u): u for u in all_urls}
+                    
+                    for i, future in enumerate(as_completed(future_to_url)):
+                        url = future_to_url[future]
+                        status_text.text(f"Analyzing {i+1}/{len(all_urls)}: {url}")
+                        
+                        try:
+                            data = future.result()
+                            
+                            # Content Pre-processing
+                            title = str(data.get('title', '')).lower()
+                            desc = str(data.get('meta_description', '')).lower()
+                            h1 = str(data.get('h1_tags', '')).lower()
+                            body = str(data.get('scope_content', '')).lower()
+                            url_str = str(data.get('url', '')).lower()
+                            word_count = data.get('word_count', 0)
+                            
+                            # Readability Score (Flesch Reading Ease)
+                            # 90-100: Very Easy, 0-30: Very Confusing
+                            readability = textstat.flesch_reading_ease(data.get('scope_content', ''))
+                            
+                            # Keyword Analysis
+                            kw_stats = {}
+                            for kw in keywords:
+                                count = body.count(kw)
+                                
+                                # Check Zones
+                                in_title = "✅" if kw in title else "❌"
+                                in_desc = "✅" if kw in desc else "❌"
+                                in_h1 = "✅" if kw in h1 else "❌"
+                                in_url = "✅" if kw in url_str else "❌"
+                                
+                                kw_stats[kw] = {
+                                    'Count': count,
+                                    'Title': in_title,
+                                    'Desc': in_desc,
+                                    'H1': in_h1,
+                                    'URL': in_url
+                                }
+
+                            results_data.append({
+                                'Type': '🟦 ME' if url == my_url_input else '🟥 COMP',
+                                'URL': url,
+                                'Word Count': word_count,
+                                'Image Count': data.get('image_count', 0),
+                                'Readability (0-100)': round(readability, 1),
+                                'Load Time': f"{data.get('response_time', 0):.2f}s",
+                                'Keywords': kw_stats
+                            })
+                            
+                        except Exception as e:
+                            st.error(f"Failed to analyze {url}: {e}")
+                            
+                        progress_bar.progress((i + 1) / len(all_urls))
+                
+                status_text.success("✅ Analysis Complete!")
+                
+                # --- VISUALIZATION ---
+                
+                # 1. Structural Comparison Table (Words, Images, Readability)
+                st.write("### 🏗️ Content Structure Comparison")
+                st.markdown("Compare the 'weight' and complexity of your content versus competitors.")
+                
+                struct_data = []
+                for r in results_data:
+                    struct_data.append({
+                        "Role": r['Type'],
+                        "URL": r['URL'],
+                        "Words": r['Word Count'],
+                        "Images": r['Image Count'],
+                        "Readability Score": r['Readability (0-100)'],
+                        "Speed": r['Load Time']
+                    })
+                
+                st.dataframe(
+                    pd.DataFrame(struct_data), 
+                    use_container_width=True,
+                    column_config={
+                        "URL": st.column_config.LinkColumn("Page URL"),
+                        "Readability Score": st.column_config.ProgressColumn("Reading Ease", min_value=0, max_value=100, format="%d"),
+                    }
+                )
+                
+                st.divider()
+
+                # 2. Keyword Gap Matrix (The Deep Analysis)
+                st.write("### 🔑 Keyword Gap Matrix")
+                st.markdown("See how many times competitors use your target keywords.")
+                
+                matrix_rows = []
+                for kw in keywords:
+                    row = {'Keyword': kw}
+                    
+                    # Get My Data
+                    my_data = next((item for item in results_data if 'ME' in item['Type']), None)
+                    
+                    if my_data:
+                        stats = my_data['Keywords'][kw]
+                        row['My Count'] = stats['Count']
+                        row['My Zones'] = f"{stats['Title']}T {stats['H1']}H {stats['Desc']}D"
+                    else:
+                        row['My Count'] = 0
+                        row['My Zones'] = "N/A"
+                    
+                    # Calculate Competitor Stats
+                    comp_counts = [item['Keywords'][kw]['Count'] for item in results_data if 'COMP' in item['Type']]
+                    
+                    if comp_counts:
+                        avg_count = sum(comp_counts) / len(comp_counts)
+                        max_count = max(comp_counts)
+                        row['Comp Avg'] = round(avg_count, 1)
+                        row['Comp Max'] = max_count
+                        
+                        # Gap Analysis Logic
+                        if row['My Count'] == 0:
+                            row['Status'] = "❌ Missing Keyword"
+                        elif row['My Count'] < (avg_count * 0.5):
+                            row['Status'] = "⚠️ Under-optimized"
+                        elif row['My Count'] > (max_count * 2.5):
+                            row['Status'] = "⚠️ Over-optimized (Stuffing?)"
+                        else:
+                            row['Status'] = "✅ Good Range"
+                    else:
+                        row['Comp Avg'] = 0
+                        row['Status'] = "❓ No Data"
+
+                    matrix_rows.append(row)
+                    
+                gap_df = pd.DataFrame(matrix_rows)
+                
+                st.dataframe(
+                    gap_df,
+                    column_config={
+                        "My Count": st.column_config.NumberColumn("My Usage", help="Times keyword appears in body"),
+                        "Comp Avg": st.column_config.NumberColumn("Comp Avg", help="Average usage by competitors"),
+                        "My Zones": st.column_config.TextColumn("My Zones", help="T=Title, H=H1, D=Meta Desc"),
+                        "Status": st.column_config.TextColumn("Gap Status"),
+                    },
+                    use_container_width=True
+                )
+                
+                st.divider()
+
+                # 3. Detailed Zone Breakdown (Drill Down)
+                with st.expander("🔎 View Detailed Zone Matrix (Where are they placing keywords?)"):
+                    st.info("Check if competitors are putting keywords in the Title, H1, Meta Description, or URL.")
+                    
+                    # Create tabs for each keyword
+                    kw_tabs = st.tabs(keywords)
+                    for i, kw in enumerate(keywords):
+                        with kw_tabs[i]:
+                            zone_rows = []
+                            for r in results_data:
+                                stats = r['Keywords'][kw]
+                                zone_rows.append({
+                                    "Role": r['Type'],
+                                    "URL": r['URL'],
+                                    "Title": stats['Title'],
+                                    "H1": stats['H1'],
+                                    "Meta": stats['Desc'],
+                                    "URL Slug": stats['URL'],
+                                    "Body Count": stats['Count']
+                                })
+                            st.dataframe(pd.DataFrame(zone_rows), use_container_width=True)
+    
     with tab_audit:
         st.subheader("📅 AI Content Relevance & Freshness Auditor")
         st.info("Identify 'Stale' or 'Zombie' pages that need to be updated or removed based on current real-world relevance.")
