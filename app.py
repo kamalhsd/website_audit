@@ -1,4 +1,14 @@
 import textstat
+import whois
+from sklearn.feature_extraction.text import CountVectorizer
+from bs4 import BeautifulSoup
+import requests
+from urllib.parse import urlparse, urljoin
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from datetime import datetime
+import re
+import textstat
 import networkx as nx
 import sys
 import asyncio
@@ -438,36 +448,74 @@ def generate_ai_meta(provider, api_key, model_name, endpoint_url, prompt_text, s
 def analyze_content_freshness(url, title, content, provider, api_key, model_name, endpoint_url):
     """Uses AI to determine if content is Relevant, Stale, or Outdated."""
     current_date = datetime.now().strftime("%B %Y")
+    
+    safe_content = str(content) if pd.notna(content) else ""
+    
     prompt = f"""
     You are an expert SEO Content Strategist. 
     Today's Date: {current_date}
     Analyze the following page content and determine its relevance for TODAY's users.
     URL: {url}
     Title: {title}
-    Content Snippet: {content[:1500]}
+    Content Snippet: {safe_content[:1500]}
     
     Decision Criteria:
     - KEEP: Content is evergreen, still accurate, or historically valuable.
     - UPDATE: Content is good but contains old dates, old prices, or missing newer facts.
-    - REMOVE: Content is completely outdated (e.g., Covid-19 temporary rules, 2021 event guides, broken promotions).
+    - REMOVE: Content is completely outdated.
     
-    Provide your response in this EXACT format:
+    Provide your response in this EXACT format. Do not use any introductory text:
     DECISION: [KEEP/UPDATE/REMOVE]
     REASON: [Short explanation why]
     ACTION: [What exactly to add or change, or why to delete]
     """
+    
     try:
         response = generate_ai_meta(provider, api_key, model_name, endpoint_url, prompt, "You are a content auditor.")
+        
+        # Catch API Errors
+        if response.startswith("Error") or response.startswith("Exception"):
+            return {"URL": url, "Decision": "Error", "Reason": response, "Action Suggestion": "Check API Key/Limits", "Raw AI Output": response}
+
+        # Default fallback (Notice we added the Raw Output column here)
+        res_dict = {
+            "URL": url, 
+            "Decision": "UNKNOWN", 
+            "Reason": "Format mismatched. See Raw Output.", 
+            "Action Suggestion": "N/A",
+            "Raw AI Output": response 
+        }
+        
+        # UPGRADED PARSING: Case-insensitive and handles extra spaces/Markdown
         lines = response.split('\n')
-        res_dict = {"URL": url}
         for line in lines:
-            if line.startswith("DECISION:"): res_dict["Decision"] = line.replace("DECISION:", "").strip()
-            if line.startswith("REASON:"): res_dict["Reason"] = line.replace("REASON:", "").strip()
-            if line.startswith("ACTION:"): res_dict["Action Suggestion"] = line.replace("ACTION:", "").strip()
-        if "Decision" not in res_dict: res_dict["Decision"] = "Unknown"
+            # Strip out markdown bolding and whitespace
+            clean_line = line.replace('*', '').strip()
+            upper_line = clean_line.upper()
+            
+            if upper_line.startswith("DECISION:") or upper_line.startswith("DECISION :"): 
+                # Grab whatever is on the right side of the colon
+                res_dict["Decision"] = clean_line.split(":", 1)[1].strip().upper()
+                
+                # If we successfully found a decision, remove the default error message from Reason
+                if "Format mismatched" in res_dict["Reason"]:
+                    res_dict["Reason"] = ""
+                    
+            elif upper_line.startswith("REASON:") or upper_line.startswith("REASON :"): 
+                res_dict["Reason"] = clean_line.split(":", 1)[1].strip()
+                
+            elif upper_line.startswith("ACTION:") or upper_line.startswith("ACTION :"): 
+                res_dict["Action Suggestion"] = clean_line.split(":", 1)[1].strip()
+                
+        # Clean up the Decision column just in case the AI added extra words (e.g., "KEEP (EVERGREEN)")
+        if "KEEP" in res_dict["Decision"]: res_dict["Decision"] = "KEEP"
+        elif "UPDATE" in res_dict["Decision"]: res_dict["Decision"] = "UPDATE"
+        elif "REMOVE" in res_dict["Decision"]: res_dict["Decision"] = "REMOVE"
+                
         return res_dict
-    except:
-        return {"URL": url, "Decision": "Error", "Reason": "AI failed to respond", "Action Suggestion": "N/A"}
+        
+    except Exception as e:
+        return {"URL": url, "Decision": "Error", "Reason": f"Crash: {str(e)}", "Action Suggestion": "N/A", "Raw AI Output": "N/A"}
 
 # --- GRAMMAR FALLBACK HELPER (UPDATED) ---
 def check_grammar_cloud(text):
@@ -547,6 +595,82 @@ def calculate_internal_pagerank(df):
     except Exception as e:
         st.error(f"PageRank Error: {e}")
         return {}
+        
+def get_domain_age(domain):
+    try:
+        w = whois.whois(domain)
+        creation_date = w.creation_date
+        if isinstance(creation_date, list): creation_date = creation_date[0]
+        if creation_date:
+            age = (datetime.now() - creation_date).days / 365.25
+            return round(age, 1)
+        return "Unknown"
+    except: return "Hidden"
+
+def extract_publish_date(soup):
+    """Attempts to find the publish or modified date from meta tags."""
+    meta_tags = soup.find_all('meta')
+    for tag in meta_tags:
+        prop = tag.get('property', '').lower()
+        name = tag.get('name', '').lower()
+        if 'published_time' in prop or 'modified_time' in prop or 'date' in name:
+            content = tag.get('content', '')
+            if content: return content[:10] # Return YYYY-MM-DD
+    return "Not Found"
+
+def count_fuzzy_match(text, keyword):
+    """Counts partial matches (e.g. 'tool for SEO' matches 'SEO tool') within the same sentence."""
+    sentences = text.split('.')
+    kw_words = [w.lower() for w in keyword.split()]
+    count = 0
+    for sentence in sentences:
+        if all(w in sentence.lower() for w in kw_words):
+            count += 1
+    return count
+
+def deep_crawl_for_inlinks(target_url, max_pages=300):
+    """
+    Spawns a mini-crawler to search the entire domain for links pointing TO the target_url.
+    Returns the count of pages that link to the target.
+    """
+    parsed_target = urlparse(target_url)
+    domain = f"{parsed_target.scheme}://{parsed_target.netloc}"
+    target_path = parsed_target.path
+    
+    visited = set()
+    queue = [domain] # Start at homepage
+    inlink_count = 0
+    
+    session = requests.Session()
+    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+    
+    while queue and len(visited) < max_pages:
+        current = queue.pop(0)
+        if current in visited: continue
+        visited.add(current)
+        
+        try:
+            res = session.get(current, timeout=5)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.text, 'html.parser')
+                links = [a.get('href', '') for a in soup.find_all('a', href=True)]
+                
+                # Check if the target URL is on this page
+                for link in links:
+                    if target_url in link or (target_path in link and len(target_path) > 1):
+                        if current != target_url: # Don't count self-referencing
+                            inlink_count += 1
+                        break # Count the page once, move on
+                        
+                # Queue internal links
+                for link in links:
+                    full_url = urljoin(domain, link)
+                    if full_url.startswith(domain) and full_url not in visited and full_url not in queue:
+                        queue.append(full_url)
+        except: pass
+        
+    return inlink_count
+    
 # --- CRAWLER CLASS ---
 class UltraFrogCrawler:
     def __init__(self, max_urls=100000, ignore_robots=False, crawl_scope="subfolder", custom_selector=None, link_selector=None, search_config=None, use_js=False):
@@ -653,15 +777,6 @@ class UltraFrogCrawler:
             if 'content-length' in r.headers: return round(int(r.headers['content-length']) / 1024, 2)
         except: pass
         return 0
-
-    def extract_recursive_types(self, data, types_list):
-        if isinstance(data, dict):
-            if '@type' in data:
-                if isinstance(data['@type'], list): types_list.extend(data['@type'])
-                else: types_list.append(data['@type'])
-            for key, value in data.items(): self.extract_recursive_types(value, types_list)
-        elif isinstance(data, list):
-            for item in data: self.extract_recursive_types(item, types_list)
 
     def fetch_with_playwright(self, url):
         """Uses Playwright to render the page content."""
@@ -863,9 +978,32 @@ class UltraFrogCrawler:
                         if script.string:
                             data = json.loads(script.string)
                             schema_dump.append(data)
-                            self.extract_recursive_types(data, schema_types)
+                            
+                            # --- ROOT-LEVEL EXTRACTION ONLY ---
+                            # Case 1: Data is a list of schemas
+                            if isinstance(data, list):
+                                for item in data:
+                                    if isinstance(item, dict) and '@type' in item:
+                                        t = item['@type']
+                                        schema_types.extend(t if isinstance(t, list) else [t])
+                            
+                            # Case 2: Data is a dictionary using "@graph" (e.g., Yoast/RankMath)
+                            elif isinstance(data, dict) and '@graph' in data and isinstance(data['@graph'], list):
+                                for item in data['@graph']:
+                                    if isinstance(item, dict) and '@type' in item:
+                                        t = item['@type']
+                                        schema_types.extend(t if isinstance(t, list) else [t])
+                                        
+                            # Case 3: Data is a simple standard dictionary
+                            elif isinstance(data, dict) and '@type' in data:
+                                t = data['@type']
+                                schema_types.extend(t if isinstance(t, list) else [t])
+                                
                     except json.JSONDecodeError as e:
                         schema_validity = "Invalid JSON"
+                        schema_errors.append(str(e))
+                    except Exception as e:
+                        schema_validity = "Error"
                         schema_errors.append(str(e))
                     except Exception as e:
                         schema_validity = "Error"
@@ -1929,10 +2067,10 @@ if has_data and df is not None:
         st.metric("👻 Orphans", len(orphans))
     
     # Locate your existing st.tabs line and replace it with this:
-    tab1, tab2, tab3, tab_meta_titles, tab_headers, tab_tech, tab10, tab11, tab13, tab14, tab15, tab16, tab_search, tab_interlink, tab_cannibal, tab_gsc, tab_audit, tab_competitor = st.tabs([
+    tab1, tab2, tab3, tab_meta_titles, tab_headers, tab_tech, tab10, tab11, tab13, tab14, tab15, tab16, tab_search, tab_cannibal, tab_gsc, tab_audit, tab_competitor = st.tabs([
         "🔗 Internal", "🌐 External", "🖼️ Images", "📝 Meta & Titles", "🏗️ Header Analysis", 
         "🛠️ Technical Audit", "📱 Social", "🚀 Perf", 
-        "👻 Orphans", "⛏️ Custom", "⚡ PSI", "🏗️ Schema", "🔍 Search Results", "💡 Interlink", "👯 Cannibalization", "📈 GSC Data", "📅 Content Audit", "⚔️ Competitor Analysis"
+        "👻 Orphans", "⛏️ Custom", "⚡ PSI", "🏗️ Schema", "🔍 Search Results", "👯 Cannibalization", "📈 GSC Data", "📅 Content Audit", "⚔️ Competitor Analysis"
     ])
     
     status_lookup = df[['url', 'status_code']].drop_duplicates()
@@ -2617,20 +2755,49 @@ if has_data and df is not None:
                     results_gen = []
                     
                     def process_gen_row(row):
-                        content_snippet = str(row.get('scope_content', df[df['url'] == row['url']]['scope_content'].values[0]))[:800]
+                        content_snippet = str(row.get('scope_content', df[df['url'] == row['url']]['scope_content'].values[0]))[:2000] # Increased context slightly
+                        
                         if action_type == "Titles Only":
-                            context = f"H1: {row.get('h1_tags', '')}\nContent: {content_snippet}"
-                            prompt = f"Write a concise, high-CTR SEO Title (under 60 chars) for this page content:\n\n{context}"
+                            context = f"Current H1: {row.get('h1_tags', '')}\nPage Content: {content_snippet}"
+                            prompt = f"""
+                            Act as a Senior SEO Copywriter. Generate ONE highly optimized SEO Title tag for this webpage.
+                            
+                            STRICT RULES:
+                            1. Length: Must be exactly between 50 and 60 characters.
+                            2. Intent: Make it highly clickable (High CTR) but DO NOT use cheap clickbait.
+                            3. Keywords: Put the main topic/keyword near the front.
+                            4. Format: Output ONLY the title text. Do NOT wrap it in quotes. Do NOT say "Here is your title".
+                            
+                            Context:
+                            {context}
+                            """
                             col_name = "New AI Title"
                             old_val = row['title']
                         else:
-                            context = f"Title: {row.get('title', '')}\nContent: {content_snippet}"
-                            prompt = f"Write a persuasive SEO Meta Description (under 160 chars) for this page:\n\n{context}"
+                            context = f"Current Title: {row.get('title', '')}\nPage Content: {content_snippet}"
+                            prompt = f"""
+                            Act as a Senior SEO Copywriter. Generate ONE highly optimized SEO Meta Description for this webpage.
+                            
+                            STRICT RULES:
+                            1. Length: Must be exactly between 145 and 155 characters.
+                            2. Intent: Clearly explain the exact value the user will get by clicking.
+                            3. CTA: End with a natural, subtle Call-to-Action (e.g., Learn more, Discover how, Get started).
+                            4. Tone: Professional, engaging, and active voice.
+                            5. Format: Output ONLY the description text. Do NOT wrap it in quotes. Do NOT add any extra conversational text.
+                            
+                            Context:
+                            {context}
+                            """
                             col_name = "New AI Description"
                             old_val = row['meta_description']
                         
-                        generated = generate_ai_meta(provider, api_key_gen, model_name, endpoint, prompt)
-                        return {"URL": row['url'], "Old Value": old_val, col_name: generated}
+                        # Added temperature control to the system instruction to make the AI more factual and less "creative/fluffy"
+                        generated = generate_ai_meta(provider, api_key_gen, model_name, endpoint, prompt, "You are a strict Technical SEO Expert. Follow length rules perfectly.")
+                        
+                        # Extra cleanup just in case the AI ignores the "no quotes" rule
+                        clean_generated = generated.strip().strip('"').strip("'").replace("**", "")
+                        
+                        return {"URL": row['url'], "Old Value": old_val, col_name: clean_generated}
 
                     with ThreadPoolExecutor(max_workers=5) as executor:
                         futures = [executor.submit(process_gen_row, row) for _, row in targets.iterrows()]
@@ -2991,31 +3158,91 @@ if has_data and df is not None:
         st.subheader("🏗️ Schema Markup Analysis")
 
         # 1. Prepare Data for Table
-        # We create a clean view for the user
         schema_view = df[['url', 'schema_types', 'schema_validity']].copy()
         
-        # Add Suggestions
-        schema_view['Suggested Schema'] = df.apply(get_suggested_schema, axis=1)
-        
-        # Add a "Preview" button column (we use selection for this)
+        # Rename your old rule-based suggestion
+        schema_view['Rule-Based Suggestion'] = df.apply(get_suggested_schema, axis=1)
+
+        # --- NEW AI SCHEMA SUGGESTION TOOL ---
+        with st.expander("✨ Get AI-Powered Schema Suggestions"):
+            st.info("Use AI to read the actual page content and recommend the exact Schema types you should add.")
+            c_ai1, c_ai2 = st.columns(2)
+            sch_provider = c_ai1.selectbox("AI Provider", ["Gemini", "OpenAI Compatible (Groq/Ollama/OpenAI)"], key="sch_p")
+            sch_key = c_ai2.text_input("API Key (or empty for Ollama)", type="password", key="sch_k")
+            
+            c_ai3, c_ai4 = st.columns(2)
+            sch_model = c_ai3.text_input("Model", value="gemini-1.5-flash" if sch_provider=="Gemini" else "llama-3.3-70b-versatile", key="sch_m")
+            sch_url = c_ai4.text_input("Endpoint URL", value="https://api.groq.com/openai/v1/chat/completions", key="sch_u")
+
+            if st.button("🧠 Check Schema Suggestion with AI"):
+                with st.spinner("AI is analyzing content to suggest schemas..."):
+                    ai_results = {}
+                    progress_sch = st.progress(0)
+                    total_urls = len(df)
+                    
+                    def fetch_ai_schema(row):
+                        content = str(row.get('scope_content', ''))[:1500] # Limit to 1500 chars to save tokens
+                        title = str(row.get('title', ''))
+                        
+                        prompt = f"""
+                        Analyze this webpage content.
+                        Title: {title}
+                        Content Snippet: {content}
+                        
+                        Task: Suggest the top 1-3 most relevant Schema.org markup types for this page (e.g., Article, FAQPage, Product, LocalBusiness, Recipe, JobPosting, SoftwareApplication). 
+                        ONLY output the exact schema names separated by a comma. Do not include any other text, explanations, or code.
+                        """
+                        
+                        # Reuse your existing AI helper function
+                        res = generate_ai_meta(sch_provider, sch_key, sch_model, sch_url, prompt, "You are a Technical SEO Expert.")
+                        
+                        # Clean up the AI output just in case it gets chatty
+                        clean_res = res.replace("DECISION:", "").replace("`", "").strip()
+                        return row['url'], clean_res
+
+                    # Run requests concurrently
+                    with ThreadPoolExecutor(max_workers=3) as executor:
+                        futures = {executor.submit(fetch_ai_schema, row): row for _, row in df.iterrows()}
+                        for i, f in enumerate(as_completed(futures)):
+                            url, suggestion = f.result()
+                            ai_results[url] = suggestion
+                            progress_sch.progress((i + 1) / total_urls)
+                    
+                    # Save to session state so it persists
+                    st.session_state.ai_schema_suggestions = ai_results
+                    st.success("✅ AI Suggestions Generated!")
+
+        # --- MERGE AI DATA IF AVAILABLE ---
+        if 'ai_schema_suggestions' in st.session_state:
+            schema_view['✨ AI Suggestion'] = schema_view['url'].map(st.session_state.ai_schema_suggestions)
+        else:
+            schema_view['✨ AI Suggestion'] = "Click AI Button ⬆️"
+
         st.write("### 📊 Schema Overview")
         st.info("Select a row to see the Google Preview and Validation details below.")
+
+        # Dynamic Column Config
+        col_config = {
+            "url": st.column_config.LinkColumn("Page URL", width="medium"),
+            "schema_types": st.column_config.TextColumn("Detected Schema", width="small"),
+            "Rule-Based Suggestion": st.column_config.TextColumn("Standard Suggestion", width="small"),
+            "schema_validity": st.column_config.TextColumn("Status", width="small"),
+            "✨ AI Suggestion": st.column_config.TextColumn("✨ AI Suggestion", width="medium")
+        }
 
         # Interactive Table
         selection = st.dataframe(
             schema_view,
             use_container_width=True,
-            column_config={
-                "url": st.column_config.LinkColumn("Page URL", width="medium"),
-                "schema_types": st.column_config.TextColumn("Detected Schema", width="small"),
-                "Suggested Schema": st.column_config.TextColumn("✨ Opportunities", width="small"),
-                "schema_validity": st.column_config.TextColumn("Status", width="small"),
-            },
+            column_config=col_config,
             on_select="rerun", # Updates when user clicks a row
             selection_mode="single-row"
         )
 
         st.divider()
+        
+        # 2. Detailed View (Triggered by Selection)
+        # ... (DO NOT DELETE YOUR EXISTING PREVIEW/VALIDATOR CODE BELOW THIS LINE) ...
 
         # 2. Detailed View (Triggered by Selection)
         if selection.selection.rows:
@@ -3306,202 +3533,301 @@ if has_data and df is not None:
                 st.warning("⚠️ No URLs found to inspect. Please run a Crawl (List Mode) or Fetch Performance Data first.")
     
     with tab_competitor:
-        st.subheader("⚔️ Competitor Deep Analysis")
-        st.info("Compare your page against top competitors to find content gaps and keyword opportunities.")
-
-        # --- INPUTS ---
+        st.subheader("⚔️ The Ultimate Deep SEO Analysis")
+        st.info("Analyzes architecture, semantic gaps, CWV, and deep site-wide interlinking.")
+        
         c1, c2 = st.columns([1, 1])
         with c1:
-            my_url_input = st.text_input("Your Page URL", placeholder="https://mysite.com/page")
-            keywords_input = st.text_area("Target Keywords (Comma separated)", placeholder="seo tools, website crawler, python seo script")
-        with c2:
-            competitors_input = st.text_area("Competitor URLs (1 per line, max 5)", placeholder="https://competitor1.com/page\nhttps://competitor2.com/page", height=135)
+            my_url_input = st.text_input("Your Page URL", key="adv_my_url", placeholder="https://mysite.com/page")
+            keywords_input = st.text_area("Target Keywords (Comma separated)", key="adv_kws", placeholder="seo tools, python script")
+            
+            # --- NEW TOGGLES ---
+            st.write("**Deep Crawl Settings**")
+            enable_deep_inlinks = st.checkbox("🕷️ Crawl Entire Website for Inlinks", help="Finds exact number of internal pages pointing to the target. WARNING: Very slow!")
+            max_inlink_pages = st.number_input("Max pages to crawl per domain (if enabled)", 50, 5000, 200, step=50)
 
-        if st.button("🚀 Run Deep Analysis"):
+        with c2:
+            competitors_input = st.text_area("Competitor URLs (1 per line)", height=220, key="adv_comps")
+
+        if st.button("🚀 Run The Ultimate Analysis"):
             if not my_url_input or not competitors_input or not keywords_input:
-                st.error("⚠️ Please fill in all fields (Your URL, Keywords, and Competitors).")
+                st.error("⚠️ Fill in all fields.")
             else:
-                # 1. Prepare Data
                 comps = [u.strip() for u in competitors_input.split('\n') if u.strip()]
                 keywords = [k.strip().lower() for k in keywords_input.split(',') if k.strip()]
-                
-                # Combine lists (Your URL is first)
                 all_urls = [my_url_input] + comps
                 
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 results_data = []
                 
-                # Re-use your existing crawler class
                 crawler_comp = UltraFrogCrawler() 
                 
-                # 2. Crawl All Pages
-                with ThreadPoolExecutor(max_workers=5) as executor:
-                    # Submit all URLs for crawling
+                with ThreadPoolExecutor(max_workers=3) as executor:
                     future_to_url = {executor.submit(crawler_comp.extract_page_data, u): u for u in all_urls}
                     
                     for i, future in enumerate(as_completed(future_to_url)):
                         url = future_to_url[future]
-                        status_text.text(f"Analyzing {i+1}/{len(all_urls)}: {url}")
+                        status_text.text(f"Fetching Advanced Metrics: {url}")
                         
                         try:
+                            # 1. Main Crawler Data
                             data = future.result()
+                            parsed_url = urlparse(url)
+                            domain = parsed_url.netloc.lower()
                             
-                            # Content Pre-processing
-                            title = str(data.get('title', '')).lower()
-                            desc = str(data.get('meta_description', '')).lower()
+                            # 2. Secondary HTML parsing for advanced tags
+                            try:
+                                r = requests.get(url, timeout=8, headers={'User-Agent': 'Mozilla/5.0'})
+                                soup = BeautifulSoup(r.content, 'html.parser')
+                                
+                                list_count = len(soup.find_all(['ul', 'ol']))
+                                table_count = len(soup.find_all('table'))
+                                video_count = len(soup.find_all(['iframe', 'video']))
+                                
+                                # Paragraph analysis
+                                paragraphs = soup.find_all('p')
+                                p_lengths = [len(p.get_text().split()) for p in paragraphs if len(p.get_text().strip()) > 0]
+                                avg_p_len = sum(p_lengths) / len(p_lengths) if p_lengths else 0
+                                
+                                publish_date = extract_publish_date(soup)
+                            except:
+                                list_count, table_count, video_count, avg_p_len, publish_date = 0, 0, 0, 0, "Unknown"
+                            
+                            # Content variables
+                            title = str(data.get('title', ''))
+                            desc = str(data.get('meta_description', ''))
                             h1 = str(data.get('h1_tags', '')).lower()
-                            body = str(data.get('scope_content', '')).lower()
-                            url_str = str(data.get('url', '')).lower()
+                            h2 = str(data.get('h2_tags', '')).lower()
+                            h3 = str(data.get('h3_tags', '')).lower()
+                            body = str(data.get('scope_content', ''))
+                            body_lower = body.lower()
+                            
+                            alts = " ".join([str(img.get('alt', '')).lower() for img in data.get('images', [])])
                             word_count = data.get('word_count', 0)
+                            image_count = data.get('image_count', 0)
+                            first_100_words = " ".join(body_lower.split()[:100])
                             
-                            # Readability Score (Flesch Reading Ease)
-                            # 90-100: Very Easy, 0-30: Very Confusing
-                            readability = textstat.flesch_reading_ease(data.get('scope_content', ''))
+                            word_to_img_ratio = round(word_count / image_count, 1) if image_count > 0 else word_count
+                            readability = textstat.flesch_reading_ease(body) if body else 0
+                            domain_age = get_domain_age(domain)
                             
-                            # Keyword Analysis
+                            # External Link Analysis (Nofollow Ratio)
+                            ext_links = data.get('external_links', [])
+                            nofollow_count = sum(1 for link in ext_links if 'nofollow' in link.get('rel_status', ''))
+                            ext_total = len(ext_links)
+                            nofollow_ratio = f"{int((nofollow_count/ext_total)*100)}%" if ext_total > 0 else "0%"
+                            
+                            # Deep Site Crawl for Inlinks
+                            total_inlinks_to_page = "Skipped"
+                            if enable_deep_inlinks:
+                                status_text.text(f"🕷️ Deep Crawling {domain} to find inlinks...")
+                                total_inlinks_to_page = deep_crawl_for_inlinks(url, max_pages=max_inlink_pages)
+                            
+                            # Keyword Zones & Fuzzy Logic
                             kw_stats = {}
                             for kw in keywords:
-                                count = body.count(kw)
-                                
-                                # Check Zones
-                                in_title = "✅" if kw in title else "❌"
-                                in_desc = "✅" if kw in desc else "❌"
-                                in_h1 = "✅" if kw in h1 else "❌"
-                                in_url = "✅" if kw in url_str else "❌"
-                                
+                                fuzzy_count = count_fuzzy_match(body, kw)
                                 kw_stats[kw] = {
-                                    'Count': count,
-                                    'Title': in_title,
-                                    'Desc': in_desc,
-                                    'H1': in_h1,
-                                    'URL': in_url
+                                    'Domain': domain.count(kw), 'URL': parsed_url.path.lower().count(kw),
+                                    'Title': title.lower().count(kw), 'Desc': desc.lower().count(kw),
+                                    'H1': h1.count(kw), 'H2': h2.count(kw), 'H3': h3.count(kw),
+                                    'Alt': alts.count(kw), 'Body Exact': body_lower.count(kw),
+                                    'Body Fuzzy': fuzzy_count,
+                                    'In First 100': "✅" if kw in first_100_words else "❌"
                                 }
+
+                            # PSI with Core Web Vitals
+                            lcp, cls, mobile_score = "N/A", "N/A", "N/A"
+                            if psi_api_key:
+                                status_text.text(f"Running PSI: {url}")
+                                m_res = run_psi_test(url, psi_api_key, "mobile")
+                                if isinstance(m_res, dict) and "Score" in m_res:
+                                    mobile_score = m_res['Score']
+                                    lcp = m_res.get('LCP', 'N/A')
+                                    cls = m_res.get('CLS', 'N/A')
 
                             results_data.append({
                                 'Type': '🟦 ME' if url == my_url_input else '🟥 COMP',
                                 'URL': url,
+                                'Date Published': publish_date,
+                                'Domain Age': domain_age,
+                                'Readability': round(readability, 1),
                                 'Word Count': word_count,
-                                'Image Count': data.get('image_count', 0),
-                                'Readability (0-100)': round(readability, 1),
-                                'Load Time': f"{data.get('response_time', 0):.2f}s",
-                                'Keywords': kw_stats
+                                'Avg Paragraph': f"{round(avg_p_len)} words",
+                                'Title / Meta Length': f"{len(title)} / {len(desc)}",
+                                'H2 / H3 Count': f"{data.get('h2_count', 0)} / {data.get('h3_count', 0)}",
+                                'Word/Img Ratio': f"{word_to_img_ratio}:1",
+                                'Media (Vid/List/Tab)': f"{video_count} / {list_count} / {table_count}",
+                                'On-Page Internal Links': data.get('internal_links_count', 0),
+                                'Total Inlinks (Whole Site)': total_inlinks_to_page, # NEW METRIC
+                                'External Outbound': f"{ext_total} (Nofollow: {nofollow_ratio})",
+                                'Schema': data.get('schema_types', 'None'),
+                                'CWV (Score | LCP | CLS)': f"{mobile_score} | {lcp} | {cls}",
+                                'Keywords': kw_stats,
+                                'RawBody': body
                             })
                             
                         except Exception as e:
-                            st.error(f"Failed to analyze {url}: {e}")
+                            st.error(f"Failed {url}: {e}")
                             
                         progress_bar.progress((i + 1) / len(all_urls))
                 
-                status_text.success("✅ Analysis Complete!")
+                status_text.success("✅ Deep Analysis Complete!")
                 
                 # --- VISUALIZATION ---
                 
-                # 1. Structural Comparison Table (Words, Images, Readability)
-                st.write("### 🏗️ Content Structure Comparison")
-                st.markdown("Compare the 'weight' and complexity of your content versus competitors.")
+                # Separate "Me" and "Competitors" for easy column building
+                my_data = next((item for item in results_data if 'ME' in item['Type']), None)
+                comp_data = [item for item in results_data if 'COMP' in item['Type']]
                 
-                struct_data = []
-                for r in results_data:
-                    struct_data.append({
-                        "Role": r['Type'],
-                        "URL": r['URL'],
-                        "Words": r['Word Count'],
-                        "Images": r['Image Count'],
-                        "Readability Score": r['Readability (0-100)'],
-                        "Speed": r['Load Time']
-                    })
-                
-                st.dataframe(
-                    pd.DataFrame(struct_data), 
-                    use_container_width=True,
-                    column_config={
-                        "URL": st.column_config.LinkColumn("Page URL"),
-                        "Readability Score": st.column_config.ProgressColumn("Reading Ease", min_value=0, max_value=100, format="%d"),
-                    }
-                )
-                
-                st.divider()
+                # Helper to get clean domain names for column headers
+                def get_clean_domain(url_str):
+                    return urlparse(url_str).netloc.replace('www.', '')
 
-                # 2. Keyword Gap Matrix (The Deep Analysis)
-                st.write("### 🔑 Keyword Gap Matrix")
-                st.markdown("See how many times competitors use your target keywords.")
+                st.write("### 🏗️ 1. Content & Technical Architecture")
+                st.markdown("Side-by-side structural comparison. **Metrics are rows, Websites are columns.**")
                 
-                matrix_rows = []
-                for kw in keywords:
-                    row = {'Keyword': kw}
+                if my_data:
+                    # Define the metrics we want to compare
+                    metrics_keys = [
+                        'Word Count', 'Readability', 'H2 / H3 Count', 'Images', 
+                        'Word/Img Ratio', 'Media (Vid/List/Tab)', 'On-Page Internal Links', 
+                        'Total Inlinks (Whole Site)', 'External Outbound', 'Schema', 
+                        'Domain Age', 'Date Published', 'CWV (Score | LCP | CLS)'
+                    ]
                     
-                    # Get My Data
-                    my_data = next((item for item in results_data if 'ME' in item['Type']), None)
-                    
-                    if my_data:
-                        stats = my_data['Keywords'][kw]
-                        row['My Count'] = stats['Count']
-                        row['My Zones'] = f"{stats['Title']}T {stats['H1']}H {stats['Desc']}D"
-                    else:
-                        row['My Count'] = 0
-                        row['My Zones'] = "N/A"
-                    
-                    # Calculate Competitor Stats
-                    comp_counts = [item['Keywords'][kw]['Count'] for item in results_data if 'COMP' in item['Type']]
-                    
-                    if comp_counts:
-                        avg_count = sum(comp_counts) / len(comp_counts)
-                        max_count = max(comp_counts)
-                        row['Comp Avg'] = round(avg_count, 1)
-                        row['Comp Max'] = max_count
+                    t1_rows = []
+                    for metric in metrics_keys:
+                        row = {"Metric": metric}
+                        row["🫵 My Page"] = my_data.get(metric, "N/A")
                         
-                        # Gap Analysis Logic
-                        if row['My Count'] == 0:
-                            row['Status'] = "❌ Missing Keyword"
-                        elif row['My Count'] < (avg_count * 0.5):
-                            row['Status'] = "⚠️ Under-optimized"
-                        elif row['My Count'] > (max_count * 2.5):
-                            row['Status'] = "⚠️ Over-optimized (Stuffing?)"
-                        else:
-                            row['Status'] = "✅ Good Range"
-                    else:
-                        row['Comp Avg'] = 0
-                        row['Status'] = "❓ No Data"
+                        for i, comp in enumerate(comp_data):
+                            col_name = f"Comp {i+1} ({get_clean_domain(comp['URL'])})"
+                            row[col_name] = comp.get(metric, "N/A")
+                            
+                        t1_rows.append(row)
+                        
+                    struct_df = pd.DataFrame(t1_rows)
+                    st.dataframe(struct_df, use_container_width=True)
+                else:
+                    st.error("Could not fetch data for 'Your Page URL'.")
 
-                    matrix_rows.append(row)
-                    
-                gap_df = pd.DataFrame(matrix_rows)
-                
-                st.dataframe(
-                    gap_df,
-                    column_config={
-                        "My Count": st.column_config.NumberColumn("My Usage", help="Times keyword appears in body"),
-                        "Comp Avg": st.column_config.NumberColumn("Comp Avg", help="Average usage by competitors"),
-                        "My Zones": st.column_config.TextColumn("My Zones", help="T=Title, H=H1, D=Meta Desc"),
-                        "Status": st.column_config.TextColumn("Gap Status"),
-                    },
-                    use_container_width=True
-                )
-                
                 st.divider()
 
-                # 3. Detailed Zone Breakdown (Drill Down)
-                with st.expander("🔎 View Detailed Zone Matrix (Where are they placing keywords?)"):
-                    st.info("Check if competitors are putting keywords in the Title, H1, Meta Description, or URL.")
-                    
-                    # Create tabs for each keyword
+                st.write("### 🎯 2. Keyword Zone Matrix")
+                st.info("Select a keyword below to see exactly which HTML tags your competitors placed it in.")
+                
+                if my_data:
                     kw_tabs = st.tabs(keywords)
+                    flat_kw_export = [] # For CSV download later
+                    
                     for i, kw in enumerate(keywords):
                         with kw_tabs[i]:
-                            zone_rows = []
-                            for r in results_data:
-                                stats = r['Keywords'][kw]
-                                zone_rows.append({
-                                    "Role": r['Type'],
-                                    "URL": r['URL'],
-                                    "Title": stats['Title'],
-                                    "H1": stats['H1'],
-                                    "Meta": stats['Desc'],
-                                    "URL Slug": stats['URL'],
-                                    "Body Count": stats['Count']
-                                })
-                            st.dataframe(pd.DataFrame(zone_rows), use_container_width=True)
+                            zones = ['Body Exact', 'Body Fuzzy', 'In First 100 Words?', 'Title', 'H1', 'H2', 'H3', 'Meta Desc', 'Img Alt', 'URL', 'Domain']
+                            kw_rows = []
+                            
+                            for zone in zones:
+                                row = {"HTML Zone": zone}
+                                my_val = my_data['Keywords'][kw].get(zone, 0)
+                                row["🫵 My Page"] = my_val
+                                
+                                comp_vals_for_avg = []
+                                for j, comp in enumerate(comp_data):
+                                    comp_val = comp['Keywords'][kw].get(zone, 0)
+                                    col_name = f"Comp {j+1} ({get_clean_domain(comp['URL'])})"
+                                    row[col_name] = comp_val
+                                    
+                                    if isinstance(comp_val, (int, float)):
+                                        comp_vals_for_avg.append(comp_val)
+                                
+                                # Calculate Average
+                                if comp_vals_for_avg:
+                                    avg = sum(comp_vals_for_avg) / len(comp_vals_for_avg)
+                                    row["Competitor Avg"] = round(avg, 1)
+                                    
+                                    # Status indicator for numeric zones
+                                    if isinstance(my_val, (int, float)):
+                                        if my_val < avg: row["Status"] = "📉 Below Avg"
+                                        elif my_val > avg * 2: row["Status"] = "📈 High (Careful)"
+                                        else: row["Status"] = "✅ Optimal"
+                                else:
+                                    row["Competitor Avg"] = "N/A"
+                                    row["Status"] = "-"
+                                    
+                                kw_rows.append(row)
+                                
+                                # Save for flat CSV export
+                                flat_row = {"Keyword": kw, **row}
+                                flat_kw_export.append(flat_row)
+                            
+                            kw_df = pd.DataFrame(kw_rows)
+                            st.dataframe(kw_df, use_container_width=True)
+
+                st.divider()
+
+                # --- 3. LSI / TF-IDF N-GRAM GAP ANALYSIS ---
+                st.write("### 🧠 3. Semantic LSI Gap Analysis")
+                st.markdown("Top 2-word and 3-word phrases used by competitors. See exactly who is using which sub-topics.")
+                
+                try:
+                    comp_data = [r for r in results_data if 'COMP' in r['Type']]
+                    comp_bodies = [r['RawBody'] for r in comp_data]
+                    my_body = my_data['RawBody'].lower() if my_data else ""
+                    
+                    if comp_bodies:
+                        vec = CountVectorizer(ngram_range=(2, 3), stop_words='english', max_features=30)
+                        matrix = vec.fit_transform(comp_bodies)
+                        sums = matrix.sum(axis=0).A1
+                        vocab = vec.get_feature_names_out()
+                        
+                        freq = [(vocab[idx], sums[idx]) for idx in range(len(vocab))]
+                        freq = sorted(freq, key=lambda x: x[1], reverse=True)
+                        
+                        lsi_data = []
+                        for phrase, total_count in freq[:20]:
+                            my_usage_count = my_body.count(phrase)
+                            status = "✅ Used" if my_usage_count > 0 else "❌ Missing"
+                            
+                            # Start building the row dictionary
+                            row_data = {
+                                "Semantic Phrase (LSI)": phrase,
+                                "🫵 My Page": my_usage_count,
+                            }
+                            
+                            # Dynamically add a column for each competitor and count their specific usage
+                            for i, comp in enumerate(comp_data):
+                                col_name = f"Comp {i+1} ({get_clean_domain(comp['URL'])})"
+                                row_data[col_name] = comp['RawBody'].lower().count(phrase)
+                                
+                            # Add the status at the very end so it sits on the far right
+                            row_data["Gap Status"] = status
+                            lsi_data.append(row_data)
+                            
+                        lsi_df = pd.DataFrame(lsi_data)
+                        st.dataframe(
+                            lsi_df, 
+                            use_container_width=True,
+                            column_config={
+                                "Gap Status": st.column_config.TextColumn("Status", width="small")
+                            }
+                        )
+                    else:
+                        st.warning("Not enough competitor data to generate LSI keywords.")
+                except Exception as e:
+                    st.error(f"Could not generate LSI phrases: {e}")
+
+                # --- CSV EXPORTS ---
+                st.markdown("<br>", unsafe_allow_html=True)
+                c_btn1, c_btn2, c_btn3 = st.columns(3)
+                
+                if 'struct_df' in locals():
+                    c_btn1.download_button("📥 Download Architecture", struct_df.to_csv(index=False).encode('utf-8'), "competitor_structure.csv", "text/csv")
+                if 'flat_kw_export' in locals() and flat_kw_export:
+                    flat_df = pd.DataFrame(flat_kw_export)
+                    c_btn2.download_button("📥 Download Keyword Matrix", flat_df.to_csv(index=False).encode('utf-8'), "competitor_keywords.csv", "text/csv")
+                if 'lsi_df' in locals():
+                    c_btn3.download_button("📥 Download LSI Gaps", lsi_df.to_csv(index=False).encode('utf-8'), "lsi_gaps.csv", "text/csv")
     
     with tab_audit:
         st.subheader("📅 AI Content Relevance & Freshness Auditor")
@@ -3509,51 +3835,65 @@ if has_data and df is not None:
         
         c1, c2 = st.columns(2)
         with c1:
-            aud_provider = st.selectbox("AI Provider", ["Gemini", "OpenAI Compatible (Groq/Ollama)"], key="aud_p")
+            aud_provider = st.selectbox("AI Provider", ["Gemini", "OpenAI Compatible (Groq/Ollama/OpenAI)"], key="aud_p")
             aud_key = st.text_input("API Key (or Ollama URL if empty)", type="password", key="aud_k")
         with c2:
+            # Note: I am inserting the Groq model name Kamal uses here!
             aud_model = st.text_input("Model", value="gemini-1.5-flash" if aud_provider=="Gemini" else "llama-3.3-70b-versatile", key="aud_m")
             aud_url = st.text_input("Endpoint (if needed)", value="https://api.groq.com/openai/v1/chat/completions", key="aud_u")
 
-        audit_scope = st.radio("Audit Scope:", ["Top 10 High Traffic (GSC Needed)", "Custom List", "All Indexable Pages"], horizontal=True)
+        # FIX 3: Added a 'Custom Select' option to prevent API rate limits
+        audit_scope = st.radio("Audit Scope:", ["Selected Pages (Custom)", "Top 10 High Traffic (GSC Needed)", "All Indexable Pages (WARNING: High API Cost)"], horizontal=True)
+
+        targets_to_audit = []
+        if audit_scope == "Selected Pages (Custom)":
+            selected_urls = st.multiselect("Select URLs to Audit", df['url'].tolist(), default=df['url'].head(3).tolist())
+            targets_to_audit = df[df['url'].isin(selected_urls)].to_dict('records')
+            
+        elif audit_scope == "Top 10 High Traffic (GSC Needed)":
+            if 'gsc_merged_data' in st.session_state and not st.session_state.gsc_merged_data.empty:
+                targets_to_audit = st.session_state.gsc_merged_data.sort_values(by='GSC Clicks', ascending=False).head(10).to_dict('records')
+            else:
+                st.warning("⚠️ No GSC Data found. Please fetch GSC data in the 'GSC Data' tab first.")
+                
+        else:
+            targets_to_audit = df[df['indexability'] == 'Indexable'].to_dict('records')
+            st.warning(f"⚠️ You are about to send {len(targets_to_audit)} pages to the AI API. This may take a while.")
 
         if st.button("🚀 Start Content Audit"):
-            targets = []
-            if audit_scope == "All Indexable Pages":
-                targets = df[df['indexability'] == 'Indexable'].to_dict('records')
-            elif audit_scope == "Top 10 High Traffic (GSC Needed)":
-                if 'gsc_merged_data' in st.session_state and not st.session_state.gsc_merged_data.empty:
-                    targets = st.session_state.gsc_merged_data.sort_values(by='GSC Clicks', ascending=False).head(10).to_dict('records')
-                else:
-                    st.error("Please fetch GSC Performance data first.")
-            else: 
-                 st.info("Custom List logic would go here. Defaulting to first 5 indexable pages.")
-                 targets = df[df['indexability'] == 'Indexable'].head(5).to_dict('records')
-            
-            if targets:
+            if not aud_key and aud_provider == "Gemini":
+                st.error("⚠️ Please enter an API key to run the audit.")
+            elif not targets_to_audit:
+                st.error("⚠️ No target URLs found to audit.")
+            else:
                 progress_aud = st.progress(0)
+                status_aud = st.empty()
                 audit_results = []
                 
-                with ThreadPoolExecutor(max_workers=3) as executor:
-                    futures = [executor.submit(analyze_content_freshness, t['url'], t.get('title', ''), t.get('scope_content', ''), aud_provider, aud_key, aud_model, aud_url) for t in targets]
+                # Reduced max_workers to 2 to prevent Groq API rate limiting
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [executor.submit(analyze_content_freshness, t['url'], t.get('title', ''), t.get('scope_content', ''), aud_provider, aud_key, aud_model, aud_url) for t in targets_to_audit]
                     for i, f in enumerate(as_completed(futures)):
                         audit_results.append(f.result())
-                        progress_aud.progress((i + 1) / len(targets))
+                        progress_aud.progress((i + 1) / len(targets_to_audit))
+                        status_aud.text(f"Audited {i + 1}/{len(targets_to_audit)}")
                 
                 aud_res_df = pd.DataFrame(audit_results)
                 st.session_state.content_audit_data = aud_res_df
-                st.success("✅ Audit Complete!")
+                status_aud.success("✅ Audit Complete!")
 
+        # --- DISPLAY RESULTS ---
         if 'content_audit_data' in st.session_state and not st.session_state.content_audit_data.empty:
             res = st.session_state.content_audit_data
             
-            m1, m2, m3 = st.columns(3)
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric("KEEP", len(res[res['Decision'] == 'KEEP']))
             m2.metric("UPDATE", len(res[res['Decision'] == 'UPDATE']), delta_color="off")
             m3.metric("REMOVE", len(res[res['Decision'] == 'REMOVE']), delta="-"+str(len(res[res['Decision'] == 'REMOVE'])))
+            m4.metric("ERRORS", len(res[res['Decision'] == 'ERROR']))
             
             st.dataframe(res, use_container_width=True, column_config={
-                "Decision": st.column_config.SelectboxColumn("Decision", options=["KEEP", "UPDATE", "REMOVE"]),
+                "Decision": st.column_config.SelectboxColumn("Decision", options=["KEEP", "UPDATE", "REMOVE", "UNKNOWN", "ERROR"]),
                 "URL": st.column_config.LinkColumn("Page URL")
             })
             
