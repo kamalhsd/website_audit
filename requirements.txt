@@ -9,3 +9,4 @@ playwright
 Pillow
 lxml
 textstat
+whois
