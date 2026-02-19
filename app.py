@@ -1,3 +1,4 @@
+import zipfile
 import textstat
 import whois
 from sklearn.feature_extraction.text import CountVectorizer
@@ -2174,7 +2175,7 @@ if has_data and df is not None:
                     "Target Authority": st.column_config.ProgressColumn("Authority", format="%d", min_value=0, max_value=100),
                 }
                 
-                cols_order = ['Source URL', 'Source Inlinks', 'Source Outlinks', 'Destination URL', 'Target Authority', 'Link Scope', 'Anchor Text', 'Status Code']
+                cols_order = ['Source URL', 'Source Inlinks', 'Source Outlinks', 'Destination URL', 'Target Authority', 'Link Scope', 'Anchor Text', 'Status Code', 'CSS Path']
                 existing_cols = [c for c in cols_order if c in final_links.columns]
                 
                 st.dataframe(final_links[existing_cols], use_container_width=True, column_config=col_config)
@@ -2708,8 +2709,60 @@ if has_data and df is not None:
                             st.download_button("📥 Download Full Report", csv_rep, "conversion_report.csv", "text/csv")
                         else:
                             st.warning("No images processed successfully.")
+        # ... [Your other tab3 code above here] ...
+
+        if images_data:
+            # ... [All your image processing and dataframes] ...
+            pass # (Just representing your existing code)
+            
         else:
             st.info("No images found.")
+
+        # 👇 THIS MUST BE LINED UP WITH THE 'if' and 'else' ABOVE IT!
+        # --- 6. OFFLINE BULK IMAGE OPTIMIZER ---
+        st.markdown("---")
+        st.subheader("🗜️ Offline Bulk Image Optimizer")
+        st.info("Upload heavy images. This tool will resize them, compress them, and convert them to SEO-friendly WebP format using your local computer's power.")
+
+        uploaded_images = st.file_uploader("Upload Images (JPG, PNG)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+
+        c_opt1, c_opt2 = st.columns(2)
+        max_width_bulk = c_opt1.number_input("Max Width (px) - Good for Hero images", value=1200, step=100)
+        quality_bulk = c_opt2.slider("WebP Quality (1-100)", min_value=10, max_value=100, value=75, help="75 is the sweet spot for SEO.")
+
+        if uploaded_images and st.button("🚀 Compress & Convert to WebP"):
+            with st.spinner("Compressing images..."):
+                zip_buffer = io.BytesIO()
+                
+                with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+                    for img_file in uploaded_images:
+                        try:
+                            img = Image.open(img_file)
+                            if img.mode in ("RGBA", "P"):
+                                img = img.convert("RGB")
+                                
+                            if img.width > max_width_bulk:
+                                ratio = max_width_bulk / float(img.width)
+                                new_height = int((float(img.height) * float(ratio)))
+                                img = img.resize((max_width_bulk, new_height), Image.Resampling.LANCZOS)
+                                
+                            img_byte_arr = io.BytesIO()
+                            img.save(img_byte_arr, format='WEBP', quality=quality_bulk, optimize=True)
+                            
+                            original_name = img_file.name.rsplit('.', 1)[0]
+                            zip_file.writestr(f"{original_name}_optimized.webp", img_byte_arr.getvalue())
+                            
+                        except Exception as e:
+                            st.error(f"Failed to process {img_file.name}: {e}")
+                            
+                st.success("✅ Compression Complete!")
+                
+                st.download_button(
+                    label="📥 Download All Optimized WebP Images (ZIP)",
+                    data=zip_buffer.getvalue(),
+                    file_name="seo_optimized_images.zip",
+                    mime="application/zip"
+                )
 
     with tab_meta_titles:
         st.subheader("📝 Meta Tags & Titles Analysis")
