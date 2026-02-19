@@ -1552,7 +1552,7 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("⚡ PageSpeed Insights")
-    psi_api_key = st.text_input("Google API Key (Optional)", type="password", help="AIzaSyDAdUhiOXqTRB-rvyfNmQkCAgYQkN8AjSE")
+    psi_api_key = st.text_input("Google API Key (Optional)", type="password", help="Add Page Speed API")
 
     st.markdown("---")
     st.subheader("📈 Search Console")
