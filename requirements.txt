@@ -10,4 +10,5 @@ Pillow
 lxml
 textstat
 whois
-networkx as nx
+networkx
+
