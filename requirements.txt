@@ -11,4 +11,4 @@ lxml
 textstat
 whois
 networkx
-
+language_tool_python
