@@ -56,6 +56,14 @@ try:
 except ImportError:
     HAS_SKLEARN = False
 
+
+# --- SEMANTIC AI IMPORTS ---
+try:
+    from sentence_transformers import SentenceTransformer, util
+    HAS_SENTENCE_TRANSFORMERS = True
+except ImportError:
+    HAS_SENTENCE_TRANSFORMERS = False
+
 # --- GRAMMAR CHECKER IMPORT (Fixes NameError) ---
 try:
     import language_tool_python
@@ -311,10 +319,24 @@ def inspect_url_indexing(service, site_url, url_list):
     return pd.DataFrame(results)
 
 # --- AI HELPER FUNCTIONS ---
+@st.cache_resource
+def load_embedding_model():
+    # all-MiniLM-L6-v2 is specifically designed for fast, accurate semantic search. 
+    # It runs locally, uses very little RAM, and is perfect for SEO matching.
+    return SentenceTransformer('all-MiniLM-L6-v2')
+
 def generate_interlink_suggestions(df, min_score=40, max_suggestions=10):
     if df.empty: return pd.DataFrame()
+    
+    if not HAS_SENTENCE_TRANSFORMERS:
+        st.error("❌ 'sentence-transformers' library missing. Run `pip install sentence-transformers`")
+        return pd.DataFrame()
+
+    # 1. Prepare Target Topics and Source Contexts
     df['target_topic'] = df['title'].fillna('') + " " + df['h1_tags'].fillna('')
     df['source_context'] = df['scope_content'].fillna('')
+    
+    # Fallback: if body is empty, use meta description
     mask = df['source_context'] == ''
     df.loc[mask, 'source_context'] = df.loc[mask, 'title'].fillna('') + " " + df.loc[mask, 'meta_description'].fillna('')
 
@@ -322,46 +344,63 @@ def generate_interlink_suggestions(df, min_score=40, max_suggestions=10):
     valid_sources = df[df['source_context'].str.strip() != '']
     if valid_targets.empty or valid_sources.empty: return pd.DataFrame()
 
-    tfidf = TfidfVectorizer(stop_words='english')
-    try:
-        all_text = pd.concat([valid_targets['target_topic'], valid_sources['source_context']])
-        tfidf.fit(all_text)
-        target_matrix = tfidf.transform(df['target_topic'])
-        source_matrix = tfidf.transform(df['source_context'])
-    except ValueError: return pd.DataFrame()
+    # 2. Load AI Model (Cached so it only loads once)
+    model = load_embedding_model()
+
+    # 3. Create AI Embeddings (Vectors)
+    # We truncate source_context to 3000 chars to keep processing ultra-fast and focused on the core text
+    target_texts = df['target_topic'].tolist()
+    source_texts = df['source_context'].str[:3000].tolist()
     
+    # Convert text into semantic mathematical vectors
+    target_embeddings = model.encode(target_texts, convert_to_tensor=True)
+    source_embeddings = model.encode(source_texts, convert_to_tensor=True)
+
+    # 4. Calculate True Semantic Similarity
+    similarity_matrix = util.cos_sim(source_embeddings, target_embeddings).cpu().numpy()
+
     suggestions = []
     existing_links = set()
+    
+    # 5. Map existing links to prevent suggesting links you already have
     for _, row in df.iterrows():
         links = row.get('internal_links', [])
         if isinstance(links, str):
             try: links = json.loads(links)
             except: links = []
         for link in links:
-            existing_links.add((row['url'], link['url']))
+            if isinstance(link, dict) and 'url' in link:
+                existing_links.add((row['url'], link['url']))
 
-    similarity_scores = cosine_similarity(source_matrix, target_matrix)
-
+    # 6. Extract Top AI Matches
     for idx, row in df.iterrows():
         source_url = row['url']
-        scores = similarity_scores[idx]
+        scores = similarity_matrix[idx]
+        
+        # Sort indices by highest score
         top_indices = scores.argsort()[::-1][:50] 
         count = 0
+        
         for target_idx in top_indices:
             if count >= max_suggestions: break
+            
             target_url = df.iloc[target_idx]['url']
-            score = round(scores[target_idx] * 100, 1)
-            if source_url == target_url: continue 
-            if score < min_score: continue 
-            if (source_url, target_url) in existing_links: continue 
+            # Convert 0.0-1.0 tensor to 0-100 score for your UI slider
+            score = round(float(scores[target_idx]) * 100, 1) 
+            
+            if source_url == target_url: continue # Skip self-linking
+            if score < min_score: continue # Must pass user's UI threshold
+            if (source_url, target_url) in existing_links: continue # Skip already linked pages
+            
             suggestions.append({
                 'Source URL': source_url,
-                'Source Content Preview': row['source_context'][:50] + "...",
+                'Source Content Preview': row['source_context'][:60] + "...",
                 'Suggested Target URL': target_url,
                 'Target Topic': df.iloc[target_idx]['target_topic'][:60] + "...",
                 'Relevance Score': score
             })
             count += 1
+            
     return pd.DataFrame(suggestions)
 
 def analyze_content_cannibalization(df, merge_threshold=0.50, duplicate_threshold=0.85):
