@@ -317,6 +317,37 @@ def inspect_url_indexing(service, site_url, url_list):
             
     status_text.success("✅ Inspection Complete!")
     return pd.DataFrame(results)
+    
+def submit_to_indexing_api(json_content, url_list, action="URL_UPDATED"):
+    """Submits URLs directly to the Google Indexing API."""
+    results = []
+    try:
+        info = json.loads(json_content)
+        # Note: The Indexing API requires a specific scope, different from GSC!
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=['https://www.googleapis.com/auth/indexing']
+        )
+        service = build('indexing', 'v3', credentials=creds)
+        
+        for url in url_list:
+            try:
+                body = {"url": url, "type": action}
+                response = service.urlNotifications().publish(body=body).execute()
+                results.append({"URL": url, "Status": "✅ Success", "Details": "Submitted for Crawl"})
+            except Exception as e:
+                # Catch API errors (like 429 Quota Exceeded or 403 Permission Denied)
+                err_msg = str(e)
+                if "429" in err_msg: err_msg = "Quota Exceeded (Daily Limit Reached)"
+                elif "403" in err_msg: err_msg = "Permission Denied (Ensure Service Account is added as Owner)"
+                results.append({"URL": url, "Status": "❌ Failed", "Details": err_msg})
+            
+            # Gentle delay to prevent overwhelming the API
+            time.sleep(0.5) 
+            
+    except Exception as e:
+        return pd.DataFrame([{"URL": "Authentication Error", "Status": "❌ Failed", "Details": str(e)}])
+        
+    return pd.DataFrame(results)
 
 # --- AI HELPER FUNCTIONS ---
 @st.cache_resource
@@ -3623,6 +3654,67 @@ if has_data and df is not None:
                         st.download_button("📥 Download Inspection Report", csv_insp, "indexing_report.csv", "text/csv")
             else:
                 st.warning("⚠️ No URLs found to inspect. Please run a Crawl (List Mode) or Fetch Performance Data first.")
+                
+    # --- 3. GOOGLE INDEXING API MODULE ---
+            st.divider()
+            st.write("### 🚀 3. Bulk Indexing API (Force Indexing)")
+            st.info("Directly ping Google to crawl/index these URLs immediately. **Limit: 200 per day.** Ensure your Service Account is added as an 'Owner' in GSC.")
+            
+            # Check if the user uploaded the JSON key in the sidebar
+            if 'last_gsc_key' not in st.session_state or not st.session_state.last_gsc_key:
+                st.warning("⚠️ Please upload your Service Account JSON Key in the sidebar first.")
+            else:
+                c_idx1, c_idx2 = st.columns([2, 1])
+                
+                with c_idx1:
+                    # Provide options from crawled data if available
+                    avail_urls = df['url'].tolist() if (df is not None and not df.empty) else []
+                    selected_index_urls = st.multiselect(
+                        "Select Crawled URLs to Submit:", 
+                        options=avail_urls,
+                        help="Select URLs from your current crawl."
+                    )
+                    
+                    # Also allow manual pasting for quick jobs without crawling
+                    manual_index_urls = st.text_area("Or Paste URLs (One per line):", placeholder="https://mysite.com/new-post")
+                
+                with c_idx2:
+                    indexing_action = st.radio(
+                        "Action Type:", 
+                        ["URL_UPDATED", "URL_DELETED"], 
+                        help="UPDATED = Add/Refresh page. DELETED = Remove page from Google."
+                    )
+                
+                if st.button("🚀 Ping Google Indexing API"):
+                    # Combine selected URLs and manually pasted URLs, then remove duplicates
+                    final_urls = list(set(selected_index_urls + [u.strip() for u in manual_index_urls.split('\n') if u.strip()]))
+                    
+                    if not final_urls:
+                        st.error("❌ Please provide at least one URL.")
+                    elif len(final_urls) > 200:
+                        st.error(f"❌ You selected {len(final_urls)} URLs. The default daily limit is 200. Please reduce your list.")
+                    else:
+                        with st.spinner(f"Pinging Google for {len(final_urls)} URLs..."):
+                            # Call our new helper function
+                            idx_results_df = submit_to_indexing_api(
+                                st.session_state.last_gsc_key, 
+                                final_urls, 
+                                indexing_action
+                            )
+                            
+                            st.success("✅ Submission Process Complete!")
+                            st.dataframe(
+                                idx_results_df, 
+                                use_container_width=True,
+                                column_config={
+                                    "URL": st.column_config.LinkColumn("Target URL"),
+                                    "Status": st.column_config.TextColumn("Status", width="small"),
+                                    "Details": st.column_config.TextColumn("API Response")
+                                }
+                            )
+                            
+                            csv_idx = idx_results_df.to_csv(index=False).encode('utf-8')
+                            st.download_button("📥 Download Submission Report", csv_idx, "indexing_api_report.csv", "text/csv")
     
     with tab_competitor:
         st.subheader("⚔️ The Ultimate Deep SEO Analysis")
