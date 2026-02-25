@@ -1,3 +1,10 @@
+import fitz  # PyMuPDF for PDF to Image
+from pdf2docx import Converter
+from docx2pdf import convert as docx2pdf_convert
+from htmldocx import HtmlToDocx
+import docx
+import tempfile
+import pdfkit
 import zipfile
 import textstat
 import whois
@@ -9,7 +16,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 from datetime import datetime
 import re
-import textstat
 import networkx as nx
 import sys
 import asyncio
@@ -21,20 +27,14 @@ if sys.platform.startswith("win"):
 # --------------------------------------------------
 
 import streamlit as st
-import requests
-from bs4 import BeautifulSoup
 import pandas as pd
-from urllib.parse import urljoin, urlparse
-import time
 from collections import deque, Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+from concurrent.futures import TimeoutError
 import json
-from datetime import datetime, timedelta
+from datetime import timedelta
 import xml.etree.ElementTree as ET
 from urllib.robotparser import RobotFileParser
-import streamlit.components.v1 as components
 import html
-import re
 import threading
 import sqlite3
 import uuid
@@ -55,7 +55,6 @@ try:
     HAS_SKLEARN = True
 except ImportError:
     HAS_SKLEARN = False
-
 
 # --- SEMANTIC AI IMPORTS ---
 try:
@@ -88,6 +87,83 @@ except ImportError:
 
 # Page config
 st.set_page_config(page_title="Battersea Crawler", layout="wide", page_icon="🐸")
+
+# --- UI ENHANCEMENTS: THEME-AGNOSTIC CSS (DARK/LIGHT MODE READY) ---
+st.markdown("""
+<style>
+/* Main Header Banner - Linear Gradients work in both modes */
+.main-header {
+    background: linear-gradient(135deg, #0f2027 0%, #203a43 50%, #2c5364 100%);
+    padding: 30px;
+    border-radius: 12px;
+    text-align: center;
+    box-shadow: 0 8px 16px rgba(0,0,0,0.15);
+    margin-bottom: 30px;
+}
+.main-header h1 { color: #ffffff !important; margin: 0; font-size: 2.8rem; font-weight: 800; letter-spacing: 1px; padding-bottom: 5px; }
+.main-header p { color: #4ade80 !important; font-size: 1.1rem; margin-top: 5px; font-weight: 600; text-transform: uppercase; letter-spacing: 2px;}
+
+/* Metrics Cards (KPIs) - Using transparent RGBA so it adapts to Dark/Light mode */
+div[data-testid="stMetric"] {
+    background-color: rgba(128, 128, 128, 0.05);
+    border: 1px solid rgba(128, 128, 128, 0.2);
+    border-radius: 10px;
+    padding: 15px 20px;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.04);
+    transition: transform 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease;
+}
+div[data-testid="stMetric"]:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 8px 15px rgba(0,0,0,0.1);
+    background-color: rgba(128, 128, 128, 0.1);
+}
+/* Inherit text color for Metric values so it automatically flips to white/black */
+div[data-testid="stMetricValue"] {
+    font-weight: 700;
+}
+
+/* Tabs Styling - Theme Agnostic */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 8px;
+    padding: 5px 0px;
+    background: transparent;
+}
+.stTabs [data-baseweb="tab"] {
+    height: 45px;
+    border-radius: 8px;
+    background-color: rgba(128, 128, 128, 0.05) !important;
+    border: 1px solid rgba(128, 128, 128, 0.2) !important;
+    font-weight: 600;
+    transition: all 0.2s ease;
+    padding: 0 15px;
+}
+.stTabs [data-baseweb="tab"]:hover {
+    background-color: rgba(128, 128, 128, 0.15) !important;
+}
+.stTabs [aria-selected="true"] {
+    background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%) !important;
+    color: #ffffff !important;
+    border: none !important;
+    box-shadow: 0 4px 10px rgba(17, 153, 142, 0.3);
+}
+
+/* Dataframe container padding */
+[data-testid="stDataFrame"] {
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+}
+</style>
+""", unsafe_allow_html=True)
+
+# Header
+st.markdown("""
+<div class="main-header">
+    <h1>Battersea Crawler</h1>
+    <p>Professional Edition • Full SEO Analysis</p>
+</div>
+""", unsafe_allow_html=True)
+
 
 # --- GLOBAL CONFIG ---
 write_lock = threading.Lock()
@@ -352,8 +428,6 @@ def submit_to_indexing_api(json_content, url_list, action="URL_UPDATED"):
 # --- AI HELPER FUNCTIONS ---
 @st.cache_resource
 def load_embedding_model():
-    # all-MiniLM-L6-v2 is specifically designed for fast, accurate semantic search. 
-    # It runs locally, uses very little RAM, and is perfect for SEO matching.
     return SentenceTransformer('all-MiniLM-L6-v2')
 
 def generate_interlink_suggestions(df, min_score=40, max_suggestions=10):
@@ -363,11 +437,9 @@ def generate_interlink_suggestions(df, min_score=40, max_suggestions=10):
         st.error("❌ 'sentence-transformers' library missing. Run `pip install sentence-transformers`")
         return pd.DataFrame()
 
-    # 1. Prepare Target Topics and Source Contexts
     df['target_topic'] = df['title'].fillna('') + " " + df['h1_tags'].fillna('')
     df['source_context'] = df['scope_content'].fillna('')
     
-    # Fallback: if body is empty, use meta description
     mask = df['source_context'] == ''
     df.loc[mask, 'source_context'] = df.loc[mask, 'title'].fillna('') + " " + df.loc[mask, 'meta_description'].fillna('')
 
@@ -375,25 +447,19 @@ def generate_interlink_suggestions(df, min_score=40, max_suggestions=10):
     valid_sources = df[df['source_context'].str.strip() != '']
     if valid_targets.empty or valid_sources.empty: return pd.DataFrame()
 
-    # 2. Load AI Model (Cached so it only loads once)
     model = load_embedding_model()
 
-    # 3. Create AI Embeddings (Vectors)
-    # We truncate source_context to 3000 chars to keep processing ultra-fast and focused on the core text
     target_texts = df['target_topic'].tolist()
     source_texts = df['source_context'].str[:3000].tolist()
     
-    # Convert text into semantic mathematical vectors
     target_embeddings = model.encode(target_texts, convert_to_tensor=True)
     source_embeddings = model.encode(source_texts, convert_to_tensor=True)
 
-    # 4. Calculate True Semantic Similarity
     similarity_matrix = util.cos_sim(source_embeddings, target_embeddings).cpu().numpy()
 
     suggestions = []
     existing_links = set()
     
-    # 5. Map existing links to prevent suggesting links you already have
     for _, row in df.iterrows():
         links = row.get('internal_links', [])
         if isinstance(links, str):
@@ -403,12 +469,10 @@ def generate_interlink_suggestions(df, min_score=40, max_suggestions=10):
             if isinstance(link, dict) and 'url' in link:
                 existing_links.add((row['url'], link['url']))
 
-    # 6. Extract Top AI Matches
     for idx, row in df.iterrows():
         source_url = row['url']
         scores = similarity_matrix[idx]
         
-        # Sort indices by highest score
         top_indices = scores.argsort()[::-1][:50] 
         count = 0
         
@@ -416,12 +480,11 @@ def generate_interlink_suggestions(df, min_score=40, max_suggestions=10):
             if count >= max_suggestions: break
             
             target_url = df.iloc[target_idx]['url']
-            # Convert 0.0-1.0 tensor to 0-100 score for your UI slider
             score = round(float(scores[target_idx]) * 100, 1) 
             
-            if source_url == target_url: continue # Skip self-linking
-            if score < min_score: continue # Must pass user's UI threshold
-            if (source_url, target_url) in existing_links: continue # Skip already linked pages
+            if source_url == target_url: continue
+            if score < min_score: continue
+            if (source_url, target_url) in existing_links: continue
             
             suggestions.append({
                 'Source URL': source_url,
@@ -437,19 +500,15 @@ def generate_interlink_suggestions(df, min_score=40, max_suggestions=10):
 def analyze_content_cannibalization(df, merge_threshold=0.50, duplicate_threshold=0.85):
     if df.empty: return pd.DataFrame()
     
-    # 1. Filter out empty/thin pages to reduce noise
     valid_df = df[df['scope_content'].str.len() > 100].copy().reset_index(drop=True)
     if len(valid_df) < 2: return pd.DataFrame()
 
-    # 2. Create "Weighted" Content for comparison
-    # We repeat Title and H1 3 times so they are more important than body text
     valid_df['analysis_text'] = (
         (valid_df['title'].fillna('') + " ") * 3 + 
         (valid_df['h1_tags'].fillna('') + " ") * 3 + 
-        valid_df['scope_content'].fillna('').str[:5000] # Limit body to 5000 chars
+        valid_df['scope_content'].fillna('').str[:5000]
     )
 
-    # 3. Calculate Similarity (TF-IDF)
     tfidf = TfidfVectorizer(stop_words='english', min_df=1)
     try:
         tfidf_matrix = tfidf.fit_transform(valid_df['analysis_text'])
@@ -459,15 +518,11 @@ def analyze_content_cannibalization(df, merge_threshold=0.50, duplicate_threshol
     results = []
     num_rows = len(valid_df)
     
-    # 4. Compare every page against every other page
     for i in range(num_rows):
         for j in range(i + 1, num_rows):
             score = cosine_sim[i, j]
-            
-            # Skip if score is too low
             if score < merge_threshold: continue
             
-            # Determine Action based on thresholds
             if score >= duplicate_threshold:
                 action = "🚨 Remove/Redirect (Duplicate)"
                 reason = "Content is nearly identical (>{}%)".format(int(duplicate_threshold*100))
@@ -517,9 +572,7 @@ def generate_ai_meta(provider, api_key, model_name, endpoint_url, prompt_text, s
     return "Unknown Error"
 
 def analyze_content_freshness(url, title, content, provider, api_key, model_name, endpoint_url):
-    """Uses AI to determine if content is Relevant, Stale, or Outdated."""
     current_date = datetime.now().strftime("%B %Y")
-    
     safe_content = str(content) if pd.notna(content) else ""
     
     prompt = f"""
@@ -544,11 +597,9 @@ def analyze_content_freshness(url, title, content, provider, api_key, model_name
     try:
         response = generate_ai_meta(provider, api_key, model_name, endpoint_url, prompt, "You are a content auditor.")
         
-        # Catch API Errors
         if response.startswith("Error") or response.startswith("Exception"):
             return {"URL": url, "Decision": "Error", "Reason": response, "Action Suggestion": "Check API Key/Limits", "Raw AI Output": response}
 
-        # Default fallback (Notice we added the Raw Output column here)
         res_dict = {
             "URL": url, 
             "Decision": "UNKNOWN", 
@@ -557,28 +608,20 @@ def analyze_content_freshness(url, title, content, provider, api_key, model_name
             "Raw AI Output": response 
         }
         
-        # UPGRADED PARSING: Case-insensitive and handles extra spaces/Markdown
         lines = response.split('\n')
         for line in lines:
-            # Strip out markdown bolding and whitespace
             clean_line = line.replace('*', '').strip()
             upper_line = clean_line.upper()
             
             if upper_line.startswith("DECISION:") or upper_line.startswith("DECISION :"): 
-                # Grab whatever is on the right side of the colon
                 res_dict["Decision"] = clean_line.split(":", 1)[1].strip().upper()
-                
-                # If we successfully found a decision, remove the default error message from Reason
                 if "Format mismatched" in res_dict["Reason"]:
                     res_dict["Reason"] = ""
-                    
             elif upper_line.startswith("REASON:") or upper_line.startswith("REASON :"): 
                 res_dict["Reason"] = clean_line.split(":", 1)[1].strip()
-                
             elif upper_line.startswith("ACTION:") or upper_line.startswith("ACTION :"): 
                 res_dict["Action Suggestion"] = clean_line.split(":", 1)[1].strip()
                 
-        # Clean up the Decision column just in case the AI added extra words (e.g., "KEEP (EVERGREEN)")
         if "KEEP" in res_dict["Decision"]: res_dict["Decision"] = "KEEP"
         elif "UPDATE" in res_dict["Decision"]: res_dict["Decision"] = "UPDATE"
         elif "REMOVE" in res_dict["Decision"]: res_dict["Decision"] = "REMOVE"
@@ -590,7 +633,6 @@ def analyze_content_freshness(url, title, content, provider, api_key, model_name
 
 # --- GRAMMAR FALLBACK HELPER (UPDATED) ---
 def check_grammar_cloud(text):
-    """Fallback to direct Cloud API call if Java is missing."""
     url = "https://api.languagetool.org/v2/check"
     data = {
         'text': text,
@@ -602,7 +644,6 @@ def check_grammar_cloud(text):
             result = response.json()
             matches = []
             for m in result.get('matches', []):
-                # We capture offset/length to extract the specific wrong word later
                 replacements = [r['value'] for r in m.get('replacements', [])][:3]
                 matches.append({
                     'message': m.get('message', ''),
@@ -616,17 +657,13 @@ def check_grammar_cloud(text):
         return []
         
 def calculate_internal_pagerank(df):
-    """Calculates PageRank (Link Juice) for all pages in the DF."""
     try:
-        # 1. Create a directed graph
         G = nx.DiGraph()
         
-        # 2. Add nodes and edges
         for _, row in df.iterrows():
             source = row['url']
             G.add_node(source)
             
-            # Parse internal links safely
             links = row.get('internal_links', [])
             if isinstance(links, str):
                 try: links = json.loads(links)
@@ -642,19 +679,16 @@ def calculate_internal_pagerank(df):
                     if target:
                         G.add_edge(source, target)
         
-        # 3. Calculate PageRank (damping factor 0.85 is standard Google)
         try:
             pagerank_scores = nx.pagerank(G, alpha=0.85, max_iter=100)
         except:
             return {}
         
-        # 4. Normalize scores (0-100) for easier reading
         if not pagerank_scores: return {}
         
         max_score = max(pagerank_scores.values())
         min_score = min(pagerank_scores.values())
         
-        # Avoid division by zero
         if max_score == min_score: return {k: 50 for k in pagerank_scores}
 
         normalized_scores = {
@@ -679,18 +713,16 @@ def get_domain_age(domain):
     except: return "Hidden"
 
 def extract_publish_date(soup):
-    """Attempts to find the publish or modified date from meta tags."""
     meta_tags = soup.find_all('meta')
     for tag in meta_tags:
         prop = tag.get('property', '').lower()
         name = tag.get('name', '').lower()
         if 'published_time' in prop or 'modified_time' in prop or 'date' in name:
             content = tag.get('content', '')
-            if content: return content[:10] # Return YYYY-MM-DD
+            if content: return content[:10]
     return "Not Found"
 
 def count_fuzzy_match(text, keyword):
-    """Counts partial matches (e.g. 'tool for SEO' matches 'SEO tool') within the same sentence."""
     sentences = text.split('.')
     kw_words = [w.lower() for w in keyword.split()]
     count = 0
@@ -700,16 +732,12 @@ def count_fuzzy_match(text, keyword):
     return count
 
 def deep_crawl_for_inlinks(target_url, max_pages=300):
-    """
-    Spawns a mini-crawler to search the entire domain for links pointing TO the target_url.
-    Returns the count of pages that link to the target.
-    """
     parsed_target = urlparse(target_url)
     domain = f"{parsed_target.scheme}://{parsed_target.netloc}"
     target_path = parsed_target.path
     
     visited = set()
-    queue = [domain] # Start at homepage
+    queue = [domain]
     inlink_count = 0
     
     session = requests.Session()
@@ -726,14 +754,12 @@ def deep_crawl_for_inlinks(target_url, max_pages=300):
                 soup = BeautifulSoup(res.text, 'html.parser')
                 links = [a.get('href', '') for a in soup.find_all('a', href=True)]
                 
-                # Check if the target URL is on this page
                 for link in links:
                     if target_url in link or (target_path in link and len(target_path) > 1):
-                        if current != target_url: # Don't count self-referencing
+                        if current != target_url:
                             inlink_count += 1
-                        break # Count the page once, move on
+                        break
                         
-                # Queue internal links
                 for link in links:
                     full_url = urljoin(domain, link)
                     if full_url.startswith(domain) and full_url not in visited and full_url not in queue:
@@ -850,7 +876,6 @@ class UltraFrogCrawler:
         return 0
 
     def fetch_with_playwright(self, url):
-        """Uses Playwright to render the page content."""
         if not HAS_PLAYWRIGHT:
             return None, "Playwright library not found."
         
@@ -953,9 +978,7 @@ class UltraFrogCrawler:
             h3_tags = [self.smart_clean(h3.get_text()) for h3 in soup.find_all('h3')]
             h4_tags = [self.smart_clean(h4.get_text()) for h4 in soup.find_all('h4')]
             
-            # --- IMPROVED CUSTOM EXTRACTION (MULTI-RULE) ---
             custom_data_dict = {}
-            # self.custom_selector is now expected to be a list of dicts (the rules)
             if self.custom_selector and isinstance(self.custom_selector, list):
                 for rule in self.custom_selector:
                     try:
@@ -978,7 +1001,6 @@ class UltraFrogCrawler:
                     except Exception:
                         custom_data_dict[rule['name']] = "Error"
 
-            # Convert to JSON string for storage
             custom_extraction_json = json.dumps(custom_data_dict)
 
             internal_links = []
@@ -1050,31 +1072,24 @@ class UltraFrogCrawler:
                             data = json.loads(script.string)
                             schema_dump.append(data)
                             
-                            # --- ROOT-LEVEL EXTRACTION ONLY ---
-                            # Case 1: Data is a list of schemas
                             if isinstance(data, list):
                                 for item in data:
                                     if isinstance(item, dict) and '@type' in item:
                                         t = item['@type']
                                         schema_types.extend(t if isinstance(t, list) else [t])
                             
-                            # Case 2: Data is a dictionary using "@graph" (e.g., Yoast/RankMath)
                             elif isinstance(data, dict) and '@graph' in data and isinstance(data['@graph'], list):
                                 for item in data['@graph']:
                                     if isinstance(item, dict) and '@type' in item:
                                         t = item['@type']
                                         schema_types.extend(t if isinstance(t, list) else [t])
                                         
-                            # Case 3: Data is a simple standard dictionary
                             elif isinstance(data, dict) and '@type' in data:
                                 t = data['@type']
                                 schema_types.extend(t if isinstance(t, list) else [t])
                                 
                     except json.JSONDecodeError as e:
                         schema_validity = "Invalid JSON"
-                        schema_errors.append(str(e))
-                    except Exception as e:
-                        schema_validity = "Error"
                         schema_errors.append(str(e))
                     except Exception as e:
                         schema_validity = "Error"
@@ -1120,7 +1135,7 @@ class UltraFrogCrawler:
                 'og_title': soup.find('meta', attrs={'property': 'og:title'}).get('content', '') if soup.find('meta', attrs={'property': 'og:title'}) else '',
                 'og_description': soup.find('meta', attrs={'property': 'og:description'}).get('content', '') if soup.find('meta', attrs={'property': 'og:description'}) else '',
                 'twitter_title': soup.find('meta', attrs={'name': 'twitter:title'}).get('content', '') if soup.find('meta', attrs={'name': 'twitter:title'}) else '',
-                'custom_extraction': custom_extraction_json,  # Updated variable name
+                'custom_extraction': custom_extraction_json, 
                 'custom_search_count': custom_search_count,
                 'indexability': self.get_indexability_status(actual_status_code, robots_content),
                 'crawl_timestamp': datetime.now().isoformat(), 
@@ -1175,7 +1190,6 @@ def run_psi_test(url, api_key, strategy="mobile"):
 
 # --- HELPER FOR HEADER ANALYSIS ---
 def analyze_heading_structure(structure):
-    """Analyzes header list for SEO issues."""
     issues = []
     h1_count = 0
     prev_level = 0
@@ -1200,23 +1214,15 @@ def analyze_heading_structure(structure):
 
 # --- PRODUCTION HELPER: VISUAL DIMENSIONS (PLAYWRIGHT) ---
 def measure_rendered_images(url_list, progress_callback=None):
-    """
-    Robust scanner:
-    1. Scrolls down to trigger lazy loading.
-    2. Uses 'stealth' arguments to avoid bot detection.
-    3. Waits for network idle to ensure images render.
-    """
     if not HAS_PLAYWRIGHT:
         return {}, "Playwright not installed"
 
     results = {}
     total_images_found = 0
-    import traceback 
-
+    
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
-            # 1. Launch Browser in 'Stealth' mode (looks like real Chrome)
             try:
                 browser = p.chromium.launch(
                     headless=True,
@@ -1225,10 +1231,8 @@ def measure_rendered_images(url_list, progress_callback=None):
             except Exception as e:
                 return {}, f"BROWSER LAUNCH FAILED: {str(e)}\n\nTry running: playwright install"
             
-            # Common User Agent
             REAL_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             
-            # Context 1: Desktop
             context_desk = browser.new_context(
                 viewport={"width": 1920, "height": 1080},
                 user_agent=REAL_USER_AGENT,
@@ -1236,7 +1240,6 @@ def measure_rendered_images(url_list, progress_callback=None):
             )
             page_desk = context_desk.new_page()
 
-            # Context 2: Mobile
             context_mob = browser.new_context(
                 viewport={"width": 390, "height": 844},
                 user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
@@ -1250,11 +1253,9 @@ def measure_rendered_images(url_list, progress_callback=None):
                 if progress_callback:
                     progress_callback(i, total, url)
 
-                # --- MEASURE DESKTOP ---
                 try:
                     page_desk.goto(url, wait_until="domcontentloaded", timeout=25000)
                     
-                    # 2. Smooth Auto-Scroll (Crucial for Lazy Loading)
                     page_desk.evaluate("""
                         async () => {
                             const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -1264,9 +1265,8 @@ def measure_rendered_images(url_list, progress_callback=None):
                             }
                         }
                     """)
-                    time.sleep(0.5) # Settle time
+                    time.sleep(0.5) 
                     
-                    # 3. Extract Data (CurrentSrc handles responsive images)
                     imgs_desk = page_desk.evaluate("""
                         Array.from(document.querySelectorAll('img')).map(img => {
                             const rect = img.getBoundingClientRect();
@@ -1294,7 +1294,6 @@ def measure_rendered_images(url_list, progress_callback=None):
                 except Exception as e:
                     print(f"Desktop Error {url}: {e}")
 
-                # --- MEASURE MOBILE ---
                 try:
                     page_mob.goto(url, wait_until="domcontentloaded", timeout=20000)
                     page_mob.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -1394,7 +1393,6 @@ def crawl_website(start_url, max_urls, crawl_scope, progress_container, ignore_r
     return True
 
 def crawl_from_list(url_list, progress_container, ignore_robots=False, custom_selector=None, link_selector=None, search_config=None, use_js=False, storage="RAM"):
-    # 1. Clean and Deduplicate
     clean_urls = [u.strip() for u in url_list if u.strip()]
     unique_urls = list(set(clean_urls))
     
@@ -1402,7 +1400,6 @@ def crawl_from_list(url_list, progress_container, ignore_robots=False, custom_se
         diff = len(clean_urls) - len(unique_urls)
         st.toast(f"🧹 Removed {diff} duplicate URLs.", icon="ℹ️")
 
-    # Initialize Crawler
     crawler = UltraFrogCrawler(len(unique_urls), ignore_robots, custom_selector=custom_selector, link_selector=link_selector, search_config=search_config, use_js=use_js)
     
     if storage == "SQLite":
@@ -1414,26 +1411,20 @@ def crawl_from_list(url_list, progress_container, ignore_robots=False, custom_se
     progress_bar = progress_container.progress(0)
     status_text = progress_container.empty()
     
-    # 2. Filter Valid URLs
     valid_urls = [url for url in unique_urls if crawler.can_fetch(url)]
     
     if not valid_urls: 
         st.error("No valid URLs found (check robots.txt or your list).")
         return False
     
-    # Decrease workers slightly to prevent socket exhaustion on Windows
     worker_count = 1 if use_js else 10 
     if use_js: st.warning("🐢 JavaScript Rendering is ON. Speed reduced to 1 URL at a time.")
 
-    # 3. Process in Batches
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         for i in range(0, len(valid_urls), 25):
             if st.session_state.stop_crawling: break
             
-            # Create batch
             batch = valid_urls[i:i + 25]
-            
-            # Map futures to URLs so we know which URL failed if a timeout occurs
             future_to_url = {executor.submit(crawler.extract_page_data, url): url for url in batch}
             
             for future in as_completed(future_to_url):
@@ -1444,24 +1435,16 @@ def crawl_from_list(url_list, progress_container, ignore_robots=False, custom_se
                     break
                 
                 try:
-                    # --- CRITICAL FIX: HARD TIMEOUT ENFORCEMENT ---
-                    # Set a strict timeout (e.g., 15 seconds for requests, 65 for JS)
-                    # If the crawler takes longer, we kill it and move on.
                     wait_time = 65 if use_js else 15
                     page_data = future.result(timeout=wait_time)
-                    
                     page_data['depth'] = 0 
                     
-                    # Save Successful Data
                     if storage == "SQLite":
                         save_row_to_db(page_data, st.session_state.db_file) 
                     else:
                         st.session_state.crawl_data.append(page_data)
 
                 except TimeoutError:
-                    # This catches the "Stuck" URLs
-                    print(f"Skipping {url} due to TIMEOUT")
-                    # Create a dummy error record so the database knows it failed
                     error_data = {
                         'url': url, 'status_code': 0, 'error': 'Timeout - Skipped',
                         'title': 'Skipped', 'depth': 0, 'crawl_timestamp': datetime.now().isoformat()
@@ -1470,8 +1453,6 @@ def crawl_from_list(url_list, progress_container, ignore_robots=False, custom_se
                     else: st.session_state.crawl_data.append(error_data)
 
                 except Exception as e:
-                    # This catches crashes
-                    print(f"Skipping {url} due to ERROR: {e}")
                     error_data = {
                         'url': url, 'status_code': 0, 'error': str(e),
                         'title': 'Error', 'depth': 0, 'crawl_timestamp': datetime.now().isoformat()
@@ -1479,7 +1460,6 @@ def crawl_from_list(url_list, progress_container, ignore_robots=False, custom_se
                     if storage == "SQLite": save_row_to_db(error_data, st.session_state.db_file)
                     else: st.session_state.crawl_data.append(error_data)
 
-                # Update Progress regardless of success or failure
                 st.session_state.total_crawled_count += 1
                 progress = st.session_state.total_crawled_count / len(valid_urls)
                 progress_bar.progress(min(progress, 1.0))
@@ -1503,2712 +1483,3131 @@ def crawl_from_sitemap(sitemap_url, max_urls, progress_container, ignore_robots=
     st.info(f"Found {len(sitemap_urls)} URLs in sitemap")
     return crawl_from_list(sitemap_urls, progress_container, ignore_robots, custom_selector, link_selector, search_config, use_js, storage)
 
-# CSS
-st.markdown("""
-<style>
-.stTabs [data-baseweb="tab-list"]{ gap: 10px; padding: 6px 6px; border-radius: 10px; background: #eef2f6; }
-.stTabs [data-baseweb="tab"]{ height: 50px; white-space: pre-wrap; border-radius: 8px; background: #ffffff !important; color: #111827 !important; border: 1px solid #d1d5db !important; }
-.stTabs [data-baseweb="tab"] *{ color: inherit !important; }
-.stTabs [aria-selected="true"]{ background: #4CAF50 !important; color: #ffffff !important; border: 1px solid #3f9f46 !important; font-weight: 700; }
-</style>
-""", unsafe_allow_html=True)
 
-# Header
-st.markdown("""
-<div class="main-header">
-    <h1 style="color: white; margin: 0;">Battersea Crawler</h1>
-    <p style="color: white; margin: 0; opacity: 0.9;">Professional Edition • Full SEO Analysis</p>
-</div>
-""", unsafe_allow_html=True)
 
-# Sidebar
+
+# ==========================================
+# 1. WORKSPACE SWITCHER (Top of Sidebar)
+# ==========================================
 with st.sidebar:
-    st.header("🔧 Crawl Configuration")
-    
-    storage_option = st.radio(
-        "💾 Storage Mode", 
-        ["RAM (Fast, <10k URLs)", "SQLite (Unlimited)"], 
-        index=0,
-        help="Use RAM for speed on small sites. Use SQLite for 100k+ URLs to prevent crashing."
+    st.markdown("<h2 style='text-align: center; color: #4da8da; font-weight: 800; padding-bottom: 10px;'>🏢 Battersea Agency</h2>", unsafe_allow_html=True)
+    workspace = st.selectbox(
+        "Select Workspace:",
+        ["🔍 SEO & Technical Audit", "📱 Social Media Reporting", "✍️ Content Writers Hub", "🛠️ Other Tools"]
     )
-
-    crawl_mode = st.selectbox("🎯 Crawl Mode", [
-        "🕷️ Spider Crawl (Follow Links)",
-        "📝 List Mode (Upload URLs)",
-        "🗺️ Sitemap Crawl (XML Sitemap)"
-    ])
-    
-    sitemap_url_orphan = ""
-    
-    if crawl_mode == "🕷️ Spider Crawl (Follow Links)":
-        start_url = st.text_input("🌐 Website URL", placeholder="https://example.com")
-        sitemap_url_orphan = st.text_input("🗺️ Orphan Check Sitemap (Optional)", placeholder="https://example.com/sitemap.xml")
-        max_urls = st.number_input("📊 Max URLs", min_value=1, max_value=100000, value=1000)
-        crawl_scope = st.selectbox("🎯 Crawl Scope", ["subfolder", "subdomain", "exact"])
-        
-    elif crawl_mode == "📝 List Mode (Upload URLs)":
-        uploaded_file = st.file_uploader("Choose file", type=['txt', 'csv'])
-        url_list_text = st.text_area("Or paste URLs here (one per line)", height=100)
-        
-    elif crawl_mode == "🗺️ Sitemap Crawl (XML Sitemap)":
-        sitemap_url = st.text_input("🗺️ Sitemap URL", placeholder="https://example.com/sitemap.xml")
-        max_urls = st.number_input("📊 Max URLs", min_value=1, max_value=100000, value=5000)
-    
-    ignore_robots = st.checkbox("🤖 Ignore robots.txt")
-    use_js = st.checkbox("🐢 Enable JavaScript Rendering (Playwright)", help="Slow! Use for React/Angular sites only.")
-    
     st.markdown("---")
-    st.subheader("🔍 Custom Search")
-    st.info("Find text, regex, or elements across pages (like Screaming Frog).")
-    search_query = st.text_input("Search Text / Regex / Selector", help="Enter text to find")
-    search_mode = st.selectbox("Search Type", ["Text (Case Insensitive)", "Text (Case Sensitive)", "Regex", "CSS Selector Existence"])
-    search_scope = st.selectbox("Look In", ["Visible Text Content", "HTML Source Code"], disabled=(search_mode=="CSS Selector Existence"))
-    
-    st.markdown("---")
-    st.subheader("⛏️ Custom Extraction")
-    
-    # Initialize session state for rules if not present
-    if 'extraction_rules' not in st.session_state:
-        st.session_state.extraction_rules = []
 
-    with st.expander("⚙️ Configure Extraction Rules", expanded=False):
-        st.caption("Add multiple rules like Screaming Frog.")
+# ==========================================
+# 2. SEO WORKSPACE (Wrap everything here)
+# ==========================================
+if workspace == "🔍 SEO & Technical Audit":
+    with st.sidebar:
+        st.markdown("<h2 style='text-align: center; color: #4da8da; font-weight: 800; padding-bottom: 10px;'>⚙️ Settings</h2>", unsafe_allow_html=True)
         
-        # Inputs for new rule
-        c_name, c_css = st.columns([1, 2])
-        new_name = c_name.text_input("Label (e.g. Date)", key="new_rule_name")
-        new_selector = c_css.text_input("CSS Selector", key="new_rule_css", placeholder="meta[property='...']")
-        
-        c_type, c_attr = st.columns([1, 1])
-        new_type = c_type.selectbox("Extract:", ["Text Content", "Attribute Value", "Inner HTML", "HTML Element"], key="new_rule_type")
-        new_attr = ""
-        if new_type == "Attribute Value":
-            new_attr = c_attr.text_input("Attribute Name", placeholder="content, href, src", key="new_rule_attr")
-
-        if st.button("➕ Add Rule"):
-            if new_name and new_selector:
-                if new_type == "Attribute Value" and not new_attr:
-                    st.error("Attribute Name required.")
-                else:
-                    rule = {
-                        "name": new_name,
-                        "selector": new_selector,
-                        "type": new_type,
-                        "attribute": new_attr
-                    }
-                    st.session_state.extraction_rules.append(rule)
-                    st.success(f"Added: {new_name}")
-            else:
-                st.warning("Label and Selector required.")
-
-        # Display current rules
-        if st.session_state.extraction_rules:
-            st.write("---")
-            st.write("**Active Rules:**")
-            for i, rule in enumerate(st.session_state.extraction_rules):
-                desc = f"**{rule['name']}**: `{rule['selector']}`"
-                c_desc, c_del = st.columns([4, 1])
-                c_desc.markdown(desc)
-                if c_del.button("🗑️", key=f"del_rule_{i}"):
-                    st.session_state.extraction_rules.pop(i)
-                    st.rerun()
-
-    # Define custom_selector variable to prevent errors elsewhere, 
-    # though we will use session_state in the main loop.
-    custom_selector = None 
-
-    
-    st.subheader("🎯 Link Scope (Optional)")
-    link_selector = st.text_input("Link Area Selector", placeholder=".sidebar, #footer, .content", help="Only extract links found inside this element")
-    
-    st.markdown("---")
-    st.subheader("⚡ PageSpeed Insights")
-    psi_api_key = st.text_input("Google API Key (Optional)", type="password", help="Add Page Speed API")
-
-    st.markdown("---")
-    st.subheader("📈 Search Console")
-    
-    if not HAS_GSC:
-        st.error("Library missing. Run: `pip install google-api-python-client google-auth`")
-    else:
-        # Auto-Load Logic
-        LOCAL_KEY_PATH = "gsc_config.json"
-        existing_key = None
-        if os.path.exists(LOCAL_KEY_PATH):
-            st.success(f"🔑 Key loaded from {LOCAL_KEY_PATH}")
-            with open(LOCAL_KEY_PATH, "r") as f: existing_key = f.read()
-        
-        if existing_key:
-            with st.expander("🔄 Change JSON Key"):
-                gsc_auth_file = st.file_uploader("Upload New JSON Key", type=['json'])
-        else:
-            gsc_auth_file = st.file_uploader("Upload JSON Key", type=['json'], help="Upload the Service Account JSON key.")
-        
-        current_file_content = None
-        if gsc_auth_file:
-            current_file_content = gsc_auth_file.getvalue().decode("utf-8")
-            with open(LOCAL_KEY_PATH, "w") as f: f.write(current_file_content)
-            st.rerun()
-        elif existing_key:
-            current_file_content = existing_key
-
-        if current_file_content:
-            if 'last_gsc_key' not in st.session_state or st.session_state.last_gsc_key != current_file_content:
-                st.session_state.last_gsc_key = current_file_content
-                st.session_state.gsc_service = authenticate_gsc(current_file_content)
-                if st.session_state.gsc_service:
-                    st.session_state.gsc_sites_list = list_gsc_sites(st.session_state.gsc_service)
-            
-            if st.session_state.gsc_sites_list:
-                gsc_property = st.selectbox("Select GSC Property", st.session_state.gsc_sites_list)
-                
-                today = datetime.now().date()
-                default_start = today - timedelta(days=28)
-                
-                date_range = st.date_input(
-                    "📅 Select Date Range",
-                    value=(default_start, today),
-                    max_value=today,
-                    format="DD/MM/YYYY"
-                )
-            else:
-                st.warning("Authenticated, but no sites found. Did you add the service account email to your GSC property?")
-                gsc_property = None
-        else:
-            gsc_property = None
-
-    # --- NEW CHECKBOX ---
-    deep_check = st.checkbox("🐢 Check Everything (Slow)", 
-        help="Automatically checks Image Status, File Sizes, and Link Status Codes after crawling.")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        start_btn = st.button("🚀 Start Crawl", type="primary", disabled=st.session_state.crawling)
-    with col2:
-        stop_btn = st.button("⛔ Stop Crawl", disabled=not st.session_state.crawling)
-    
-    if stop_btn:
-        st.session_state.stop_crawling = True
-        st.session_state.crawling = False
-        st.rerun()
-    
-    if start_btn:
-        valid_input = False
-        url_list = []
-        
-        if "SQLite" in storage_option:
-            st.session_state.storage_mode = "SQLite"
-            st.session_state.crawl_data = [] 
-            if os.path.exists(st.session_state.db_file):
-                try: os.remove(st.session_state.db_file)
-                except: pass
-            st.session_state.db_file = f"battersea_data_{uuid.uuid4().hex}.db"
-        else:
-            st.session_state.storage_mode = "RAM"
-
-        search_config = None
-        if search_query:
-            search_config = {
-                "query": search_query,
-                "mode": search_mode,
-                "scope": search_scope
-            }
-
-        if crawl_mode == "🕷️ Spider Crawl (Follow Links)" and start_url:
-            valid_input = True
-            if sitemap_url_orphan:
-                crawler_temp = UltraFrogCrawler()
-                st.session_state.sitemap_urls_set = set(crawler_temp.extract_sitemap_urls(sitemap_url_orphan))
-            else:
-                st.session_state.sitemap_urls_set = set()
-        elif crawl_mode == "📝 List Mode (Upload URLs)":
-            if uploaded_file:
-                content = uploaded_file.read().decode('utf-8')
-                url_list = [line.strip() for line in content.split('\n') if line.strip()]
-                valid_input = len(url_list) > 0
-            elif url_list_text:
-                url_list = [line.strip() for line in url_list_text.split('\n') if line.strip()]
-                valid_input = len(url_list) > 0
-        elif crawl_mode == "🗺️ Sitemap Crawl (XML Sitemap)" and sitemap_url:
-            valid_input = True
-        
-        if valid_input:
-            st.session_state.crawling = True
-            st.session_state.stop_crawling = False
-            st.session_state.do_deep_check = deep_check  # <--- SAVE STATE HERE
-            st.session_state.start_time = time.time()
-            st.session_state.search_config = search_config
-            st.rerun()
-        else:
-            st.error("Please provide valid input")
-    
-    if st.button("🗑️ Clear All Data"):
-        st.session_state.crawl_data = []
-        if os.path.exists(st.session_state.db_file):
-            try: os.remove(st.session_state.db_file)
-            except: pass
-        st.session_state.db_file = f"battersea_data_{uuid.uuid4().hex}.db"
-        st.session_state.sitemap_urls_set = set()
-        st.session_state.psi_results = {}
-        st.rerun()
-        
-def run_post_crawl_deep_check(storage_mode, db_file):
-    status_container = st.empty()
-    progress_bar = st.progress(0)
-    status_container.info("🐢 Deep Check: Gathering URLs and Images...")
-    
-    # 1. Gather all unique Links and Images
-    all_links = [] # List of dicts for relevance check
-    all_images = set()
-    unique_pages = set() # For Visual Dims
-    
-    # Load data
-    if storage_mode == "RAM":
-        data_source = st.session_state.crawl_data
-    else:
-        conn = sqlite3.connect(db_file, check_same_thread=False)
-        df_temp = pd.read_sql("SELECT url, internal_links, external_links, images FROM pages", conn)
-        conn.close()
-        data_source = df_temp.to_dict('records')
-
-    for row in data_source:
-        unique_pages.add(row['url'])
-        
-        # Collect Links (We need Source & Dest for Relevance)
-        for col in ['internal_links', 'external_links']:
-            val = row.get(col, [])
-            if isinstance(val, str):
-                try: val = json.loads(val)
-                except: val = []
-            for link in val:
-                if isinstance(link, dict) and 'url' in link:
-                    all_links.append({
-                        'Source': row['url'], 
-                        'Dest': link['url'], 
-                        'Anchor': link.get('anchor_text', '')
-                    })
-        
-        # Collect Images
-        imgs = row.get('images', [])
-        if isinstance(imgs, str):
-            try: imgs = json.loads(imgs)
-            except: imgs = []
-        for img in imgs:
-            if isinstance(img, dict) and 'src' in img:
-                all_images.add(img['src'])
-
-    # 2. Filter what needs checking
-    links_to_check = list(set([x['Dest'] for x in all_links if x['Dest'] not in st.session_state.link_status_cache]))
-    images_to_check = list([u for u in all_images if u not in st.session_state.img_status_cache])
-    
-    # Total Operations Step 1 (Network Checks)
-    total_ops = len(links_to_check) + len(images_to_check)
-    completed = 0
-    crawler = UltraFrogCrawler()
-    
-    # --- A. LINK STATUS CHECK ---
-    if links_to_check:
-        status_container.text(f"🐢 Checking Status for {len(links_to_check)} Links...")
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            future_to_url = {executor.submit(crawler.session.head, u, timeout=5, allow_redirects=True): u for u in links_to_check}
-            for future in as_completed(future_to_url):
-                u = future_to_url[future]
-                try:
-                    r = future.result()
-                    code = r.status_code
-                    if code in [405, 403]: 
-                        r_get = crawler.session.get(u, timeout=5, stream=True)
-                        code = r_get.status_code
-                    st.session_state.link_status_cache[u] = code
-                except: st.session_state.link_status_cache[u] = "Error"
-                completed += 1
-                if total_ops > 0: progress_bar.progress(min(completed / total_ops, 1.0))
-
-    # --- B. ANCHOR RELEVANCE (CPU Task) ---
-    status_container.text(f"🧠 Calculating Anchor Relevance for {len(all_links)} links...")
-    # Import difflib here to ensure availability
-    import difflib
-    
-    # We don't cache this in session_state usually as it's computed on the fly, 
-    # but we can pre-compute if you want. 
-    # Since it's fast (CPU only), we skip caching to save memory, 
-    # or you can add a simple session_state variable if really needed.
-    # For now, we assume the Tab 1 logic runs it on demand or we can just skip this 
-    # as it's instantaneous compared to network requests.
-
-    # --- C. IMAGE STATUS & SIZE ---
-    if images_to_check:
-        status_container.text(f"🖼️ Checking Status & Size for {len(images_to_check)} Images...")
-        def check_img(u):
-            try:
-                r = crawler.session.head(u, timeout=5, allow_redirects=True)
-                s = r.status_code
-                if s in [405, 403]:
-                    r = crawler.session.get(u, timeout=5, stream=True)
-                    s = r.status_code
-                size = round(int(r.headers.get('content-length', 0)) / 1024, 2)
-                return u, s, size
-            except: return u, "Error", 0
-
-        with ThreadPoolExecutor(max_workers=20) as executor:
-            futures = {executor.submit(check_img, u): u for u in images_to_check}
-            for f in as_completed(futures):
-                u, code, size = f.result()
-                st.session_state.img_status_cache[u] = code
-                st.session_state.img_size_cache[u] = size
-                completed += 1
-                if total_ops > 0: progress_bar.progress(min(completed / total_ops, 1.0))
-
-    # --- D. REAL DIMENSIONS (PIL) ---
-    # Filter images not yet checked for dimensions
-    real_dims_to_check = [u for u in all_images if u not in st.session_state.img_real_dim_cache]
-    
-    if real_dims_to_check:
-        status_container.text(f"📏 Measuring Real Dimensions for {len(real_dims_to_check)} Images (Downloading)...")
-        # Reset progress for this phase
-        prog_pil = 0
-        total_pil = len(real_dims_to_check)
-        
-        def get_pil_dims(u):
-            try:
-                r = requests.get(u, timeout=5, headers={'User-Agent': 'Mozilla/5.0'}, verify=False)
-                if r.status_code == 200:
-                    img = Image.open(io.BytesIO(r.content))
-                    return u, f"{img.width}x{img.height}"
-                return u, f"Error {r.status_code}"
-            except: return u, "Error"
-
-        with ThreadPoolExecutor(max_workers=10) as exe:
-            futures = {exe.submit(get_pil_dims, u): u for u in real_dims_to_check}
-            for f in as_completed(futures):
-                u, dims = f.result()
-                st.session_state.img_real_dim_cache[u] = dims
-                prog_pil += 1
-                progress_bar.progress(min(prog_pil / total_pil, 1.0))
-
-    # --- E. VISUAL DIMENSIONS (Playwright) ---
-    # Only run if Playwright is available and we have pages
-    if HAS_PLAYWRIGHT and unique_pages:
-        # Check if we already have data for these pages to avoid re-running
-        pages_to_render = [p for p in unique_pages]
-        # (Optional: You could filter this list if you had a cache of 'scanned pages')
-        
-        status_container.text(f"👁️ Visual Scan: Rendering {len(pages_to_render)} Pages with Playwright (Slow)...")
-        
-        # We reuse your existing function logic here but update the progress bar
-        def update_prog_pw(i, total, url):
-            progress_bar.progress((i+1)/total)
-            status_container.text(f"👁️ Visual Scan: {i+1}/{total} - {url}")
-
-        scan_results, count = measure_rendered_images(pages_to_render, update_prog_pw)
-        if isinstance(scan_results, dict):
-            st.session_state.img_rendered_cache.update(scan_results)
-
-    status_container.success("✅ Deep Check Complete! All data updated.")
-    time.sleep(1)
-    status_container.empty()
-    
-    
-# --- SCHEMA ANALYSIS HELPERS ---
-def validate_schema_structure(schema):
-    """
-    Checks for common SEO schema errors based on Google's recommendations.
-    Returns a list of warnings/errors.
-    """
-    issues = []
-    if not isinstance(schema, dict): return []
-    
-    s_type = schema.get('@type', '')
-    if isinstance(s_type, list): s_type = s_type[0]
-    
-    # 1. General Checks
-    if '@context' not in schema: 
-        issues.append("⚠️ Missing '@context' (should be 'https://schema.org')")
-    
-    # 2. Type-Specific Checks
-    if s_type == 'Article' or s_type == 'BlogPosting':
-        if 'headline' not in schema: issues.append("❌ Missing 'headline'")
-        if 'author' not in schema: issues.append("⚠️ Missing 'author'")
-        if 'datePublished' not in schema: issues.append("⚠️ Missing 'datePublished'")
-        if 'image' not in schema: issues.append("⚠️ Missing 'image' (Required for Google Discover)")
-
-    elif s_type == 'Product':
-        if 'name' not in schema: issues.append("❌ Missing 'name'")
-        if 'offers' not in schema and 'aggregateRating' not in schema:
-            issues.append("❌ Product needs 'offers' (Price) or 'aggregateRating'")
-        if 'image' not in schema: issues.append("⚠️ Missing 'image' URL")
-    
-    elif s_type == 'LocalBusiness' or s_type == 'Organization':
-        if 'name' not in schema: issues.append("❌ Missing 'name'")
-        if 'address' not in schema: issues.append("⚠️ Missing 'address'")
-        if 'telephone' not in schema: issues.append("⚠️ Missing 'telephone'")
-
-    elif s_type == 'BreadcrumbList':
-        if 'itemListElement' not in schema: issues.append("❌ Missing 'itemListElement'")
-
-    elif s_type == 'FAQPage':
-        if 'mainEntity' not in schema: issues.append("❌ Missing 'mainEntity' (Questions)")
-
-    return issues
-
-def render_rich_snippet_preview(schema):
-    """
-    Visualizes what the schema might look like in Google Search.
-    """
-    s_type = schema.get('@type', '')
-    if isinstance(s_type, list): s_type = s_type[0]
-    
-    # CSS for Google Snippet Card
-    st.markdown("""
-    <style>
-    .google-card { font-family: arial, sans-serif; background: #fff; padding: 15px; border-radius: 8px; border: 1px solid #dfe1e5; margin-bottom: 15px; max-width: 600px; }
-    .g-cite { font-size: 12px; line-height: 1.3; color: #202124; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .g-title { font-size: 20px; line-height: 1.3; color: #1a0dab; margin: 5px 0; text-decoration: none; display: block; cursor: pointer; }
-    .g-title:hover { text-decoration: underline; }
-    .g-desc { font-size: 14px; line-height: 1.58; color: #4d5156; }
-    .g-meta { font-size: 13px; color: #70757a; margin-top: 5px; }
-    .g-rating { color: #e7711b; font-weight: bold; }
-    </style>
-    """, unsafe_allow_html=True)
-
-    title = schema.get('name', schema.get('headline', 'No Title Detected'))
-    desc = schema.get('description', 'No description found in schema.')
-    
-    # Handle Review Stars
-    rating_html = ""
-    if 'aggregateRating' in schema:
-        try:
-            rating = schema['aggregateRating'].get('ratingValue', 4.5)
-            count = schema['aggregateRating'].get('reviewCount', 0)
-            rating_html = f'<div class="g-meta"><span class="g-rating">★★★★☆ {rating}</span> - {count} reviews</div>'
-        except: pass
-        
-    # Handle Price
-    price_html = ""
-    if 'offers' in schema:
-        offer = schema['offers']
-        if isinstance(offer, list): offer = offer[0]
-        price = offer.get('price', '')
-        currency = offer.get('priceCurrency', 'USD')
-        if price:
-            price_html = f'<div class="g-meta" style="font-weight:bold;">{currency} {price}</div>'
-
-    html = f"""
-    <div class="google-card">
-        <div class="g-cite">https://example.com › ...</div>
-        <a class="g-title" href="#">{title}</a>
-        <div class="g-desc">{desc[:160]}...</div>
-        {rating_html}
-        {price_html}
-    </div>
-    """
-    st.markdown(html, unsafe_allow_html=True)
-    
-def get_suggested_schema(row):
-    """
-    Analyzes page content to suggest missing schema types.
-    """
-    suggestions = []
-    current = str(row.get('schema_types', '')).lower()
-    
-    # Check URL structure
-    url = str(row.get('url', '')).lower()
-    content = str(row.get('scope_content', '')).lower()
-    
-    # 1. Product
-    if 'product' not in current:
-        if '/product/' in url or '/item/' in url: suggestions.append("Product")
-        elif 'price' in content and 'add to cart' in content: suggestions.append("Product")
-        
-    # 2. Article / Blog
-    if 'article' not in current and 'blogposting' not in current:
-        if '/blog/' in url or '/news/' in url: suggestions.append("Article")
-        
-    # 3. FAQ
-    if 'faqpage' not in current:
-        if 'frequently asked questions' in content or content.count('?') > 3: suggestions.append("FAQPage")
-        
-    # 4. Local Business
-    if 'localbusiness' not in current and 'organization' not in current:
-        if 'contact' in url or 'about' in url: suggestions.append("LocalBusiness")
-        
-    # 5. Breadcrumbs
-    if 'breadcrumblist' not in current:
-        # Almost every page should have breadcrumbs
-        suggestions.append("BreadcrumbList")
-        
-    return ", ".join(suggestions) if suggestions else "✅ Looks Good"
-
-# Main content
-if st.session_state.crawling:
-    st.header("🐸 Battersea Crawler is Running...")
-    progress_container = st.container()
-    
-    try:
-        # Pass the list of rules from session state
-        custom_sel = st.session_state.extraction_rules if 'extraction_rules' in st.session_state and st.session_state.extraction_rules else None
-        link_sel = link_selector if link_selector else None
-        mode_val = st.session_state.storage_mode
-        s_conf = st.session_state.get('search_config', None)
-        
-        if crawl_mode == "🕷️ Spider Crawl (Follow Links)":
-            crawl_website(start_url, max_urls, crawl_scope, progress_container, ignore_robots, custom_sel, link_sel, s_conf, use_js, mode_val)
-        elif crawl_mode == "📝 List Mode (Upload URLs)":
-            if uploaded_file:
-                content = uploaded_file.read().decode('utf-8')
-                url_list = [line.strip() for line in content.split('\n') if line.strip()]
-            else:
-                url_list = [line.strip() for line in url_list_text.split('\n') if line.strip()]
-            crawl_from_list(url_list, progress_container, ignore_robots, custom_sel, link_sel, s_conf, use_js, mode_val)
-        else:
-            crawl_from_sitemap(sitemap_url, max_urls, progress_container, ignore_robots, custom_sel, link_sel, s_conf, use_js, mode_val)
-        
-        # --- NEW LOGIC START ---
-        if not st.session_state.stop_crawling and st.session_state.get('do_deep_check', False):
-            run_post_crawl_deep_check(st.session_state.storage_mode, st.session_state.db_file)
-        # --- NEW LOGIC END ---
-
-        st.session_state.crawling = False
-        st.session_state.stop_crawling = False
-        
-        if st.session_state.stop_crawling:
-            st.warning("⛔ Crawl stopped by user")
-        else:
-            crawl_time = time.time() - st.session_state.get('start_time', time.time())
-            st.success(f"✅ Crawl completed! Found {st.session_state.total_crawled_count} URLs in {crawl_time:.1f} seconds")
-        st.rerun()
-        
-    except Exception as e:
-        st.error(f"Error: {str(e)}")
-        st.session_state.crawling = False
-
-# --- RESULT LOADING LOGIC ---
-df = None
-has_data = False
-
-if st.session_state.storage_mode == "RAM" and st.session_state.crawl_data:
-    df = pd.DataFrame(st.session_state.crawl_data)
-    has_data = True
-elif st.session_state.storage_mode == "SQLite" and os.path.exists(st.session_state.db_file):
-    conn = sqlite3.connect(st.session_state.db_file, check_same_thread=False)
-    try:
-        df = pd.read_sql("SELECT * FROM pages LIMIT 20000", conn)
-        for col in ['internal_links', 'external_links', 'images', 'redirect_chain', 'schema_dump', 'header_structure']: 
-            if col in df.columns:
-                df[col] = df[col].apply(lambda x: json.loads(x) if isinstance(x, str) else [])
-        has_data = True
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM pages")
-        total_in_db = cursor.fetchone()[0]
-        if total_in_db > 20000:
-            st.warning(f"⚠️ Displaying first 20,000 URLs for performance. Download the DB below for the full dataset ({total_in_db} URLs).")
-        conn.close()
-    except Exception as e:
-        st.error(f"Error reading DB: {e}")
-
-if has_data and df is not None:
-    inlinks_counter = Counter()
-    for _, row in df.iterrows():
-        links = row.get('internal_links', [])
-        if isinstance(links, str): 
-            try: links = json.loads(links)
-            except: links = []
-        for link in links:
-            inlinks_counter[link['url']] += 1
-            
-    df['inlinks_count'] = df['url'].map(inlinks_counter).fillna(0).astype(int)
-    
-    if 'depth' not in df.columns: df['depth'] = 0
-    else: df['depth'] = df['depth'].fillna(0).astype(int)
-
-    if 'custom_search_count' not in df.columns: df['custom_search_count'] = 0
-    else: df['custom_search_count'] = df['custom_search_count'].fillna(0).astype(int)
-
-if has_data and df is not None:
-    st.header("📊 Battersea Analysis Dashboard")
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    with col1: st.metric("Total URLs", len(df) if st.session_state.storage_mode == "RAM" else total_in_db)
-    with col2: st.metric("✅ Indexable", len(df[df['indexability'] == 'Indexable']))
-    with col3: st.metric("❌ Non-Indexable", len(df[df['indexability'] == 'Non-Indexable']))
-    with col4: st.metric("🔄 Redirects", len(df[df['redirect_count'] > 0]))
-    with col5: st.metric("⚡ Avg Response", f"{df['response_time'].mean():.2f}s" if len(df)>0 else "0s")
-    with col6:
-        crawled_urls = set(df['url'])
-        orphans = list(st.session_state.sitemap_urls_set - crawled_urls) if st.session_state.sitemap_urls_set else []
-        st.metric("👻 Orphans", len(orphans))
-    
-    # Locate your existing st.tabs line and replace it with this:
-    tab1, tab2, tab3, tab_meta_titles, tab_headers, tab_tech, tab10, tab11, tab13, tab14, tab15, tab16, tab_search, tab_cannibal, tab_gsc, tab_audit, tab_competitor = st.tabs([
-        "🔗 Internal", "🌐 External", "🖼️ Images", "📝 Meta & Titles", "🏗️ Header Analysis", 
-        "🛠️ Technical Audit", "📱 Social", "🚀 Perf", 
-        "👻 Orphans", "⛏️ Custom", "⚡ PSI", "🏗️ Schema", "🔍 Search Results", "👯 Cannibalization", "📈 GSC Data", "📅 Content Audit", "⚔️ Competitor Analysis"
-    ])
-    
-    status_lookup = df[['url', 'status_code']].drop_duplicates()
-    status_lookup.columns = ['Destination URL', 'Status Code']
-
-    # --- ADD THIS IMPORT AT THE TOP IF MISSING ---
-    import difflib
-
-    with tab1:
-        st.subheader("🔗 Internal Links Analysis")
-        
-        # --- PART 1: EXISTING LINKS ANALYSIS ---
-        if link_selector:
-            st.info(f"Showing links extracted ONLY from: `{link_selector}`")
-        
-        if 'internal_links' in df.columns:
-            base_df = df[['url', 'internal_links']].copy()
-            base_df = base_df.rename(columns={'url': 'Source URL'})
-            exploded = base_df.explode('internal_links')
-            exploded = exploded.dropna(subset=['internal_links'])
-            
-            if not exploded.empty:
-                # Process Link Data
-                links_data = pd.json_normalize(exploded['internal_links'])
-                exploded = exploded.reset_index(drop=True)
-                links_data = links_data.reset_index(drop=True)
-                final_links = pd.concat([exploded['Source URL'], links_data], axis=1)
-                
-                # Fill Defaults
-                if 'rel_status' not in final_links.columns: final_links['rel_status'] = 'dofollow'
-                if 'target' not in final_links.columns: final_links['target'] = '_self'
-                
-                # Column Cleanup
-                final_links = final_links[['Source URL', 'url', 'anchor_text', 'rel_status', 'target', 'placement', 'css_path']]
-                final_links.columns = ['Source URL', 'Destination URL', 'Anchor Text', 'Link Type', 'Target', 'Placement', 'CSS Path']
-                
-                # Add Inlinks/Outlinks
-                counts_lookup = df[['url', 'inlinks_count', 'internal_links_count']].copy()
-                counts_lookup.columns = ['Source URL', 'Source Inlinks', 'Source Outlinks']
-                final_links = pd.merge(final_links, counts_lookup, on='Source URL', how='left')
-                
-                # Add Scope (Self-ref vs Different)
-                final_links['Link Scope'] = final_links.apply(
-                    lambda x: '🔄 Same Page' if x['Source URL'] == x['Destination URL'] else '➡️ Different Page', 
-                    axis=1
-                )
-
-                # Merge with Status Codes
-                final_links = pd.merge(final_links, status_lookup, on='Destination URL', how='left')
-                if 'link_status_cache' not in st.session_state: st.session_state.link_status_cache = {}
-                final_links['Status Code'] = final_links.apply(
-                    lambda x: st.session_state.link_status_cache.get(x['Destination URL'], x['Status Code']), axis=1
-                )
-                final_links['Status Code'] = final_links['Status Code'].fillna('Not Crawled').astype(str)
-
-                # --- TOOLBAR ---
-                st.write("### 🛠️ Link Tools")
-                c_btn1, c_btn2, c_btn3 = st.columns([1, 1, 1])
-                
-                # 1. Authority Button
-                if c_btn3.button("📊 Calculate Page Authority"):
-                    with st.spinner("Calculating PageRank..."):
-                        scores = calculate_internal_pagerank(df)
-                        st.session_state['pagerank_scores'] = scores
-                        st.success("Calculated!")
-                        st.rerun()
-
-                # Merge Authority if exists
-                if 'pagerank_scores' in st.session_state:
-                    scores = st.session_state['pagerank_scores']
-                    final_links['Target Authority'] = final_links['Destination URL'].map(scores).fillna(0).astype(int)
-
-                # 2. Status Check Button
-                if c_btn1.button("🔍 Check Status Codes"):
-                    uncrawled = final_links[final_links['Status Code'] == 'Not Crawled']['Destination URL'].unique().tolist()
-                    if uncrawled:
-                        p_bar = st.progress(0)
-                        temp_crawl = UltraFrogCrawler()
-                        res = {}
-                        def fetch(u):
-                            try:
-                                r = temp_crawl.session.head(u, timeout=5)
-                                if r.status_code == 405: r = temp_crawl.session.get(u, timeout=5, stream=True)
-                                return u, r.status_code
-                            except: return u, "Error"
-                        
-                        with ThreadPoolExecutor(max_workers=20) as exc:
-                            fut = [exc.submit(fetch, u) for u in uncrawled]
-                            for i, f in enumerate(as_completed(fut)):
-                                u, c = f.result()
-                                res[u] = c
-                                if i%5==0: p_bar.progress((i+1)/len(uncrawled))
-                        
-                        st.session_state.link_status_cache.update(res)
-                        st.rerun()
-
-                # --- MAIN TABLE DISPLAY ---
-                col_config = {
-                    "Source URL": st.column_config.LinkColumn("From Page"),
-                    "Destination URL": st.column_config.LinkColumn("To Page"),
-                    "Target Authority": st.column_config.ProgressColumn("Authority", format="%d", min_value=0, max_value=100),
-                }
-                
-                cols_order = ['Source URL', 'Source Inlinks', 'Source Outlinks', 'Destination URL', 'Target Authority', 'Link Scope', 'Anchor Text', 'Status Code', 'CSS Path']
-                existing_cols = [c for c in cols_order if c in final_links.columns]
-                
-                st.dataframe(final_links[existing_cols], use_container_width=True, column_config=col_config)
-                
-                # Stats Row
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Total Links", len(final_links))
-                c2.metric("Self-Referencing", len(final_links[final_links['Link Scope'].str.contains('Same')]))
-                c3.metric("Nofollow", len(final_links[final_links['Link Type'].str.contains('nofollow')]))
-                c4.metric("Broken", len(final_links[final_links['Status Code'].str.match(r'4|5', na=False)]))
-                
-                csv = final_links.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Download Link Report", csv, "internal_links.csv", "text/csv")
-
-            else:
-                st.warning("No internal links found.")
-
-        # --- PART 2: AI OPPORTUNITIES (MOVED HERE) ---
-        st.markdown("---")
-        st.header("💡 AI Internal Link Opportunities")
-        st.info("Find pages that *should* link to each other based on content similarity.")
-
-        if not HAS_SKLEARN:
-            st.error("❌ 'scikit-learn' library missing. Install it to use this feature.")
-        else:
-            c_ai1, c_ai2 = st.columns([1, 1])
-            min_score = c_ai1.slider("Minimum Relevance Score", 0, 100, 50)
-            max_links = c_ai2.number_input("Max Suggestions per Page", 1, 20, 5)
-            
-            if st.button("🚀 Generate Link Suggestions"):
-                with st.spinner("Analyzing content semantics..."):
-                    if 'scope_content' not in df.columns:
-                        st.error("Please re-crawl to capture content data.")
-                    else:
-                        suggestions_df = generate_interlink_suggestions(df, min_score=min_score, max_suggestions=max_links)
-                        if not suggestions_df.empty:
-                            # Merge Authority if available
-                            if 'pagerank_scores' in st.session_state:
-                                scores = st.session_state['pagerank_scores']
-                                suggestions_df['Target Authority'] = suggestions_df['Suggested Target URL'].map(scores).fillna(0).astype(int)
-                            
-                            st.session_state.interlink_opportunities = suggestions_df
-                            st.success(f"Found {len(suggestions_df)} opportunities!")
-                        else:
-                            st.warning("No suggestions found. Try lowering the score.")
-
-            # Display Suggestions
-            if 'interlink_opportunities' in st.session_state and not st.session_state.interlink_opportunities.empty:
-                res_df = st.session_state.interlink_opportunities
-                
-                ai_col_config = {
-                    "Relevance Score": st.column_config.ProgressColumn("Relevance", format="%.1f%%", min_value=0, max_value=100),
-                    "Suggested Target URL": st.column_config.LinkColumn("Target Page"),
-                    "Source URL": st.column_config.LinkColumn("Source Page"),
-                }
-                
-                if 'Target Authority' in res_df.columns:
-                    ai_col_config["Target Authority"] = st.column_config.ProgressColumn("Target Auth", format="%d", min_value=0, max_value=100)
-
-                st.dataframe(res_df, column_config=ai_col_config, use_container_width=True)
-                
-                csv_ai = res_df.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Download Suggestions", csv_ai, "link_opportunities.csv", "text/csv")
-
-    with tab2:
-        st.subheader("🌐 External Links Analysis")
-        external_data = []
-        for _, row in df.iterrows():
-            for ext_link in row.get('external_links', []):
-                external_data.append({
-                    'Source URL': row['url'],
-                    'Destination URL': ext_link['url'],
-                    'Anchor Text': ext_link['anchor_text'],
-                    'Link Type': ext_link.get('rel_status', 'dofollow'),
-                    'Target': ext_link.get('target', '_self'),
-                    'Placement': ext_link.get('placement', 'Unknown'),
-                    'CSS Path': ext_link.get('css_path', '')
-                })
-        if external_data:
-            ext_df = pd.DataFrame(external_data)
-            ext_df = pd.merge(ext_df, status_lookup, on='Destination URL', how='left')
-            
-            if 'link_status_cache' not in st.session_state:
-                st.session_state.link_status_cache = {}
-                
-            ext_df['Status Code'] = ext_df.apply(
-                lambda x: st.session_state.link_status_cache.get(x['Destination URL'], x['Status Code']), axis=1
+        # 1. Core Config
+        with st.container():
+            st.markdown("### 🎯 Core Setup")
+            storage_option = st.radio(
+                "💾 Storage Mode", 
+                ["RAM (Fast, <10k URLs)", "SQLite (Unlimited)"], 
+                index=0,
+                help="Use RAM for speed on small sites. Use SQLite for 100k+ URLs to prevent crashing."
             )
-            ext_df['Status Code'] = ext_df['Status Code'].fillna('Not Crawled').astype(str)
 
-            col_btn_ext, col_info_ext = st.columns([1, 3])
-            uncrawled_ext = ext_df[ext_df['Status Code'] == 'Not Crawled']['Destination URL'].unique().tolist()
+            crawl_mode = st.selectbox("🎯 Crawl Mode", [
+                "🕷️ Spider Crawl (Follow Links)",
+                "📝 List Mode (Upload URLs)",
+                "🗺️ Sitemap Crawl (XML Sitemap)"
+            ])
             
-            if col_btn_ext.button("🔍 Check External Statuses"):
-                if uncrawled_ext:
-                    progress_bar = col_info_ext.progress(0)
-                    status_text = col_info_ext.empty()
-                    temp_crawler = UltraFrogCrawler()
-                    results = {}
-                    
-                    def fetch_status(url):
-                        try:
-                            r = temp_crawler.session.head(url, timeout=5, allow_redirects=True)
-                            if r.status_code == 405 or r.status_code == 403: 
-                                r = temp_crawler.session.get(url, timeout=5, stream=True)
-                            return url, r.status_code
-                        except Exception as e:
-                            return url, "Error"
+            sitemap_url_orphan = ""
+            
+            if crawl_mode == "🕷️ Spider Crawl (Follow Links)":
+                start_url = st.text_input("🌐 Website URL", placeholder="https://example.com")
+                sitemap_url_orphan = st.text_input("🗺️ Orphan Check Sitemap (Optional)", placeholder="https://example.com/sitemap.xml")
+                max_urls = st.number_input("📊 Max URLs", min_value=1, max_value=100000, value=1000)
+                crawl_scope = st.selectbox("🎯 Crawl Scope", ["subfolder", "subdomain", "exact"])
+                
+            elif crawl_mode == "📝 List Mode (Upload URLs)":
+                uploaded_file = st.file_uploader("Choose file", type=['txt', 'csv'])
+                url_list_text = st.text_area("Or paste URLs here (one per line)", height=100)
+                
+            elif crawl_mode == "🗺️ Sitemap Crawl (XML Sitemap)":
+                sitemap_url = st.text_input("🗺️ Sitemap URL", placeholder="https://example.com/sitemap.xml")
+                max_urls = st.number_input("📊 Max URLs", min_value=1, max_value=100000, value=5000)
+                
+        # 2. Advanced Config
+        with st.expander("🛠️ Advanced Crawler Settings", expanded=False):
+            ignore_robots = st.checkbox("🤖 Ignore robots.txt")
+            use_js = st.checkbox("🐢 Enable JS Rendering (Playwright)", help="Slow! Use for React/Angular sites only.")
+            deep_check = st.checkbox("🐢 Check Everything (Deep Scan)", help="Automatically checks Image Status, File Sizes, and Link Status Codes after crawling.")
+            link_selector = st.text_input("Link Area Selector (Optional)", placeholder=".sidebar, #footer, .content", help="Only extract links found inside this CSS element")
+            
+        # 3. Custom Search Config
+        with st.expander("🔍 Custom Search Engine", expanded=False):
+            st.caption("Find text, regex, or elements across pages.")
+            search_query = st.text_input("Query (Text/Regex/Selector)", help="Enter text to find")
+            search_mode = st.selectbox("Search Type", ["Text (Case Insensitive)", "Text (Case Sensitive)", "Regex", "CSS Selector Existence"])
+            search_scope = st.selectbox("Look In", ["Visible Text Content", "HTML Source Code"], disabled=(search_mode=="CSS Selector Existence"))
+            
+        # 4. Custom Extraction Config
+        if 'extraction_rules' not in st.session_state:
+            st.session_state.extraction_rules = []
 
-                    with ThreadPoolExecutor(max_workers=20) as executor:
-                        futures = [executor.submit(fetch_status, u) for u in uncrawled_ext]
-                        for i, future in enumerate(as_completed(futures)):
-                            u, code = future.result()
-                            results[u] = code
-                            if i % 5 == 0:
-                                progress_bar.progress((i + 1) / len(uncrawled_ext))
-                                status_text.text(f"Checking: {u}")
-                    
-                    st.session_state.link_status_cache.update(results)
-                    status_text.success("✅ External statuses updated!")
-                    time.sleep(1)
-                    st.rerun()
+        with st.expander("⛏️ Data Extraction Rules", expanded=False):
+            st.caption("Add multi-rules like Screaming Frog.")
+            
+            c_name, c_css = st.columns([1, 2])
+            new_name = c_name.text_input("Label", key="new_rule_name", placeholder="Date")
+            new_selector = c_css.text_input("CSS Selector", key="new_rule_css", placeholder="meta[property='...']")
+            
+            c_type, c_attr = st.columns([1, 1])
+            new_type = c_type.selectbox("Extract:", ["Text Content", "Attribute Value", "Inner HTML", "HTML Element"], key="new_rule_type")
+            new_attr = ""
+            if new_type == "Attribute Value":
+                new_attr = c_attr.text_input("Attribute", placeholder="content, href", key="new_rule_attr")
+
+            if st.button("➕ Add Rule", use_container_width=True):
+                if new_name and new_selector:
+                    if new_type == "Attribute Value" and not new_attr:
+                        st.error("Attribute Name required.")
+                    else:
+                        rule = {"name": new_name, "selector": new_selector, "type": new_type, "attribute": new_attr}
+                        st.session_state.extraction_rules.append(rule)
+                        st.success(f"Added: {new_name}")
                 else:
-                    col_info_ext.info("All external links have status codes.")
+                    st.warning("Label and Selector required.")
 
-            st.dataframe(ext_df, use_container_width=True)
-            csv = ext_df.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download External", csv, "external_links.csv", "text/csv")
-        else:
-            st.info("No external links found.")
+            if st.session_state.extraction_rules:
+                st.write("---")
+                st.write("**Active Rules:**")
+                for i, rule in enumerate(st.session_state.extraction_rules):
+                    c_desc, c_del = st.columns([4, 1])
+                    c_desc.markdown(f"**{rule['name']}**: `{rule['selector']}`")
+                    if c_del.button("🗑️", key=f"del_rule_{i}"):
+                        st.session_state.extraction_rules.pop(i)
+                        st.rerun()
+                        
+        custom_selector = None # Ensures no crash later 
+            
+        # 5. Integrations
+        with st.expander("🔌 APIs & Integrations", expanded=False):
+            st.markdown("#### PageSpeed Insights")
+            psi_api_key = st.text_input("Google PSI API Key", type="password")
+            
+            st.markdown("#### Google Search Console")
+            if not HAS_GSC:
+                st.error("Missing libraries: google-api-python-client google-auth")
+                gsc_property = None
+            else:
+                LOCAL_KEY_PATH = "gsc_config.json"
+                existing_key = None
+                if os.path.exists(LOCAL_KEY_PATH):
+                    st.success(f"🔑 Key loaded automatically.")
+                    with open(LOCAL_KEY_PATH, "r") as f: existing_key = f.read()
+                
+                gsc_auth_file = st.file_uploader("Upload New JSON Key", type=['json'])
+                
+                current_file_content = None
+                if gsc_auth_file:
+                    current_file_content = gsc_auth_file.getvalue().decode("utf-8")
+                    with open(LOCAL_KEY_PATH, "w") as f: f.write(current_file_content)
+                    st.rerun()
+                elif existing_key:
+                    current_file_content = existing_key
 
-    with tab3:
-        st.subheader("🖼️ Images Analysis")
+                if current_file_content:
+                    if 'last_gsc_key' not in st.session_state or st.session_state.last_gsc_key != current_file_content:
+                        st.session_state.last_gsc_key = current_file_content
+                        st.session_state.gsc_service = authenticate_gsc(current_file_content)
+                        if st.session_state.gsc_service:
+                            st.session_state.gsc_sites_list = list_gsc_sites(st.session_state.gsc_service)
+                    
+                    if st.session_state.gsc_sites_list:
+                        gsc_property = st.selectbox("Select Property", st.session_state.gsc_sites_list)
+                        today = datetime.now().date()
+                        default_start = today - timedelta(days=28)
+                        date_range = st.date_input("📅 Date Range", value=(default_start, today), max_value=today, format="DD/MM/YYYY")
+                    else:
+                        st.warning("Authenticated, but no sites found.")
+                        gsc_property = None
+                else:
+                    gsc_property = None
+
+        # ACTION BUTTONS
+        st.divider()
+        col1, col2 = st.columns(2)
+        with col1:
+            start_btn = st.button("🚀 Start Crawl", type="primary", use_container_width=True, disabled=st.session_state.crawling)
+        with col2:
+            stop_btn = st.button("⛔ Stop Crawl", use_container_width=True, disabled=not st.session_state.crawling)
         
-        # --- 1. PREPARE DATA ---
-        images_data = []
-        for _, row in df.iterrows():
+        st.button("🗑️ Clear All Data", use_container_width=True, on_click=lambda: [
+            st.session_state.pop('crawl_data', None),
+            st.session_state.pop('psi_results', None),
+            os.remove(st.session_state.db_file) if os.path.exists(st.session_state.db_file) else None,
+            st.session_state.update({'db_file': f"battersea_data_{uuid.uuid4().hex}.db", 'sitemap_urls_set': set()})
+        ])
+
+        if stop_btn:
+            st.session_state.stop_crawling = True
+            st.session_state.crawling = False
+            st.rerun()
+        
+        if start_btn:
+            valid_input = False
+            url_list = []
+            
+            if "SQLite" in storage_option:
+                st.session_state.storage_mode = "SQLite"
+                st.session_state.crawl_data = [] 
+                if os.path.exists(st.session_state.db_file):
+                    try: os.remove(st.session_state.db_file)
+                    except: pass
+                st.session_state.db_file = f"battersea_data_{uuid.uuid4().hex}.db"
+            else:
+                st.session_state.storage_mode = "RAM"
+
+            search_config = None
+            if search_query:
+                search_config = {
+                    "query": search_query,
+                    "mode": search_mode,
+                    "scope": search_scope
+                }
+
+            if crawl_mode == "🕷️ Spider Crawl (Follow Links)" and start_url:
+                valid_input = True
+                if sitemap_url_orphan:
+                    crawler_temp = UltraFrogCrawler()
+                    st.session_state.sitemap_urls_set = set(crawler_temp.extract_sitemap_urls(sitemap_url_orphan))
+                else:
+                    st.session_state.sitemap_urls_set = set()
+            elif crawl_mode == "📝 List Mode (Upload URLs)":
+                if uploaded_file:
+                    content = uploaded_file.read().decode('utf-8')
+                    url_list = [line.strip() for line in content.split('\n') if line.strip()]
+                    valid_input = len(url_list) > 0
+                elif url_list_text:
+                    url_list = [line.strip() for line in url_list_text.split('\n') if line.strip()]
+                    valid_input = len(url_list) > 0
+            elif crawl_mode == "🗺️ Sitemap Crawl (XML Sitemap)" and sitemap_url:
+                valid_input = True
+            
+            if valid_input:
+                st.session_state.crawling = True
+                st.session_state.stop_crawling = False
+                st.session_state.do_deep_check = deep_check 
+                st.session_state.start_time = time.time()
+                st.session_state.search_config = search_config
+                st.rerun()
+            else:
+                st.error("Please provide valid input")
+            
+    def run_post_crawl_deep_check(storage_mode, db_file):
+        status_container = st.empty()
+        progress_bar = st.progress(0)
+        status_container.info("🐢 Deep Check: Gathering URLs and Images...")
+        
+        all_links = [] 
+        all_images = set()
+        unique_pages = set()
+        
+        if storage_mode == "RAM":
+            data_source = st.session_state.crawl_data
+        else:
+            conn = sqlite3.connect(db_file, check_same_thread=False)
+            df_temp = pd.read_sql("SELECT url, internal_links, external_links, images FROM pages", conn)
+            conn.close()
+            data_source = df_temp.to_dict('records')
+
+        for row in data_source:
+            unique_pages.add(row['url'])
+            for col in ['internal_links', 'external_links']:
+                val = row.get(col, [])
+                if isinstance(val, str):
+                    try: val = json.loads(val)
+                    except: val = []
+                for link in val:
+                    if isinstance(link, dict) and 'url' in link:
+                        all_links.append({
+                            'Source': row['url'], 
+                            'Dest': link['url'], 
+                            'Anchor': link.get('anchor_text', '')
+                        })
+            
             imgs = row.get('images', [])
             if isinstance(imgs, str):
                 try: imgs = json.loads(imgs)
                 except: imgs = []
-                
             for img in imgs:
-                html_w = str(img.get('width', '')).strip()
-                html_h = str(img.get('height', '')).strip()
-                
-                if html_w and html_h: html_dim_str = f"{html_w}x{html_h}"
-                elif html_w: html_dim_str = f"{html_w}x?"
-                elif html_h: html_dim_str = f"?x{html_h}"
-                else: html_dim_str = "Missing in HTML"
+                if isinstance(img, dict) and 'src' in img:
+                    all_images.add(img['src'])
 
-                images_data.append({
-                    'source_url': row['url'],
-                    'image_url': img['src'],
-                    'alt_text': img['alt'],
-                    'html_dimensions': html_dim_str,
-                    'real_dimensions': 'Not Checked',
-                    'rendered_desktop': 'Not Scanned',
-                    'rendered_mobile': 'Not Scanned',
-                    'size_kb': img.get('size_kb', 0),
-                    'status_code': 'Pending' # Initialize Status Column
-                })
+        links_to_check = list(set([x['Dest'] for x in all_links if x['Dest'] not in st.session_state.link_status_cache]))
+        images_to_check = list([u for u in all_images if u not in st.session_state.img_status_cache])
         
-        if images_data:
-            img_df = pd.DataFrame(images_data)
+        total_ops = len(links_to_check) + len(images_to_check)
+        completed = 0
+        crawler = UltraFrogCrawler()
+        
+        if links_to_check:
+            status_container.text(f"🐢 Checking Status for {len(links_to_check)} Links...")
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                future_to_url = {executor.submit(crawler.session.head, u, timeout=5, allow_redirects=True): u for u in links_to_check}
+                for future in as_completed(future_to_url):
+                    u = future_to_url[future]
+                    try:
+                        r = future.result()
+                        code = r.status_code
+                        if code in [405, 403]: 
+                            r_get = crawler.session.get(u, timeout=5, stream=True)
+                            code = r_get.status_code
+                        st.session_state.link_status_cache[u] = code
+                    except: st.session_state.link_status_cache[u] = "Error"
+                    completed += 1
+                    if total_ops > 0: progress_bar.progress(min(completed / total_ops, 1.0))
+
+        import difflib
+
+        if images_to_check:
+            status_container.text(f"🖼️ Checking Status & Size for {len(images_to_check)} Images...")
+            def check_img(u):
+                try:
+                    r = crawler.session.head(u, timeout=5, allow_redirects=True)
+                    s = r.status_code
+                    if s in [405, 403]:
+                        r = crawler.session.get(u, timeout=5, stream=True)
+                        s = r.status_code
+                    size = round(int(r.headers.get('content-length', 0)) / 1024, 2)
+                    return u, s, size
+                except: return u, "Error", 0
+
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                futures = {executor.submit(check_img, u): u for u in images_to_check}
+                for f in as_completed(futures):
+                    u, code, size = f.result()
+                    st.session_state.img_status_cache[u] = code
+                    st.session_state.img_size_cache[u] = size
+                    completed += 1
+                    if total_ops > 0: progress_bar.progress(min(completed / total_ops, 1.0))
+
+        real_dims_to_check = [u for u in all_images if u not in st.session_state.img_real_dim_cache]
+        
+        if real_dims_to_check:
+            status_container.text(f"📏 Measuring Real Dimensions for {len(real_dims_to_check)} Images (Downloading)...")
+            prog_pil = 0
+            total_pil = len(real_dims_to_check)
             
-            # --- 2. CACHE MANAGEMENT ---
-            # Size Cache
-            if 'img_size_cache' not in st.session_state: st.session_state.img_size_cache = {}
-            if st.session_state.img_size_cache:
-                img_df['size_kb'] = img_df['image_url'].map(st.session_state.img_size_cache).fillna(img_df['size_kb'])
+            def get_pil_dims(u):
+                try:
+                    r = requests.get(u, timeout=5, headers={'User-Agent': 'Mozilla/5.0'}, verify=False)
+                    if r.status_code == 200:
+                        img = Image.open(io.BytesIO(r.content))
+                        return u, f"{img.width}x{img.height}"
+                    return u, f"Error {r.status_code}"
+                except: return u, "Error"
 
-            # Real Dim Cache
-            if 'img_real_dim_cache' not in st.session_state: st.session_state.img_real_dim_cache = {}
-            if st.session_state.img_real_dim_cache:
-                img_df['real_dimensions'] = img_df.apply(lambda x: st.session_state.img_real_dim_cache.get(x['image_url'], x['real_dimensions']), axis=1)
+            with ThreadPoolExecutor(max_workers=10) as exe:
+                futures = {exe.submit(get_pil_dims, u): u for u in real_dims_to_check}
+                for f in as_completed(futures):
+                    u, dims = f.result()
+                    st.session_state.img_real_dim_cache[u] = dims
+                    prog_pil += 1
+                    progress_bar.progress(min(prog_pil / total_pil, 1.0))
 
-            # --- NEW: Status Code Cache ---
-            if 'img_status_cache' not in st.session_state: st.session_state.img_status_cache = {}
-            if st.session_state.img_status_cache:
-                # Map cached status codes, keep 'Pending' if not found
-                img_df['status_code'] = img_df['image_url'].map(st.session_state.img_status_cache).fillna('Pending')
+        if HAS_PLAYWRIGHT and unique_pages:
+            pages_to_render = [p for p in unique_pages]
+            status_container.text(f"👁️ Visual Scan: Rendering {len(pages_to_render)} Pages with Playwright (Slow)...")
+            def update_prog_pw(i, total, url):
+                progress_bar.progress((i+1)/total)
+                status_container.text(f"👁️ Visual Scan: {i+1}/{total} - {url}")
 
-            # Rendered Cache Logic
-            if 'img_rendered_cache' not in st.session_state: st.session_state.img_rendered_cache = {}
+            scan_results, count = measure_rendered_images(pages_to_render, update_prog_pw)
+            if isinstance(scan_results, dict):
+                st.session_state.img_rendered_cache.update(scan_results)
+
+        status_container.success("✅ Deep Check Complete! All data updated.")
+        time.sleep(1)
+        status_container.empty()
+        
+        
+    # --- SCHEMA ANALYSIS HELPERS ---
+    def validate_schema_structure(schema):
+        issues = []
+        if not isinstance(schema, dict): return []
+        
+        s_type = schema.get('@type', '')
+        if isinstance(s_type, list): s_type = s_type[0]
+        
+        if '@context' not in schema: 
+            issues.append("⚠️ Missing '@context' (should be 'https://schema.org')")
+        
+        if s_type == 'Article' or s_type == 'BlogPosting':
+            if 'headline' not in schema: issues.append("❌ Missing 'headline'")
+            if 'author' not in schema: issues.append("⚠️ Missing 'author'")
+            if 'datePublished' not in schema: issues.append("⚠️ Missing 'datePublished'")
+            if 'image' not in schema: issues.append("⚠️ Missing 'image' (Required for Google Discover)")
+
+        elif s_type == 'Product':
+            if 'name' not in schema: issues.append("❌ Missing 'name'")
+            if 'offers' not in schema and 'aggregateRating' not in schema:
+                issues.append("❌ Product needs 'offers' (Price) or 'aggregateRating'")
+            if 'image' not in schema: issues.append("⚠️ Missing 'image' URL")
+        
+        elif s_type == 'LocalBusiness' or s_type == 'Organization':
+            if 'name' not in schema: issues.append("❌ Missing 'name'")
+            if 'address' not in schema: issues.append("⚠️ Missing 'address'")
+            if 'telephone' not in schema: issues.append("⚠️ Missing 'telephone'")
+
+        elif s_type == 'BreadcrumbList':
+            if 'itemListElement' not in schema: issues.append("❌ Missing 'itemListElement'")
+
+        elif s_type == 'FAQPage':
+            if 'mainEntity' not in schema: issues.append("❌ Missing 'mainEntity' (Questions)")
+
+        return issues
+
+    def render_rich_snippet_preview(schema):
+        s_type = schema.get('@type', '')
+        if isinstance(s_type, list): s_type = s_type[0]
+        
+        st.markdown("""
+        <style>
+        .google-card { font-family: arial, sans-serif; background: rgba(128, 128, 128, 0.05); padding: 15px; border-radius: 8px; border: 1px solid rgba(128, 128, 128, 0.2); margin-bottom: 15px; max-width: 600px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+        .g-cite { font-size: 12px; line-height: 1.3; opacity: 0.8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .g-title { font-size: 20px; line-height: 1.3; color: #4da8da; margin: 5px 0; text-decoration: none; display: block; cursor: pointer; }
+        .g-title:hover { text-decoration: underline; }
+        .g-desc { font-size: 14px; line-height: 1.58; opacity: 0.9; }
+        .g-meta { font-size: 13px; opacity: 0.7; margin-top: 5px; }
+        .g-rating { color: #e7711b; font-weight: bold; }
+        </style>
+        """, unsafe_allow_html=True)
+
+        title = schema.get('name', schema.get('headline', 'No Title Detected'))
+        desc = schema.get('description', 'No description found in schema.')
+        
+        rating_html = ""
+        if 'aggregateRating' in schema:
+            try:
+                rating = schema['aggregateRating'].get('ratingValue', 4.5)
+                count = schema['aggregateRating'].get('reviewCount', 0)
+                rating_html = f'<div class="g-meta"><span class="g-rating">★★★★☆ {rating}</span> - {count} reviews</div>'
+            except: pass
             
-            # Smart Matching Logic for Rendered Data
-            def normalize_url(u):
-                if not u: return ""
-                u = u.split('?')[0].split('#')[0]
-                return u.replace('https://', '').replace('http://', '').replace('www.', '')
+        price_html = ""
+        if 'offers' in schema:
+            offer = schema['offers']
+            if isinstance(offer, list): offer = offer[0]
+            price = offer.get('price', '')
+            currency = offer.get('priceCurrency', 'USD')
+            if price:
+                price_html = f'<div class="g-meta" style="font-weight:bold;">{currency} {price}</div>'
 
-            def get_rendered_data(img_url, key):
-                cache = st.session_state.img_rendered_cache
-                if not cache: return 'Not Scanned'
-                if img_url in cache and key in cache[img_url]: return cache[img_url][key]
-                clean_target = normalize_url(img_url)
-                for cache_url, data in cache.items():
-                    if clean_target in cache_url or normalize_url(cache_url) == clean_target:
-                        return data.get(key, 'Not Scanned')
-                return 'Not Scanned'
-
-            if st.session_state.img_rendered_cache:
-                img_df['rendered_desktop'] = img_df['image_url'].apply(lambda x: get_rendered_data(x, 'Desktop'))
-                img_df['rendered_mobile'] = img_df['image_url'].apply(lambda x: get_rendered_data(x, 'Mobile'))
-                def update_natural(row):
-                    if row['real_dimensions'] == 'Not Checked':
-                        return get_rendered_data(row['image_url'], 'Natural').replace('Not Scanned', 'Not Checked')
-                    return row['real_dimensions']
-                img_df['real_dimensions'] = img_df.apply(update_natural, axis=1)
-
-            # --- 3. ACTION BUTTONS ---
-            st.write("#### 🛠️ Image Tools")
-            # Adjusted columns to fit 4 buttons
-            col_kb, col_px, col_vis, col_stat = st.columns([1, 1, 1.5, 1])
+        html = f"""
+        <div class="google-card">
+            <div class="g-cite">https://example.com › ...</div>
+            <a class="g-title" href="#">{title}</a>
+            <div class="g-desc">{desc[:160]}...</div>
+            {rating_html}
+            {price_html}
+        </div>
+        """
+        st.markdown(html, unsafe_allow_html=True)
+        
+    def get_suggested_schema(row):
+        suggestions = []
+        current = str(row.get('schema_types', '')).lower()
+        
+        url = str(row.get('url', '')).lower()
+        content = str(row.get('scope_content', '')).lower()
+        
+        if 'product' not in current:
+            if '/product/' in url or '/item/' in url: suggestions.append("Product")
+            elif 'price' in content and 'add to cart' in content: suggestions.append("Product")
             
-            with col_kb:
-                if st.button("1️⃣ Check File Sizes"):
-                    targets = img_df[img_df['size_kb'] == 0]['image_url'].unique().tolist()
-                    if targets:
-                        p_bar = st.progress(0)
-                        crawler_temp = UltraFrogCrawler()
-                        res = {}
-                        with ThreadPoolExecutor(max_workers=20) as exe:
-                            futures = {exe.submit(crawler_temp.get_file_size, u): u for u in targets}
-                            for i, f in enumerate(as_completed(futures)):
-                                u = futures[f]
-                                try: res[u] = f.result()
-                                except: res[u] = 0
-                                if i%5==0: p_bar.progress((i+1)/len(targets))
-                        st.session_state.img_size_cache.update(res)
-                        st.rerun()
+        if 'article' not in current and 'blogposting' not in current:
+            if '/blog/' in url or '/news/' in url: suggestions.append("Article")
+            
+        if 'faqpage' not in current:
+            if 'frequently asked questions' in content or content.count('?') > 3: suggestions.append("FAQPage")
+            
+        if 'localbusiness' not in current and 'organization' not in current:
+            if 'contact' in url or 'about' in url: suggestions.append("LocalBusiness")
+            
+        if 'breadcrumblist' not in current:
+            suggestions.append("BreadcrumbList")
+            
+        return ", ".join(suggestions) if suggestions else "✅ Looks Good"
 
-            with col_px:
-                if st.button("2️⃣ Check Real Dims"):
-                    targets = img_df[
-                        (img_df['real_dimensions'] == 'Not Checked') | 
-                        (img_df['real_dimensions'] == 'Error')
-                    ]['image_url'].unique().tolist()
-                    if targets:
-                        p_bar = st.progress(0)
-                        results_cache = {}
-                        def get_pil_dims(u):
-                            try:
-                                r = requests.get(u, timeout=8, headers={'User-Agent': 'Mozilla/5.0'}, verify=False)
-                                if r.status_code == 200:
-                                    image_file = io.BytesIO(r.content)
-                                    img = Image.open(image_file)
-                                    return u, f"{img.width}x{img.height}"
-                                return u, f"Error {r.status_code}"
-                            except: return u, "Error"
-                        
-                        with ThreadPoolExecutor(max_workers=10) as exe:
-                            futures = {exe.submit(get_pil_dims, u): u for u in targets}
-                            for i, future in enumerate(as_completed(futures)):
-                                url = futures[future]
-                                try: results_cache[url] = future.result()[1]
-                                except: results_cache[url] = "Error"
-                                if i % 2 == 0: p_bar.progress((i + 1) / len(targets))
-                        st.session_state.img_real_dim_cache.update(results_cache)
-                        st.rerun()
 
-            with col_vis:
-                if st.button("3️⃣ Check Visual Dims"):
-                    unique_pages = img_df['source_url'].unique().tolist()
-                    if not HAS_PLAYWRIGHT: st.error("❌ Playwright not installed.")
-                    elif not unique_pages: st.warning("No pages to scan.")
-                    else:
-                        p_bar = st.progress(0)
-                        s_text = st.empty()
-                        def update_prog(i, total, url):
-                            p_bar.progress((i+1)/total)
-                            s_text.text(f"Rendering {i+1}/{total}: {url}")
-                        
-                        scan_results, img_count = measure_rendered_images(unique_pages, update_prog)
-                        if isinstance(scan_results, dict) and scan_results:
-                            st.session_state.img_rendered_cache.update(scan_results)
-                            st.success(f"✅ Scanned {len(unique_pages)} pages!")
-                            time.sleep(1)
+    # --- MAIN CONTENT / DASHBOARD ---
+    if st.session_state.crawling:
+        st.header("🐸 Battersea Crawler is Running...")
+        progress_container = st.container()
+        
+        try:
+            custom_sel = st.session_state.extraction_rules if 'extraction_rules' in st.session_state and st.session_state.extraction_rules else None
+            link_sel = link_selector if link_selector else None
+            mode_val = st.session_state.storage_mode
+            s_conf = st.session_state.get('search_config', None)
+            
+            if crawl_mode == "🕷️ Spider Crawl (Follow Links)":
+                crawl_website(start_url, max_urls, crawl_scope, progress_container, ignore_robots, custom_sel, link_sel, s_conf, use_js, mode_val)
+            elif crawl_mode == "📝 List Mode (Upload URLs)":
+                if uploaded_file:
+                    content = uploaded_file.read().decode('utf-8')
+                    url_list = [line.strip() for line in content.split('\n') if line.strip()]
+                else:
+                    url_list = [line.strip() for line in url_list_text.split('\n') if line.strip()]
+                crawl_from_list(url_list, progress_container, ignore_robots, custom_sel, link_sel, s_conf, use_js, mode_val)
+            else:
+                crawl_from_sitemap(sitemap_url, max_urls, progress_container, ignore_robots, custom_sel, link_sel, s_conf, use_js, mode_val)
+            
+            if not st.session_state.stop_crawling and st.session_state.get('do_deep_check', False):
+                run_post_crawl_deep_check(st.session_state.storage_mode, st.session_state.db_file)
+
+            st.session_state.crawling = False
+            st.session_state.stop_crawling = False
+            
+            if st.session_state.stop_crawling:
+                st.warning("⛔ Crawl stopped by user")
+            else:
+                crawl_time = time.time() - st.session_state.get('start_time', time.time())
+                st.success(f"✅ Crawl completed! Found {st.session_state.total_crawled_count} URLs in {crawl_time:.1f} seconds")
+            st.rerun()
+            
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
+            st.session_state.crawling = False
+
+    # --- RESULT LOADING LOGIC ---
+    df = None
+    has_data = False
+
+    if st.session_state.storage_mode == "RAM" and st.session_state.crawl_data:
+        df = pd.DataFrame(st.session_state.crawl_data)
+        has_data = True
+    elif st.session_state.storage_mode == "SQLite" and os.path.exists(st.session_state.db_file):
+        conn = sqlite3.connect(st.session_state.db_file, check_same_thread=False)
+        try:
+            df = pd.read_sql("SELECT * FROM pages LIMIT 20000", conn)
+            for col in ['internal_links', 'external_links', 'images', 'redirect_chain', 'schema_dump', 'header_structure']: 
+                if col in df.columns:
+                    df[col] = df[col].apply(lambda x: json.loads(x) if isinstance(x, str) else [])
+            has_data = True
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM pages")
+            total_in_db = cursor.fetchone()[0]
+            if total_in_db > 20000:
+                st.warning(f"⚠️ Displaying first 20,000 URLs for performance. Download the DB below for the full dataset ({total_in_db} URLs).")
+            conn.close()
+        except Exception as e:
+            st.error(f"Error reading DB: {e}")
+
+    if has_data and df is not None:
+        inlinks_counter = Counter()
+        for _, row in df.iterrows():
+            links = row.get('internal_links', [])
+            if isinstance(links, str): 
+                try: links = json.loads(links)
+                except: links = []
+            for link in links:
+                inlinks_counter[link['url']] += 1
+                
+        df['inlinks_count'] = df['url'].map(inlinks_counter).fillna(0).astype(int)
+        
+        if 'depth' not in df.columns: df['depth'] = 0
+        else: df['depth'] = df['depth'].fillna(0).astype(int)
+
+        if 'custom_search_count' not in df.columns: df['custom_search_count'] = 0
+        else: df['custom_search_count'] = df['custom_search_count'].fillna(0).astype(int)
+
+    if has_data and df is not None:
+        st.markdown("## 📊 SEO Analysis Dashboard")
+        
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
+        with col1: st.metric("🌐 Total URLs", len(df) if st.session_state.storage_mode == "RAM" else total_in_db)
+        with col2: st.metric("✅ Indexable", len(df[df['indexability'] == 'Indexable']))
+        with col3: st.metric("❌ Non-Indexable", len(df[df['indexability'] == 'Non-Indexable']))
+        with col4: st.metric("🔄 Redirects", len(df[df['redirect_count'] > 0]))
+        with col5: st.metric("⚡ Avg Response", f"{df['response_time'].mean():.2f}s" if len(df)>0 else "0s")
+        with col6:
+            crawled_urls = set(df['url'])
+            orphans = list(st.session_state.sitemap_urls_set - crawled_urls) if st.session_state.sitemap_urls_set else []
+            st.metric("👻 Orphans", len(orphans))
+            
+        st.markdown("<br>", unsafe_allow_html=True)
+        
+        tab1, tab2, tab3, tab_meta_titles, tab_headers, tab_tech, tab10, tab11, tab13, tab14, tab15, tab16, tab_search, tab_cannibal, tab_gsc, tab_audit, tab_competitor = st.tabs([
+            "🔗 Internal Links", "🌐 External", "🖼️ Images", "📝 Meta & Titles", "🏗️ Headers", 
+            "🛠️ Technical", "📱 Social", "🚀 Performance", 
+            "👻 Orphans", "⛏️ Custom Data", "⚡ PSI", "🏗️ Schema", "🔍 Search", "👯 Cannibalization", "📈 GSC", "📅 Audit", "⚔️ Competitor"
+        ])
+        
+        status_lookup = df[['url', 'status_code']].drop_duplicates()
+        status_lookup.columns = ['Destination URL', 'Status Code']
+
+        import difflib
+
+        with tab1:
+            st.subheader("🔗 Internal Links Analysis")
+            
+            # --- PART 1: EXISTING LINKS ANALYSIS ---
+            if 'internal_links' in df.columns:
+                base_df = df[['url', 'internal_links']].copy()
+                base_df = base_df.rename(columns={'url': 'Source URL'})
+                exploded = base_df.explode('internal_links')
+                exploded = exploded.dropna(subset=['internal_links'])
+                
+                if not exploded.empty:
+                    links_data = pd.json_normalize(exploded['internal_links'])
+                    exploded = exploded.reset_index(drop=True)
+                    links_data = links_data.reset_index(drop=True)
+                    final_links = pd.concat([exploded['Source URL'], links_data], axis=1)
+                    
+                    if 'rel_status' not in final_links.columns: final_links['rel_status'] = 'dofollow'
+                    if 'target' not in final_links.columns: final_links['target'] = '_self'
+                    
+                    final_links = final_links[['Source URL', 'url', 'anchor_text', 'rel_status', 'target', 'placement', 'css_path']]
+                    final_links.columns = ['Source URL', 'Destination URL', 'Anchor Text', 'Link Type', 'Target', 'Placement', 'CSS Path']
+                    
+                    counts_lookup = df[['url', 'inlinks_count', 'internal_links_count']].copy()
+                    counts_lookup.columns = ['Source URL', 'Source Inlinks', 'Source Outlinks']
+                    final_links = pd.merge(final_links, counts_lookup, on='Source URL', how='left')
+                    
+                    final_links['Link Scope'] = final_links.apply(
+                        lambda x: '🔄 Same Page' if x['Source URL'] == x['Destination URL'] else '➡️ Different Page', 
+                        axis=1
+                    )
+
+                    final_links = pd.merge(final_links, status_lookup, on='Destination URL', how='left')
+                    if 'link_status_cache' not in st.session_state: st.session_state.link_status_cache = {}
+                    final_links['Status Code'] = final_links.apply(
+                        lambda x: st.session_state.link_status_cache.get(x['Destination URL'], x['Status Code']), axis=1
+                    )
+                    final_links['Status Code'] = final_links['Status Code'].fillna('Not Crawled').astype(str)
+
+                    # --- TOOLBAR ---
+                    st.write("#### 🛠️ Link Tools")
+                    c_btn1, c_btn2, c_btn3 = st.columns([1, 1, 1])
+                    
+                    if c_btn3.button("📊 Calculate Page Authority"):
+                        with st.spinner("Calculating PageRank..."):
+                            scores = calculate_internal_pagerank(df)
+                            st.session_state['pagerank_scores'] = scores
+                            st.success("Calculated!")
                             st.rerun()
 
-            # --- NEW BUTTON: CHECK STATUS ---
-            with col_stat:
-                if st.button("4️⃣ Check Status"):
-                    # Find images that are 'Pending' or 'Error'
-                    targets = img_df[img_df['status_code'].isin(['Pending', 'Error'])]['image_url'].unique().tolist()
-                    
-                    if targets:
-                        p_bar = st.progress(0)
-                        stat_text = st.empty()
-                        res_status = {}
-                        
-                        def fetch_img_status(u):
-                            try:
-                                # Try HEAD first for speed
-                                r = requests.head(u, timeout=5, headers={'User-Agent': 'Mozilla/5.0'}, verify=False, allow_redirects=True)
-                                # If Method Not Allowed (405) or Forbidden (403), try GET
-                                if r.status_code in [405, 403]:
-                                    r = requests.get(u, timeout=5, headers={'User-Agent': 'Mozilla/5.0'}, stream=True, verify=False)
-                                return u, r.status_code
-                            except Exception as e:
-                                return u, "Error"
+                    if 'pagerank_scores' in st.session_state:
+                        scores = st.session_state['pagerank_scores']
+                        final_links['Target Authority'] = final_links['Destination URL'].map(scores).fillna(0).astype(int)
 
-                        with ThreadPoolExecutor(max_workers=20) as exe:
-                            futures = {exe.submit(fetch_img_status, u): u for u in targets}
-                            for i, f in enumerate(as_completed(futures)):
-                                u = futures[f]
-                                try: res_status[u] = f.result()[1]
-                                except: res_status[u] = "Error"
+                    if c_btn1.button("🔍 Check Status Codes"):
+                        uncrawled = final_links[final_links['Status Code'] == 'Not Crawled']['Destination URL'].unique().tolist()
+                        if uncrawled:
+                            p_bar = st.progress(0)
+                            temp_crawl = UltraFrogCrawler()
+                            res = {}
+                            def fetch(u):
+                                try:
+                                    r = temp_crawl.session.head(u, timeout=5)
+                                    if r.status_code == 405: r = temp_crawl.session.get(u, timeout=5, stream=True)
+                                    return u, r.status_code
+                                except: return u, "Error"
+                            
+                            with ThreadPoolExecutor(max_workers=20) as exc:
+                                fut = [exc.submit(fetch, u) for u in uncrawled]
+                                for i, f in enumerate(as_completed(fut)):
+                                    u, c = f.result()
+                                    res[u] = c
+                                    if i%5==0: p_bar.progress((i+1)/len(uncrawled))
+                            
+                            st.session_state.link_status_cache.update(res)
+                            st.rerun()
+
+                    col_config = {
+                        "Source URL": st.column_config.LinkColumn("From Page"),
+                        "Destination URL": st.column_config.LinkColumn("To Page"),
+                        "Target Authority": st.column_config.ProgressColumn("Authority", format="%d", min_value=0, max_value=100),
+                    }
+                    
+                    cols_order = ['Source URL', 'Source Inlinks', 'Source Outlinks', 'Destination URL', 'Target Authority', 'Link Scope', 'Anchor Text', 'Status Code', 'CSS Path']
+                    existing_cols = [c for c in cols_order if c in final_links.columns]
+                    
+                    st.dataframe(final_links[existing_cols], use_container_width=True, column_config=col_config)
+                    
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Total Links", len(final_links))
+                    c2.metric("Self-Referencing", len(final_links[final_links['Link Scope'].str.contains('Same')]))
+                    c3.metric("Nofollow", len(final_links[final_links['Link Type'].str.contains('nofollow')]))
+                    c4.metric("Broken", len(final_links[final_links['Status Code'].str.match(r'4|5', na=False)]))
+                    
+                    csv = final_links.to_csv(index=False).encode('utf-8')
+                    st.download_button("📥 Download Link Report", csv, "internal_links.csv", "text/csv")
+
+                else:
+                    st.warning("No internal links found.")
+
+            # --- PART 2: AI OPPORTUNITIES ---
+            st.divider()
+            st.write("### 💡 AI Internal Link Opportunities")
+            st.info("Find pages that *should* link to each other based on content similarity.")
+
+            if not HAS_SKLEARN:
+                st.error("❌ 'scikit-learn' library missing. Install it to use this feature.")
+            else:
+                c_ai1, c_ai2 = st.columns([1, 1])
+                min_score = c_ai1.slider("Minimum Relevance Score", 0, 100, 50)
+                max_links = c_ai2.number_input("Max Suggestions per Page", 1, 20, 5)
+                
+                if st.button("🚀 Generate Link Suggestions", type="primary"):
+                    with st.spinner("Analyzing content semantics..."):
+                        if 'scope_content' not in df.columns:
+                            st.error("Please re-crawl to capture content data.")
+                        else:
+                            suggestions_df = generate_interlink_suggestions(df, min_score=min_score, max_suggestions=max_links)
+                            if not suggestions_df.empty:
+                                if 'pagerank_scores' in st.session_state:
+                                    scores = st.session_state['pagerank_scores']
+                                    suggestions_df['Target Authority'] = suggestions_df['Suggested Target URL'].map(scores).fillna(0).astype(int)
                                 
-                                if i % 5 == 0: 
-                                    p_bar.progress((i+1)/len(targets))
-                                    stat_text.text(f"Checking {i+1}/{len(targets)}")
+                                st.session_state.interlink_opportunities = suggestions_df
+                                st.success(f"Found {len(suggestions_df)} opportunities!")
+                            else:
+                                st.warning("No suggestions found. Try lowering the score.")
+
+                if 'interlink_opportunities' in st.session_state and not st.session_state.interlink_opportunities.empty:
+                    res_df = st.session_state.interlink_opportunities
+                    
+                    ai_col_config = {
+                        "Relevance Score": st.column_config.ProgressColumn("Relevance", format="%.1f%%", min_value=0, max_value=100),
+                        "Suggested Target URL": st.column_config.LinkColumn("Target Page"),
+                        "Source URL": st.column_config.LinkColumn("Source Page"),
+                    }
+                    
+                    if 'Target Authority' in res_df.columns:
+                        ai_col_config["Target Authority"] = st.column_config.ProgressColumn("Target Auth", format="%d", min_value=0, max_value=100)
+
+                    st.dataframe(res_df, column_config=ai_col_config, use_container_width=True)
+                    
+                    csv_ai = res_df.to_csv(index=False).encode('utf-8')
+                    st.download_button("📥 Download Suggestions", csv_ai, "link_opportunities.csv", "text/csv")
+
+        with tab2:
+            st.subheader("🌐 External Links Analysis")
+            external_data = []
+            for _, row in df.iterrows():
+                for ext_link in row.get('external_links', []):
+                    external_data.append({
+                        'Source URL': row['url'],
+                        'Destination URL': ext_link['url'],
+                        'Anchor Text': ext_link['anchor_text'],
+                        'Link Type': ext_link.get('rel_status', 'dofollow'),
+                        'Target': ext_link.get('target', '_self'),
+                        'Placement': ext_link.get('placement', 'Unknown'),
+                        'CSS Path': ext_link.get('css_path', '')
+                    })
+            if external_data:
+                ext_df = pd.DataFrame(external_data)
+                ext_df = pd.merge(ext_df, status_lookup, on='Destination URL', how='left')
+                
+                if 'link_status_cache' not in st.session_state:
+                    st.session_state.link_status_cache = {}
+                    
+                ext_df['Status Code'] = ext_df.apply(
+                    lambda x: st.session_state.link_status_cache.get(x['Destination URL'], x['Status Code']), axis=1
+                )
+                ext_df['Status Code'] = ext_df['Status Code'].fillna('Not Crawled').astype(str)
+
+                col_btn_ext, col_info_ext = st.columns([1, 3])
+                uncrawled_ext = ext_df[ext_df['Status Code'] == 'Not Crawled']['Destination URL'].unique().tolist()
+                
+                if col_btn_ext.button("🔍 Check External Statuses"):
+                    if uncrawled_ext:
+                        progress_bar = col_info_ext.progress(0)
+                        status_text = col_info_ext.empty()
+                        temp_crawler = UltraFrogCrawler()
+                        results = {}
                         
-                        st.session_state.img_status_cache.update(res_status)
-                        st.success("✅ Status Checks Complete")
-                        time.sleep(0.5)
+                        def fetch_status(url):
+                            try:
+                                r = temp_crawler.session.head(url, timeout=5, allow_redirects=True)
+                                if r.status_code == 405 or r.status_code == 403: 
+                                    r = temp_crawler.session.get(url, timeout=5, stream=True)
+                                return url, r.status_code
+                            except Exception as e:
+                                return url, "Error"
+
+                        with ThreadPoolExecutor(max_workers=20) as executor:
+                            futures = [executor.submit(fetch_status, u) for u in uncrawled_ext]
+                            for i, future in enumerate(as_completed(futures)):
+                                u, code = future.result()
+                                results[u] = code
+                                if i % 5 == 0:
+                                    progress_bar.progress((i + 1) / len(uncrawled_ext))
+                                    status_text.text(f"Checking: {u}")
+                        
+                        st.session_state.link_status_cache.update(results)
+                        status_text.success("✅ External statuses updated!")
+                        time.sleep(1)
                         st.rerun()
                     else:
-                        st.info("All images checked.")
+                        col_info_ext.info("All external links have status codes.")
 
-            # --- 4. DISPLAY DATAFRAME ---
-            st.markdown("---")
-            
-            def analyze_image_status(row):
-                real = row['real_dimensions']
-                html = row['html_dimensions']
-                vis_d = row['rendered_desktop']
-                code = str(row['status_code'])
-                
-                status = []
-                
-                # Check HTTP Status
-                if code != 'Pending' and code != '200':
-                    status.append(f"❌ HTTP {code}")
-
-                if html == 'Missing in HTML': status.append("⚠️ Missing HTML Attrs")
-                
-                if 'x' in str(real) and 'x' in str(vis_d) and real != 'Not Checked' and vis_d != 'Not Scanned':
-                    try:
-                        rw, rh = map(int, real.split('x'))
-                        vw, vh = map(int, vis_d.split('x'))
-                        if vw > 0 and rw < vw: status.append("⚠️ Pixelated (Real < Visible)")
-                        if vw > 0 and rw > (vw * 3): status.append("⚠️ Too Big (Real > 3x Visible)")
-                    except: pass
-                    
-                if not status: return "✅ Good"
-                return " | ".join(status)
-
-            if not img_df.empty:
-                img_df['Analysis'] = img_df.apply(analyze_image_status, axis=1)
-
-            # Reorder columns to put Status Code near the URL
-            cols_order = ['image_url', 'status_code', 'size_kb', 'source_url', 'alt_text', 'html_dimensions', 'real_dimensions', 'Analysis']
-            # Ensure other columns exist just in case
-            final_cols = cols_order + [c for c in img_df.columns if c not in cols_order]
-
-            st.dataframe(
-                img_df[final_cols], 
-                use_container_width=True, 
-                column_config={
-                    "image_url": st.column_config.LinkColumn("Image Link"),
-                    "source_url": st.column_config.LinkColumn("Found On Page"),
-                    "size_kb": st.column_config.NumberColumn("KB", format="%.2f"),
-                    "status_code": st.column_config.TextColumn("HTTP Status", width="small"),
-                }
-            )
-            
-            csv_img = img_df.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download Image Report", csv_img, "images_report.csv", "text/csv")
-
-            # --- 5. OPTIMIZATION TOOL ---
-            st.markdown("---")
-            st.subheader("📉 Optimize & Resize Images")
-            
-            if not HAS_PIL:
-                st.error("❌ 'Pillow' library missing. Run `pip install Pillow`")
+                st.dataframe(ext_df, use_container_width=True)
+                csv = ext_df.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Download External", csv, "external_links.csv", "text/csv")
             else:
-                st.info("Resize images to match their rendered size (Step 1) and then compress them (Step 2).")
-                
-                c1, c2, c3, c4 = st.columns(4)
-                min_kb = c1.number_input("Filter Min KB:", 0, 10000, 100)
-                reduc_pct = c2.slider("Quality %", 10, 90, 50, help="Lower = Smaller File")
-                target_fmt_ui = c3.selectbox("Format", ["WebP", "JPEG", "PNG", "Original"])
-                
-                resize_mode = c4.selectbox("Resize To:", ["Original Size Only (No Resize)", "Desktop Rendered Size", "Mobile Rendered Size", "Both Desktop & Mobile"])
+                st.info("No external links found.")
 
-                if st.button("✨ Optimize Images"):
-                    out_dir = "optimized_images"
-                    if not os.path.exists(out_dir): os.makedirs(out_dir)
-
-                    # Filter candidates
-                    candidates = img_df[img_df['size_kb'] >= min_kb].drop_duplicates(subset=['image_url'])
+        with tab3:
+            st.subheader("🖼️ Images Analysis")
+            
+            images_data = []
+            for _, row in df.iterrows():
+                imgs = row.get('images', [])
+                if isinstance(imgs, str):
+                    try: imgs = json.loads(imgs)
+                    except: imgs = []
                     
-                    if candidates.empty:
-                        st.warning("No images found matching your size filter.")
-                    else:
-                        progress = st.progress(0)
-                        status = st.empty()
-                        report_data = []
-                        
-                        target_urls = candidates['image_url'].tolist()
-                        
-                        # Process Single Image Variant
-                        def process_variant(img_obj, url, variant_label, target_w, target_h, original_kb, original_dims_str, old_fmt):
-                            try:
-                                # 1. Resize if dimensions provided
-                                if target_w and target_h:
-                                    img_obj = img_obj.resize((target_w, target_h), Image.Resampling.LANCZOS)
-                                
-                                new_dims_str = f"{img_obj.width}x{img_obj.height}"
-                                
-                                # 2. Format & Compress
-                                if target_fmt_ui == "Original": fmt = old_fmt
-                                elif target_fmt_ui == "WebP": fmt = "WEBP"
-                                elif target_fmt_ui == "JPEG": fmt = "JPEG"
-                                elif target_fmt_ui == "PNG": fmt = "PNG"
-                                else: fmt = old_fmt
-
-                                if img_obj.mode in ("RGBA", "P") and fmt in ["JPEG"]:
-                                    img_obj = img_obj.convert("RGB")
-                                
-                                buf = io.BytesIO()
-                                save_args = {'format': fmt, 'optimize': True}
-                                if fmt in ['JPEG', 'WEBP']: save_args['quality'] = reduc_pct
-                                
-                                img_obj.save(buf, **save_args)
-                                new_data = buf.getvalue()
-                                new_size_kb = len(new_data) / 1024
-
-                                # 3. Save
-                                base_name = url.split('/')[-1].split('?')[0].split('.')[0]
-                                if not base_name: base_name = f"img_{uuid.uuid4().hex[:6]}"
-                                base_name = "".join([c for c in base_name if c.isalnum() or c in '_-'])
-                                
-                                suffix = f"_{variant_label.lower()}" if variant_label != "Original" else ""
-                                filename = f"{base_name}{suffix}.{fmt.lower()}"
-                                local_path = os.path.abspath(os.path.join(out_dir, filename))
-                                
-                                with open(local_path, "wb") as f: f.write(new_data)
-                                
-                                return {
-                                    "Original URL": url,
-                                    "Variant": variant_label,
-                                    "Old Size KB": round(original_kb, 2),
-                                    "New Size KB": round(new_size_kb, 2),
-                                    "Before Dimension": original_dims_str,
-                                    "New Dimension": new_dims_str,
-                                    "Old Format": old_fmt,
-                                    "New Format": fmt,
-                                    "Path": local_path
-                                }
-                            except Exception as e:
-                                return None
-
-                        # Main Processing Loop
-                        def process_image_row(row_tuple):
-                            url = row_tuple.image_url
-                            
-                            # Get Rendered Data from DF row
-                            desk_render = row_tuple.rendered_desktop
-                            mob_render = row_tuple.rendered_mobile
-                            
-                            try:
-                                r = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'}, verify=False)
-                                if r.status_code != 200: return []
-                                
-                                # Capture Original Data
-                                original_kb = len(r.content) / 1024
-                                img_org = Image.open(io.BytesIO(r.content))
-                                original_dims_str = f"{img_org.width}x{img_org.height}"
-                                old_fmt = img_org.format if img_org.format else 'JPEG'
-
-                                results = []
-                                tasks = []
-                                
-                                # Define Tasks based on Selection
-                                if resize_mode == "Original Size Only (No Resize)":
-                                    tasks.append((None, None, "Original"))
-                                    
-                                elif resize_mode == "Desktop Rendered Size":
-                                    if desk_render and 'x' in desk_render and desk_render != 'Not Scanned':
-                                        dw, dh = map(int, desk_render.split('x'))
-                                        tasks.append((dw, dh, "Desktop"))
-                                    else:
-                                        tasks.append((None, None, "Skipped (Missing Data)"))
-                                        
-                                elif resize_mode == "Mobile Rendered Size":
-                                    if mob_render and 'x' in mob_render and mob_render != 'Not Scanned':
-                                        mw, mh = map(int, mob_render.split('x'))
-                                        tasks.append((mw, mh, "Mobile"))
-                                    else:
-                                        tasks.append((None, None, "Skipped (Missing Data)"))
-
-                                elif resize_mode == "Both Desktop & Mobile":
-                                    if desk_render and 'x' in desk_render and desk_render != 'Not Scanned':
-                                        dw, dh = map(int, desk_render.split('x'))
-                                        tasks.append((dw, dh, "Desktop"))
-                                    else:
-                                        tasks.append((None, None, "Skipped (Missing Data)"))
-                                    
-                                    if mob_render and 'x' in mob_render and mob_render != 'Not Scanned':
-                                        mw, mh = map(int, mob_render.split('x'))
-                                        tasks.append((mw, mh, "Mobile"))
-
-                                # Execute Tasks
-                                for w, h, label in tasks:
-                                    # Always pass a copy so the original stays clean for the next loop
-                                    res = process_variant(img_org.copy(), url, label, w, h, original_kb, original_dims_str, old_fmt)
-                                    if res: results.append(res)
-                                    
-                                return results
-
-                            except Exception: return []
-
-                        with ThreadPoolExecutor(max_workers=5) as exe:
-                            futures = [exe.submit(process_image_row, row) for row in candidates.itertuples()]
-                            for i, f in enumerate(as_completed(futures)):
-                                res_list = f.result()
-                                if res_list: report_data.extend(res_list)
-                                progress.progress((i + 1) / len(candidates))
-                                status.text(f"Processing: {i+1}/{len(candidates)}")
-
-                        if report_data:
-                            st.success(f"✅ Generated {len(report_data)} optimized images!")
-                            rep_df = pd.DataFrame(report_data)
-                            st.dataframe(rep_df, use_container_width=True)
-                            
-                            # CSV Export
-                            csv_rep = rep_df.to_csv(index=False).encode('utf-8')
-                            st.download_button("📥 Download Full Report", csv_rep, "conversion_report.csv", "text/csv")
-                        else:
-                            st.warning("No images processed successfully.")
-        # ... [Your other tab3 code above here] ...
-
-        if images_data:
-            # ... [All your image processing and dataframes] ...
-            pass # (Just representing your existing code)
-            
-        else:
-            st.info("No images found.")
-
-        # 👇 THIS MUST BE LINED UP WITH THE 'if' and 'else' ABOVE IT!
-        # --- 6. OFFLINE BULK IMAGE OPTIMIZER ---
-        st.markdown("---")
-        st.subheader("🗜️ Offline Bulk Image Optimizer")
-        st.info("Upload heavy images. This tool will resize them, compress them, and convert them to SEO-friendly WebP format using your local computer's power.")
-
-        uploaded_images = st.file_uploader("Upload Images (JPG, PNG)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
-
-        c_opt1, c_opt2 = st.columns(2)
-        max_width_bulk = c_opt1.number_input("Max Width (px) - Good for Hero images", value=1200, step=100)
-        quality_bulk = c_opt2.slider("WebP Quality (1-100)", min_value=10, max_value=100, value=75, help="75 is the sweet spot for SEO.")
-
-        if uploaded_images and st.button("🚀 Compress & Convert to WebP"):
-            with st.spinner("Compressing images..."):
-                zip_buffer = io.BytesIO()
-                
-                with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-                    for img_file in uploaded_images:
-                        try:
-                            img = Image.open(img_file)
-                            if img.mode in ("RGBA", "P"):
-                                img = img.convert("RGB")
-                                
-                            if img.width > max_width_bulk:
-                                ratio = max_width_bulk / float(img.width)
-                                new_height = int((float(img.height) * float(ratio)))
-                                img = img.resize((max_width_bulk, new_height), Image.Resampling.LANCZOS)
-                                
-                            img_byte_arr = io.BytesIO()
-                            img.save(img_byte_arr, format='WEBP', quality=quality_bulk, optimize=True)
-                            
-                            original_name = img_file.name.rsplit('.', 1)[0]
-                            zip_file.writestr(f"{original_name}_optimized.webp", img_byte_arr.getvalue())
-                            
-                        except Exception as e:
-                            st.error(f"Failed to process {img_file.name}: {e}")
-                            
-                st.success("✅ Compression Complete!")
-                
-                st.download_button(
-                    label="📥 Download All Optimized WebP Images (ZIP)",
-                    data=zip_buffer.getvalue(),
-                    file_name="seo_optimized_images.zip",
-                    mime="application/zip"
-                )
-
-    with tab_meta_titles:
-        st.subheader("📝 Meta Tags & Titles Analysis")
-        # Combined DataFrame View
-        meta_view = df[['url', 'title', 'title_length', 'meta_description', 'meta_desc_length', 'h1_tags']].copy()
-        st.dataframe(meta_view, use_container_width=True)
-        csv_meta = meta_view.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download All Meta Data", csv_meta, "meta_titles.csv", "text/csv")
-
-        st.markdown("---")
-        with st.expander("✨ AI Content Generator (Titles & Meta)", expanded=False):
-            st.info("Generate missing or improved tags using AI.")
-            
-            c1, c2 = st.columns(2)
-            provider = c1.selectbox("Provider", ["Gemini", "OpenAI Compatible (Groq/Ollama/OpenAI)"])
-            api_key_gen = c2.text_input("API Key (Leave empty for Ollama)", type="password")
-            
-            c3, c4 = st.columns(2)
-            model_name = c3.text_input("Model Name", value="gemini-1.5-flash" if provider=="Gemini" else "lama-3.1-8b-instant")
-            endpoint = c4.text_input("Endpoint URL (OpenAI/Ollama Only)", value="https://api.groq.com/openai/v1/chat/completions")
-            
-            action_type = st.radio("I want to generate:", ["Titles Only", "Meta Descriptions Only"], horizontal=True)
-            filter_mode = st.radio("Generate for:", ["Only Missing Items (Empty)", "Regenerate All"], horizontal=True)
-            
-            if st.button("🚀 Generate Content"):
-                # Filter Logic
-                if action_type == "Titles Only":
-                    if filter_mode == "Only Missing Items (Empty)":
-                        targets = meta_view[meta_view['title_length'] == 0].copy()
-                    else:
-                        targets = meta_view.copy()
-                else: # Meta Desc
-                    if filter_mode == "Only Missing Items (Empty)":
-                        targets = meta_view[meta_view['meta_desc_length'] == 0].copy()
-                    else:
-                        targets = meta_view.copy()
-                
-                if targets.empty:
-                    st.warning("No pages match your criteria.")
-                else:
-                    st.write(f"Generating for {len(targets)} pages...")
-                    progress_gen = st.progress(0)
-                    results_gen = []
+                for img in imgs:
+                    html_w = str(img.get('width', '')).strip()
+                    html_h = str(img.get('height', '')).strip()
                     
-                    def process_gen_row(row):
-                        content_snippet = str(row.get('scope_content', df[df['url'] == row['url']]['scope_content'].values[0]))[:2000] # Increased context slightly
-                        
-                        if action_type == "Titles Only":
-                            context = f"Current H1: {row.get('h1_tags', '')}\nPage Content: {content_snippet}"
-                            prompt = f"""
-                            Act as a Senior SEO Copywriter. Generate ONE highly optimized SEO Title tag for this webpage.
-                            
-                            STRICT RULES:
-                            1. Length: Must be exactly between 50 and 60 characters.
-                            2. Intent: Make it highly clickable (High CTR) but DO NOT use cheap clickbait.
-                            3. Keywords: Put the main topic/keyword near the front.
-                            4. Format: Output ONLY the title text. Do NOT wrap it in quotes. Do NOT say "Here is your title".
-                            
-                            Context:
-                            {context}
-                            """
-                            col_name = "New AI Title"
-                            old_val = row['title']
-                        else:
-                            context = f"Current Title: {row.get('title', '')}\nPage Content: {content_snippet}"
-                            prompt = f"""
-                            Act as a Senior SEO Copywriter. Generate ONE highly optimized SEO Meta Description for this webpage.
-                            
-                            STRICT RULES:
-                            1. Length: Must be exactly between 145 and 155 characters.
-                            2. Intent: Clearly explain the exact value the user will get by clicking.
-                            3. CTA: End with a natural, subtle Call-to-Action (e.g., Learn more, Discover how, Get started).
-                            4. Tone: Professional, engaging, and active voice.
-                            5. Format: Output ONLY the description text. Do NOT wrap it in quotes. Do NOT add any extra conversational text.
-                            
-                            Context:
-                            {context}
-                            """
-                            col_name = "New AI Description"
-                            old_val = row['meta_description']
-                        
-                        # Added temperature control to the system instruction to make the AI more factual and less "creative/fluffy"
-                        generated = generate_ai_meta(provider, api_key_gen, model_name, endpoint, prompt, "You are a strict Technical SEO Expert. Follow length rules perfectly.")
-                        
-                        # Extra cleanup just in case the AI ignores the "no quotes" rule
-                        clean_generated = generated.strip().strip('"').strip("'").replace("**", "")
-                        
-                        return {"URL": row['url'], "Old Value": old_val, col_name: clean_generated}
+                    if html_w and html_h: html_dim_str = f"{html_w}x{html_h}"
+                    elif html_w: html_dim_str = f"{html_w}x?"
+                    elif html_h: html_dim_str = f"?x{html_h}"
+                    else: html_dim_str = "Missing in HTML"
 
-                    with ThreadPoolExecutor(max_workers=5) as executor:
-                        futures = [executor.submit(process_gen_row, row) for _, row in targets.iterrows()]
-                        for i, f in enumerate(as_completed(futures)):
-                            res = f.result()
-                            results_gen.append(res)
-                            progress_gen.progress((i + 1) / len(targets))
-                    
-                    res_df = pd.DataFrame(results_gen)
-                    st.success("✅ Generation Complete!")
-                    st.dataframe(res_df, use_container_width=True)
-                    csv_gen = res_df.to_csv(index=False).encode('utf-8')
-                    st.download_button("📥 Download Generated Data", csv_gen, "ai_generated_tags.csv", "text/csv")
-
-    with tab_headers:
-        st.subheader("🏗️ Header Architecture & Counts")
-        
-        if 'header_structure' in df.columns:
-            # 1. Prepare Data
-            struct_df = df[['url', 'h1_count', 'h2_count', 'h3_count', 'h4_count', 'h1_tags', 'header_structure']].copy()
-            
-            analyzed_data = []
-            problematic_urls = []
-            bad_h1_count = 0
-            broken_struct_count = 0
-            
-            # 2. Run Analysis Loop
-            def get_struct_status(row):
-                struct = row['header_structure']
-                if isinstance(struct, str):
-                    try: struct = json.loads(struct)
-                    except: struct = []
-                
-                issues, h1_c = analyze_heading_structure(struct)
-                
-                # Logic for counters
-                has_h1_issue = h1_c != 1
-                has_hierarchy_issue = any("Skipped" in i for i in issues)
-                
-                if has_h1_issue: 
-                    # We can't modify external variable easily in apply, so we handle counting differently or just use this for the DF
-                    pass 
-                
-                status_label = "✅ Perfect"
-                if has_h1_issue and has_hierarchy_issue: status_label = "❌ H1 & Hierarchy Errors"
-                elif has_h1_issue: status_label = "❌ Bad H1 Count"
-                elif has_hierarchy_issue: status_label = "⚠️ Skipped Levels"
-                
-                # Store for Visual Inspector
-                analyzed_data.append({
-                    'url': row['url'],
-                    'structure': struct,
-                    'issues': issues,
-                    'h1_count': h1_c,
-                    'status': status_label
-                })
-                
-                if has_h1_issue or has_hierarchy_issue:
-                    problematic_urls.append({
-                        'URL': row['url'],
-                        'H1 Count': h1_c,
-                        'Hierarchy Issues': " | ".join(issues)
+                    images_data.append({
+                        'source_url': row['url'],
+                        'image_url': img['src'],
+                        'alt_text': img['alt'],
+                        'html_dimensions': html_dim_str,
+                        'real_dimensions': 'Not Checked',
+                        'rendered_desktop': 'Not Scanned',
+                        'rendered_mobile': 'Not Scanned',
+                        'size_kb': img.get('size_kb', 0),
+                        'status_code': 'Pending' 
                     })
-                    
-                return status_label
-
-            # Apply Analysis
-            struct_df['Hierarchy Status'] = struct_df.apply(get_struct_status, axis=1)
             
-            # Calculate Counts from the processed data
-            bad_h1_count = len(struct_df[struct_df['h1_count'] != 1])
-            broken_struct_count = len(struct_df[struct_df['Hierarchy Status'].str.contains("Skipped")])
-
-            # 3. Top Metrics
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Total Pages", len(df))
-            m2.metric("❌ Bad H1 Usage", bad_h1_count, help="Pages with 0 or >1 H1 tags")
-            m3.metric("⚠️ Broken Levels", broken_struct_count, help="Pages skipping levels (e.g. H2->H4)")
-            m4.metric("✅ Perfect Structure", len(df) - len(problematic_urls))
-
-            st.divider()
-
-            # 4. Main Data Table (Merged View)
-            st.write("### 📊 Overview Table")
-            
-            # Reorder columns for readability
-            cols_to_show = ['Hierarchy Status', 'url', 'h1_count', 'h2_count', 'h3_count', 'h1_tags']
-            st.dataframe(
-                struct_df[cols_to_show],
-                use_container_width=True,
-                column_config={
-                    "url": st.column_config.LinkColumn("Page URL"),
-                    "h1_tags": st.column_config.TextColumn("H1 Text", width="large"),
-                    "Hierarchy Status": st.column_config.TextColumn("Status", width="medium"),
-                }
-            )
-            
-            csv = struct_df.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download Header Report", csv, "header_analysis.csv", "text/csv")
-
-            st.divider()
-
-            # 5. Visual Hierarchy Inspector (The "Deep Dive")
-            c_insp, c_tree = st.columns([1, 2])
-            
-            with c_insp:
-                st.write("### 🔍 Visual Inspector")
-                st.info("Select a page to visualize its Heading Tree (DOM).")
+            if images_data:
+                img_df = pd.DataFrame(images_data)
                 
-                filter_mode = st.radio("Filter List:", ["All Pages", "Only Pages with Issues"], horizontal=True)
-                
-                if filter_mode == "Only Pages with Issues":
-                    options = [d['URL'] for d in problematic_urls]
-                else:
-                    options = [d['url'] for d in analyzed_data]
-                
-                if not options:
-                    st.warning("No pages match this filter.")
-                    selected_page = None
-                else:
-                    selected_page = st.selectbox("Select Page:", options, key="merged_struct_select")
+                if 'img_size_cache' not in st.session_state: st.session_state.img_size_cache = {}
+                if st.session_state.img_size_cache:
+                    img_df['size_kb'] = img_df['image_url'].map(st.session_state.img_size_cache).fillna(img_df['size_kb'])
 
-            with c_tree:
-                if selected_page:
-                    page_data = next((item for item in analyzed_data if item['url'] == selected_page), None)
-                    
-                    if page_data:
-                        st.markdown(f"**Analysis for:** `{selected_page}`")
-                        
-                        # Show Issues Badge
-                        if page_data['issues']:
-                            for issue in page_data['issues']:
-                                if "❌" in issue: st.error(issue)
-                                else: st.warning(issue)
+                if 'img_real_dim_cache' not in st.session_state: st.session_state.img_real_dim_cache = {}
+                if st.session_state.img_real_dim_cache:
+                    img_df['real_dimensions'] = img_df.apply(lambda x: st.session_state.img_real_dim_cache.get(x['image_url'], x['real_dimensions']), axis=1)
+
+                if 'img_status_cache' not in st.session_state: st.session_state.img_status_cache = {}
+                if st.session_state.img_status_cache:
+                    img_df['status_code'] = img_df['image_url'].map(st.session_state.img_status_cache).fillna('Pending')
+
+                if 'img_rendered_cache' not in st.session_state: st.session_state.img_rendered_cache = {}
+                
+                def normalize_url(u):
+                    if not u: return ""
+                    u = u.split('?')[0].split('#')[0]
+                    return u.replace('https://', '').replace('http://', '').replace('www.', '')
+
+                def get_rendered_data(img_url, key):
+                    cache = st.session_state.img_rendered_cache
+                    if not cache: return 'Not Scanned'
+                    if img_url in cache and key in cache[img_url]: return cache[img_url][key]
+                    clean_target = normalize_url(img_url)
+                    for cache_url, data in cache.items():
+                        if clean_target in cache_url or normalize_url(cache_url) == clean_target:
+                            return data.get(key, 'Not Scanned')
+                    return 'Not Scanned'
+
+                if st.session_state.img_rendered_cache:
+                    img_df['rendered_desktop'] = img_df['image_url'].apply(lambda x: get_rendered_data(x, 'Desktop'))
+                    img_df['rendered_mobile'] = img_df['image_url'].apply(lambda x: get_rendered_data(x, 'Mobile'))
+                    def update_natural(row):
+                        if row['real_dimensions'] == 'Not Checked':
+                            return get_rendered_data(row['image_url'], 'Natural').replace('Not Scanned', 'Not Checked')
+                        return row['real_dimensions']
+                    img_df['real_dimensions'] = img_df.apply(update_natural, axis=1)
+
+                st.write("#### 🛠️ Image Tools")
+                col_kb, col_px, col_vis, col_stat = st.columns([1, 1, 1.5, 1])
+                
+                with col_kb:
+                    if st.button("1️⃣ Check File Sizes"):
+                        targets = img_df[img_df['size_kb'] == 0]['image_url'].unique().tolist()
+                        if targets:
+                            p_bar = st.progress(0)
+                            crawler_temp = UltraFrogCrawler()
+                            res = {}
+                            with ThreadPoolExecutor(max_workers=20) as exe:
+                                futures = {exe.submit(crawler_temp.get_file_size, u): u for u in targets}
+                                for i, f in enumerate(as_completed(futures)):
+                                    u = futures[f]
+                                    try: res[u] = f.result()
+                                    except: res[u] = 0
+                                    if i%5==0: p_bar.progress((i+1)/len(targets))
+                            st.session_state.img_size_cache.update(res)
+                            st.rerun()
+
+                with col_px:
+                    if st.button("2️⃣ Check Real Dims"):
+                        targets = img_df[
+                            (img_df['real_dimensions'] == 'Not Checked') | 
+                            (img_df['real_dimensions'] == 'Error')
+                        ]['image_url'].unique().tolist()
+                        if targets:
+                            p_bar = st.progress(0)
+                            results_cache = {}
+                            def get_pil_dims(u):
+                                try:
+                                    r = requests.get(u, timeout=8, headers={'User-Agent': 'Mozilla/5.0'}, verify=False)
+                                    if r.status_code == 200:
+                                        image_file = io.BytesIO(r.content)
+                                        img = Image.open(image_file)
+                                        return u, f"{img.width}x{img.height}"
+                                    return u, f"Error {r.status_code}"
+                                except: return u, "Error"
+                            
+                            with ThreadPoolExecutor(max_workers=10) as exe:
+                                futures = {exe.submit(get_pil_dims, u): u for u in targets}
+                                for i, future in enumerate(as_completed(futures)):
+                                    url = futures[future]
+                                    try: results_cache[url] = future.result()[1]
+                                    except: results_cache[url] = "Error"
+                                    if i % 2 == 0: p_bar.progress((i + 1) / len(targets))
+                            st.session_state.img_real_dim_cache.update(results_cache)
+                            st.rerun()
+
+                with col_vis:
+                    if st.button("3️⃣ Check Visual Dims"):
+                        unique_pages = img_df['source_url'].unique().tolist()
+                        if not HAS_PLAYWRIGHT: st.error("❌ Playwright not installed.")
+                        elif not unique_pages: st.warning("No pages to scan.")
                         else:
-                            st.success("✅ Structure is perfectly logical.")
-
-                        # Render Tree
-                        st.markdown("#### 🌳 Heading Tree")
-                        st.markdown("""
-                        <style>
-                        .header-node { padding: 3px 8px; border-left: 3px solid #ddd; margin-bottom: 3px; font-family: monospace; }
-                        .h1-node { border-left-color: #ff4b4b; background-color: #ff4b4b1a; font-weight: bold; }
-                        .h2-node { border-left-color: #ffbd45; background-color: #ffbd451a; }
-                        .h3-node { border-left-color: #92c5de; }
-                        .h4-node { border-left-color: #e0e0e0; color: #666; }
-                        </style>
-                        """, unsafe_allow_html=True)
-
-                        if not page_data['structure']:
-                            st.info("No headers found on this page.")
-                        
-                        for h in page_data['structure']:
-                            lvl = h['level']
-                            indent = (lvl - 1) * 20
-                            # CSS Class based on level
-                            css_class = "header-node"
-                            if lvl == 1: css_class += " h1-node"
-                            elif lvl == 2: css_class += " h2-node"
-                            elif lvl == 3: css_class += " h3-node"
-                            elif lvl >= 4: css_class += " h4-node"
+                            p_bar = st.progress(0)
+                            s_text = st.empty()
+                            def update_prog(i, total, url):
+                                p_bar.progress((i+1)/total)
+                                s_text.text(f"Rendering {i+1}/{total}: {url}")
                             
-                            st.markdown(
-                                f"<div class='{css_class}' style='margin-left: {indent}px;'>"
-                                f"<span>{h['tag'].upper()}</span>: {h['text']}"
-                                f"</div>", 
-                                unsafe_allow_html=True
-                            )
-        else:
-            st.warning("Header structure data not available. Please re-crawl the site.")
+                            scan_results, img_count = measure_rendered_images(unique_pages, update_prog)
+                            if isinstance(scan_results, dict) and scan_results:
+                                st.session_state.img_rendered_cache.update(scan_results)
+                                st.success(f"✅ Scanned {len(unique_pages)} pages!")
+                                time.sleep(1)
+                                st.rerun()
 
-    with tab_tech:
-        st.header("🛠️ Master Technical Audit")
-        st.info("Unified view of Status Codes, Redirects, and Canonicals.")
-
-        # 1. Prepare the Unified Dataframe
-        # Start with the basics
-        tech_df = df[['url', 'status_code', 'indexability', 'redirect_count', 'final_url', 'canonical_url', 'meta_robots']].copy()
-
-        # 2. Add Computed Columns for easy filtering
-        
-        # --- Canonical Logic ---
-        def get_canonical_status(row):
-            c_url = row['canonical_url']
-            if not c_url: return "❌ Missing"
-            if row['url'] == c_url: return "✅ Self-Referencing"
-            return "⚠️ Canonicalized to Other"
-
-        tech_df['Canonical Status'] = tech_df.apply(get_canonical_status, axis=1)
-
-        # --- Redirect Logic ---
-        def get_redirect_status(row):
-            if row['redirect_count'] > 0:
-                return f"🔄 Redirect ({row['redirect_count']} hops)"
-            if row['status_code'] == 200:
-                return "✅ 200 OK"
-            return f"⚠️ {row['status_code']}"
-
-        tech_df['Page Status'] = tech_df.apply(get_redirect_status, axis=1)
-
-        # 3. Reorder Columns for Readability
-        # We drop raw columns we don't need to show since we have computed ones
-        display_df = tech_df[[
-            'url', 
-            'Page Status', 
-            'indexability', 
-            'final_url', 
-            'Canonical Status', 
-            'canonical_url',
-            'meta_robots'
-        ]]
-
-        # Rename for UI
-        display_df.columns = [
-            'Source URL', 'Status Overview', 'Indexability', 
-            'Redirect Target (Final URL)', 'Canonical Status', 'Canonical Link', 'Robots Tag'
-        ]
-
-        # 4. Metrics Row
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total URLs", len(tech_df))
-        m2.metric("🔄 Redirects", len(tech_df[tech_df['redirect_count'] > 0]))
-        m3.metric("❌ Broken (4xx/5xx)", len(tech_df[tech_df['status_code'] >= 400]))
-        m4.metric("⚠️ Canonical Issues", len(tech_df[tech_df['Canonical Status'].str.contains("Missing|Other")]))
-
-        st.divider()
-
-        # 5. Render the Master Table
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            column_config={
-                "Source URL": st.column_config.LinkColumn("Source URL", width="medium"),
-                "Redirect Target (Final URL)": st.column_config.LinkColumn("Redirect Target"),
-                "Canonical Link": st.column_config.LinkColumn("Canonical Tag"),
-                "Status Overview": st.column_config.TextColumn("Status", width="small"),
-            }
-        )
-
-        # 6. Unified Download Button
-        csv = display_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            "📥 Download Full Technical Report", 
-            csv, 
-            "master_technical_audit.csv", 
-            "text/csv",
-            type="primary"
-        )
-
-    with tab10:
-        st.subheader("📱 Social Tags")
-        st.dataframe(df[['url', 'og_title', 'twitter_title']], use_container_width=True)
-        csv = df[['url', 'og_title', 'twitter_title']].to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Social", csv, "social_tags.csv", "text/csv")
-
-    with tab11:
-        st.subheader("🚀 Performance Stats")
-        st.dataframe(df[['url', 'response_time', 'word_count', 'content_length']], use_container_width=True)
-        csv = df[['url', 'response_time']].to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download Performance", csv, "performance.csv", "text/csv")
-
-    with tab13:
-        st.subheader("👻 Orphan Pages")
-        if orphans:
-            orphan_df = pd.DataFrame(orphans, columns=['Orphan URL'])
-            st.dataframe(orphan_df, use_container_width=True)
-            csv = orphan_df.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download Orphans", csv, "orphans.csv", "text/csv")
-        else:
-            st.success("No orphans found (or no sitemap provided).")
-
-    with tab14:
-        st.subheader("⛏️ Custom Extracted Data")
-        
-        if 'custom_extraction' not in df.columns:
-            st.info("No custom data found. Add rules in the sidebar and start a crawl.")
-        else:
-            try:
-                # Filter rows that have data
-                valid_custom = df[df['custom_extraction'].notna() & (df['custom_extraction'] != '')].copy()
-                
-                if valid_custom.empty:
-                    st.warning("No data extracted yet.")
-                else:
-                    # Parse JSON
-                    json_data = valid_custom['custom_extraction'].apply(
-                        lambda x: json.loads(x) if isinstance(x, str) and x.startswith('{') else {}
-                    ).tolist()
-                    
-                    # Create dataframe from list of dicts
-                    extracted_df = pd.DataFrame(json_data)
-                    
-                    # Combine with URL
-                    result_df = pd.concat([valid_custom['url'].reset_index(drop=True), extracted_df], axis=1)
-                    
-                    st.write(f"**Found data for {len(result_df)} URLs**")
-                    st.dataframe(result_df, use_container_width=True)
-                    
-                    csv = result_df.to_csv(index=False).encode('utf-8')
-                    st.download_button("📥 Download Custom Data", csv, "custom_extraction.csv", "text/csv")
-            except Exception as e:
-                st.error(f"Error parsing data: {e}")
-                st.dataframe(df[['url', 'custom_extraction']], use_container_width=True)
-
-    with tab15:
-        st.subheader("⚡ Google PageSpeed Insights (PSI)")
-        st.info("Enter your Google PageSpeed API Key in the Sidebar to use this feature.")
-        
-        if psi_api_key:
-            check_all = st.checkbox("Select All URLs (Run for everyone)", help="⚠️ Be careful with API limits if you have thousands of URLs.")
-            if check_all:
-                urls_to_test = df['url'].tolist()
-                st.write(f"Selected {len(urls_to_test)} URLs.")
-            else:
-                urls_to_test = st.multiselect("Select URLs to Test (Max 5 recommended)", df['url'].head(20).tolist())
-            
-            if st.button("🏃 Run PageSpeed Test (Mobile & Desktop)"):
-                if not urls_to_test:
-                    st.warning("Please select at least one URL.")
-                else:
-                    progress_psi = st.progress(0)
-                    status_text = st.empty()
-                    results = []
-                    total_steps = len(urls_to_test)
-                    
-                    for i, u in enumerate(urls_to_test):
-                        status_text.text(f"Testing {i+1}/{total_steps}: {u}...")
-                        mobile_res = run_psi_test(u, psi_api_key, "mobile")
-                        desktop_res = run_psi_test(u, psi_api_key, "desktop")
+                with col_stat:
+                    if st.button("4️⃣ Check Status"):
+                        targets = img_df[img_df['status_code'].isin(['Pending', 'Error'])]['image_url'].unique().tolist()
                         
-                        row = {'url': u}
-                        if "error" in mobile_res: row['Mobile Error'] = mobile_res['error']
+                        if targets:
+                            p_bar = st.progress(0)
+                            stat_text = st.empty()
+                            res_status = {}
+                            
+                            def fetch_img_status(u):
+                                try:
+                                    r = requests.head(u, timeout=5, headers={'User-Agent': 'Mozilla/5.0'}, verify=False, allow_redirects=True)
+                                    if r.status_code in [405, 403]:
+                                        r = requests.get(u, timeout=5, headers={'User-Agent': 'Mozilla/5.0'}, stream=True, verify=False)
+                                    return u, r.status_code
+                                except Exception as e:
+                                    return u, "Error"
+
+                            with ThreadPoolExecutor(max_workers=20) as exe:
+                                futures = {exe.submit(fetch_img_status, u): u for u in targets}
+                                for i, f in enumerate(as_completed(futures)):
+                                    u = futures[f]
+                                    try: res_status[u] = f.result()[1]
+                                    except: res_status[u] = "Error"
+                                    
+                                    if i % 5 == 0: 
+                                        p_bar.progress((i+1)/len(targets))
+                                        stat_text.text(f"Checking {i+1}/{len(targets)}")
+                            
+                            st.session_state.img_status_cache.update(res_status)
+                            st.success("✅ Status Checks Complete")
+                            time.sleep(0.5)
+                            st.rerun()
                         else:
-                            for k, v in mobile_res.items(): row[f"Mobile {k}"] = v
-                                
-                        if "error" in desktop_res: row['Desktop Error'] = desktop_res['error']
-                        else:
-                            for k, v in desktop_res.items(): row[f"Desktop {k}"] = v
+                            st.info("All images checked.")
 
-                        results.append(row)
-                        progress_psi.progress((i + 1) / total_steps)
+                st.divider()
+                
+                def analyze_image_status(row):
+                    real = row['real_dimensions']
+                    html = row['html_dimensions']
+                    vis_d = row['rendered_desktop']
+                    code = str(row['status_code'])
                     
-                    st.session_state.psi_results = results
-                    status_text.success("✅ Analysis Complete!")
-            
-            if st.session_state.psi_results:
-                psi_df = pd.DataFrame(st.session_state.psi_results)
-                desired_order = ['url', 'Mobile Score', 'Desktop Score', 'Mobile LCP', 'Desktop LCP', 'Mobile FCP', 'Desktop FCP', 'Mobile CLS', 'Desktop CLS', 'Mobile INP', 'Desktop INP']
-                final_cols = [c for c in desired_order if c in psi_df.columns]
-                remaining_cols = [c for c in psi_df.columns if c not in final_cols]
-                st.dataframe(psi_df[final_cols + remaining_cols], use_container_width=True)
-                csv_psi = psi_df.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Download PSI Report", csv_psi, "psi_report.csv", "text/csv")
-        else:
-            st.warning("⚠️ PSI API Key is missing. Please add it in the sidebar.")
-
-    with tab16:
-        st.subheader("🏗️ Schema Markup Analysis")
-
-        # 1. Prepare Data for Table
-        schema_view = df[['url', 'schema_types', 'schema_validity']].copy()
-        
-        # Rename your old rule-based suggestion
-        schema_view['Rule-Based Suggestion'] = df.apply(get_suggested_schema, axis=1)
-
-        # --- NEW AI SCHEMA SUGGESTION TOOL ---
-        with st.expander("✨ Get AI-Powered Schema Suggestions"):
-            st.info("Use AI to read the actual page content and recommend the exact Schema types you should add.")
-            c_ai1, c_ai2 = st.columns(2)
-            sch_provider = c_ai1.selectbox("AI Provider", ["Gemini", "OpenAI Compatible (Groq/Ollama/OpenAI)"], key="sch_p")
-            sch_key = c_ai2.text_input("API Key (or empty for Ollama)", type="password", key="sch_k")
-            
-            c_ai3, c_ai4 = st.columns(2)
-            sch_model = c_ai3.text_input("Model", value="gemini-1.5-flash" if sch_provider=="Gemini" else "llama-3.3-70b-versatile", key="sch_m")
-            sch_url = c_ai4.text_input("Endpoint URL", value="https://api.groq.com/openai/v1/chat/completions", key="sch_u")
-
-            if st.button("🧠 Check Schema Suggestion with AI"):
-                with st.spinner("AI is analyzing content to suggest schemas..."):
-                    ai_results = {}
-                    progress_sch = st.progress(0)
-                    total_urls = len(df)
+                    status = []
                     
-                    def fetch_ai_schema(row):
-                        content = str(row.get('scope_content', ''))[:1500] # Limit to 1500 chars to save tokens
-                        title = str(row.get('title', ''))
-                        
-                        prompt = f"""
-                        Analyze this webpage content.
-                        Title: {title}
-                        Content Snippet: {content}
-                        
-                        Task: Suggest the top 1-3 most relevant Schema.org markup types for this page (e.g., Article, FAQPage, Product, LocalBusiness, Recipe, JobPosting, SoftwareApplication). 
-                        ONLY output the exact schema names separated by a comma. Do not include any other text, explanations, or code.
-                        """
-                        
-                        # Reuse your existing AI helper function
-                        res = generate_ai_meta(sch_provider, sch_key, sch_model, sch_url, prompt, "You are a Technical SEO Expert.")
-                        
-                        # Clean up the AI output just in case it gets chatty
-                        clean_res = res.replace("DECISION:", "").replace("`", "").strip()
-                        return row['url'], clean_res
+                    if code != 'Pending' and code != '200':
+                        status.append(f"❌ HTTP {code}")
 
-                    # Run requests concurrently
-                    with ThreadPoolExecutor(max_workers=3) as executor:
-                        futures = {executor.submit(fetch_ai_schema, row): row for _, row in df.iterrows()}
-                        for i, f in enumerate(as_completed(futures)):
-                            url, suggestion = f.result()
-                            ai_results[url] = suggestion
-                            progress_sch.progress((i + 1) / total_urls)
+                    if html == 'Missing in HTML': status.append("⚠️ Missing HTML Attrs")
                     
-                    # Save to session state so it persists
-                    st.session_state.ai_schema_suggestions = ai_results
-                    st.success("✅ AI Suggestions Generated!")
-
-        # --- MERGE AI DATA IF AVAILABLE ---
-        if 'ai_schema_suggestions' in st.session_state:
-            schema_view['✨ AI Suggestion'] = schema_view['url'].map(st.session_state.ai_schema_suggestions)
-        else:
-            schema_view['✨ AI Suggestion'] = "Click AI Button ⬆️"
-
-        st.write("### 📊 Schema Overview")
-        st.info("Select a row to see the Google Preview and Validation details below.")
-
-        # Dynamic Column Config
-        col_config = {
-            "url": st.column_config.LinkColumn("Page URL", width="medium"),
-            "schema_types": st.column_config.TextColumn("Detected Schema", width="small"),
-            "Rule-Based Suggestion": st.column_config.TextColumn("Standard Suggestion", width="small"),
-            "schema_validity": st.column_config.TextColumn("Status", width="small"),
-            "✨ AI Suggestion": st.column_config.TextColumn("✨ AI Suggestion", width="medium")
-        }
-
-        # Interactive Table
-        selection = st.dataframe(
-            schema_view,
-            use_container_width=True,
-            column_config=col_config,
-            on_select="rerun", # Updates when user clicks a row
-            selection_mode="single-row"
-        )
-
-        st.divider()
-        
-        # 2. Detailed View (Triggered by Selection)
-        # ... (DO NOT DELETE YOUR EXISTING PREVIEW/VALIDATOR CODE BELOW THIS LINE) ...
-
-        # 2. Detailed View (Triggered by Selection)
-        if selection.selection.rows:
-            # Get the selected row index
-            idx = selection.selection.rows[0]
-            selected_url = schema_view.iloc[idx]['url']
-            
-            st.markdown(f"### 🔍 Inspecting: `{selected_url}`")
-            
-            # Fetch full row data
-            row = df[df['url'] == selected_url].iloc[0]
-            schema_dump = row.get('schema_dump', [])
-            
-            # Layout: Preview Left, JSON Right
-            col_preview, col_json = st.columns([1, 1])
-            
-            with col_preview:
-                st.markdown("#### 📱 Google Search Preview")
-                
-                # Parse JSON
-                if isinstance(schema_dump, str):
-                    try: schema_objs = json.loads(schema_dump)
-                    except: schema_objs = []
-                else: schema_objs = schema_dump
-                
-                if not schema_objs:
-                    st.warning("⚠️ No Schema JSON found to render preview.")
-                    # Show a generic preview if no schema
-                    st.markdown("""
-                    <div style="font-family:arial; background:#fff; padding:15px; border:1px solid #dfe1e5; border-radius:8px;">
-                        <div style="font-size:12px; color:#202124;">https://example.com › ...</div>
-                        <div style="font-size:20px; color:#1a0dab; margin:5px 0;">Page Title Example</div>
-                        <div style="font-size:14px; color:#4d5156;">No rich snippets detected. This is how a standard result looks.</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                else:
-                    # Render card for the first valid schema item found
-                    render_rich_snippet_preview(schema_objs[0] if isinstance(schema_objs, list) else schema_objs)
-                    
-                    # Validation Results
-                    st.markdown("#### ✅ Validation Issues")
-                    issues = validate_schema_structure(schema_objs[0] if isinstance(schema_objs, list) else schema_objs)
-                    if issues:
-                        for i in issues: st.error(i)
-                    else:
-                        st.success("Structure looks valid for Google Rich Results.")
-
-                # Action Buttons
-                encoded_url = requests.utils.quote(selected_url)
-                st.markdown(f"""
-                <div style="display: flex; gap: 10px; margin-top: 20px;">
-                    <a href="https://search.google.com/test/rich-results?url={encoded_url}" target="_blank">
-                        <button style="padding:8px 16px; border-radius:5px; border:1px solid #ccc; background:#f0f2f6; cursor:pointer;">
-                            📡 Test in Google
-                        </button>
-                    </a>
-                    <a href="https://validator.schema.org/#url={encoded_url}" target="_blank">
-                        <button style="padding:8px 16px; border-radius:5px; border:1px solid #ccc; background:#f0f2f6; cursor:pointer;">
-                            ✅ Schema Validator
-                        </button>
-                    </a>
-                </div>
-                """, unsafe_allow_html=True)
-
-            with col_json:
-                st.markdown("#### 📝 Raw JSON-LD")
-                st.json(schema_objs, expanded=True)
-
-        else:
-            st.info("👆 Click on a row in the table above to see the Google Preview.")
-            
-            # Download Button for the Table
-            csv = schema_view.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download Schema Report", csv, "schema_analysis.csv", "text/csv")
-
-    with tab_search:
-        st.subheader("🔍 Custom Search Results")
-        s_conf = st.session_state.get('search_config', None)
-        if 'custom_search_count' not in df.columns:
-            st.info("Please configure Custom Search in the Sidebar and run a new crawl.")
-        elif s_conf:
-            st.info(f"Results for search: **'{s_conf['query']}'** ({s_conf['mode']}) in **{s_conf['scope']}**")
-            found_df = df[df['custom_search_count'] > 0][['url', 'custom_search_count']].copy()
-            st.dataframe(found_df, use_container_width=True)
-        else:
-            st.warning("No search was configured.") 
-    
-    with tab_cannibal:
-        st.subheader("👯 Content Similarity & Pruning")
-        st.markdown("""
-        **Two-Step Pruning Strategy:**
-        1. **Duplicates (High Match):** Pages that are copies. Action: *Delete or 301 Redirect.*
-        2. **Cannibalization (Medium Match):** Different pages fighting for the same topic. Action: *Merge content.*
-        """)
-        
-        if not HAS_SKLEARN:
-            st.error("❌ 'scikit-learn' is not installed. Please run: `pip install scikit-learn`")
-        else:
-            col1, col2 = st.columns(2)
-            
-            # --- RESTORED SLIDERS ---
-            merge_thresh = col1.slider("Merge Threshold % (Topic Overlap)", 30, 90, 60, help="Finds pages that talk about similar things.")
-            dupe_thresh = col2.slider("Duplicate Threshold % (Exact Copies)", 80, 100, 90, help="Finds pages that are almost identical.")
-            
-            if st.button("🔍 Analyze Content Similarity"):
-                with st.spinner("Comparing semantic fingerprints (Title + H1 + Body)..."):
-                    if 'scope_content' not in df.columns:
-                        st.error("Please re-crawl the website to capture content data.")
-                    else:
-                        cannibal_df = analyze_content_cannibalization(df, merge_threshold=merge_thresh/100, duplicate_threshold=dupe_thresh/100)
-                        st.session_state.cannibal_data = cannibal_df
-            
-            # --- DISPLAY RESULTS ---
-            if 'cannibal_data' in st.session_state:
-                data = st.session_state.cannibal_data
-                
-                if data.empty:
-                    st.success("✅ No similarity found above your thresholds.")
-                else:
-                    # SECTION 1: DUPLICATES (TO REMOVE)
-                    duplicates = data[data['Recommendation'].str.contains("Remove")]
-                    st.write("### 🚨 1. Duplicates (High Risk - Remove/Redirect)")
-                    if not duplicates.empty:
-                        st.error(f"Found {len(duplicates)} pages that look like copies.")
-                        st.dataframe(
-                            duplicates, 
-                            use_container_width=True,
-                            column_config={
-                                "Similarity": st.column_config.ProgressColumn("Match %", format="%.1f%%", min_value=0, max_value=100),
-                                "Page A": st.column_config.LinkColumn("Page A"),
-                                "Page B": st.column_config.LinkColumn("Page B"),
-                            }
-                        )
-                    else:
-                        st.info("No exact duplicates found.")
-
-                    st.divider()
-
-                    # SECTION 2: MERGERS (TO COMBINE)
-                    mergers = data[data['Recommendation'].str.contains("Merge")]
-                    st.write("### 🤝 2. Merge Opportunities (Keyword Cannibalization)")
-                    if not mergers.empty:
-                        st.warning(f"Found {len(mergers)} pages covering similar topics.")
-                        st.caption("These pages are likely competing for the same keywords. Pick the strongest one and merge the others into it.")
-                        st.dataframe(
-                            mergers, 
-                            use_container_width=True,
-                            column_config={
-                                "Similarity": st.column_config.ProgressColumn("Match %", format="%.1f%%", min_value=0, max_value=100),
-                                "Page A": st.column_config.LinkColumn("Page A"),
-                                "Page B": st.column_config.LinkColumn("Page B"),
-                            }
-                        )
-                    else:
-                        st.info("No merge opportunities found with current settings.")
-                    
-                    st.divider()
-                    
-                    # Filter for Mergers
-                    mergers = data[data['Recommendation'].str.contains("Merge")]
-                    if not mergers.empty:
-                        st.warning(f"🤝 Found {len(mergers)} pages covering similar topics (Keyword Cannibalization).")
-                        st.dataframe(
-                            mergers, 
-                            use_container_width=True,
-                            column_config={
-                                "Similarity Score": st.column_config.ProgressColumn("Similarity", format="%.1f%%", min_value=0, max_value=100),
-                                "Page A": st.column_config.LinkColumn("Keep This?"),
-                                "Page B": st.column_config.LinkColumn("Redirect This?"),
-                            }
-                        )
-
-    with tab_gsc:
-        st.subheader("📈 Google Search Console Analysis")
-        
-        if not HAS_GSC:
-            st.error("Missing libraries. Run: `pip install google-api-python-client google-auth`")
-        elif not st.session_state.gsc_service or not gsc_property:
-            st.info("👈 Please upload your JSON Key and select a property in the sidebar.")
-        else:
-            st.write("### 1. Performance Metrics")
-            
-            valid_dates = False
-            start_d, end_d = None, None
-            
-            if 'date_range' in locals() and isinstance(date_range, tuple) and len(date_range) == 2:
-                start_d, end_d = date_range
-                st.caption(f"Fetching data from: **{start_d}** to **{end_d}**")
-                valid_dates = True
-            elif 'date_range' not in locals():
-                 st.warning("⚠️ Date picker loading...")
-            else:
-                st.warning("⚠️ Please select both a Start Date and an End Date in the sidebar.")
-
-            if st.button("🔄 Fetch Performance (Clicks, Imp, CTR, Pos)", disabled=not valid_dates):
-                with st.spinner("Fetching performance data..."):
-                    gsc_data = fetch_gsc_data(st.session_state.gsc_service, gsc_property, start_d, end_d)
-                    
-                    if not gsc_data.empty:
-                        st.success(f"Fetched data for {len(gsc_data)} URLs!")
-                        
-                        if 'GSC CTR' in gsc_data.columns:
-                            gsc_data['GSC CTR'] = (gsc_data['GSC CTR'] * 100).round(2).astype(str) + '%'
-                        if 'GSC Position' in gsc_data.columns:
-                            gsc_data['GSC Position'] = gsc_data['GSC Position'].round(1)
-
-                        if df is not None and not df.empty:
-                            df['url'] = df['url'].astype(str)
-                            gsc_data['url'] = gsc_data['url'].astype(str)
-                            
-                            merged_gsc = pd.merge(df, gsc_data, on='url', how='left')
-                            
-                            zero_clicks = merged_gsc[merged_gsc['GSC Clicks'].fillna(0) == 0]
-                            st.metric("Pages in List with 0 Clicks", len(zero_clicks))
-                            
-                            display_df = merged_gsc.copy()
-                            complex_cols = ['schema_dump', 'internal_links', 'external_links', 
-                                          'images', 'redirect_chain', 'header_structure', 'custom_extraction']
-                            for col in complex_cols:
-                                if col in display_df.columns:
-                                    display_df[col] = display_df[col].astype(str)
-                            
-                            target_cols = ['url', 'GSC Clicks', 'GSC Impressions', 'GSC CTR', 'GSC Position']
-                            final_cols = [c for c in target_cols if c in display_df.columns]
-                            
-                            st.dataframe(display_df[final_cols], use_container_width=True)
-                            st.session_state.gsc_merged_data = merged_gsc
-                        else:
-                            st.dataframe(gsc_data, use_container_width=True)
-                            st.session_state.gsc_merged_data = gsc_data
-                    else:
-                        st.warning("No data found in GSC for this period.")
-
-            st.divider()
-
-            st.write("### 2. Indexing & Canonical Inspection")
-            st.info("ℹ️ Checks the live Google Index status. Use 'List Mode' crawl to define your URLs first.")
-            
-            available_urls = []
-            if df is not None and not df.empty:
-                available_urls = df['url'].tolist()
-            elif 'gsc_merged_data' in st.session_state and not st.session_state.gsc_merged_data.empty:
-                available_urls = st.session_state.gsc_merged_data['url'].tolist()
-            
-            if available_urls:
-                st.write(f"**Ready to inspect {len(available_urls)} URLs**")
-                
-                col_i1, col_i2 = st.columns(2)
-                do_inspect = False
-                urls_to_run = []
-                
-                with col_i1:
-                    specific_url = st.text_input("Inspect Single URL")
-                    if st.button("🔎 Inspect One"):
-                        if specific_url:
-                            urls_to_run = [specific_url]
-                            do_inspect = True
-                        else:
-                            st.warning("Enter a URL")
-
-                with col_i2:
-                    st.write(f"Batch Inspect ({len(available_urls)} URLs)")
-                    if st.button(f"🚀 Inspect All {len(available_urls)} URLs"):
-                        urls_to_run = available_urls
-                        do_inspect = True
-                
-                if do_inspect:
-                    with st.status("Inspecting URLs... (This can take a while)") as status:
-                        insp_df = inspect_url_indexing(st.session_state.gsc_service, gsc_property, urls_to_run)
-                        status.update(label="Inspection Complete!", state="complete")
-                    
-                    if not insp_df.empty:
-                        if 'Google Canonical' in insp_df.columns and 'User Canonical' in insp_df.columns:
-                            mismatches = insp_df[
-                                (insp_df['Google Canonical'] != 'N/A') & 
-                                (insp_df['Google Canonical'] != insp_df['User Canonical'])
-                            ]
-                            if not mismatches.empty:
-                                st.error(f"⚠️ Found {len(mismatches)} Canonical Mismatches (Google chose differently)")
-                                st.dataframe(mismatches, use_container_width=True)
-                            else:
-                                st.success("✅ Google respects all your canonical tags.")
-
-                        st.dataframe(insp_df, use_container_width=True)
-                        csv_insp = insp_df.to_csv(index=False).encode('utf-8')
-                        st.download_button("📥 Download Inspection Report", csv_insp, "indexing_report.csv", "text/csv")
-            else:
-                st.warning("⚠️ No URLs found to inspect. Please run a Crawl (List Mode) or Fetch Performance Data first.")
-                
-    # --- 3. GOOGLE INDEXING API MODULE ---
-            st.divider()
-            st.write("### 🚀 3. Bulk Indexing API (Force Indexing)")
-            st.info("Directly ping Google to crawl/index these URLs immediately. **Limit: 200 per day.** Ensure your Service Account is added as an 'Owner' in GSC.")
-            
-            # Check if the user uploaded the JSON key in the sidebar
-            if 'last_gsc_key' not in st.session_state or not st.session_state.last_gsc_key:
-                st.warning("⚠️ Please upload your Service Account JSON Key in the sidebar first.")
-            else:
-                c_idx1, c_idx2 = st.columns([2, 1])
-                
-                with c_idx1:
-                    # Provide options from crawled data if available
-                    avail_urls = df['url'].tolist() if (df is not None and not df.empty) else []
-                    selected_index_urls = st.multiselect(
-                        "Select Crawled URLs to Submit:", 
-                        options=avail_urls,
-                        help="Select URLs from your current crawl."
-                    )
-                    
-                    # Also allow manual pasting for quick jobs without crawling
-                    manual_index_urls = st.text_area("Or Paste URLs (One per line):", placeholder="https://mysite.com/new-post")
-                
-                with c_idx2:
-                    indexing_action = st.radio(
-                        "Action Type:", 
-                        ["URL_UPDATED", "URL_DELETED"], 
-                        help="UPDATED = Add/Refresh page. DELETED = Remove page from Google."
-                    )
-                
-                if st.button("🚀 Ping Google Indexing API"):
-                    # Combine selected URLs and manually pasted URLs, then remove duplicates
-                    final_urls = list(set(selected_index_urls + [u.strip() for u in manual_index_urls.split('\n') if u.strip()]))
-                    
-                    if not final_urls:
-                        st.error("❌ Please provide at least one URL.")
-                    elif len(final_urls) > 200:
-                        st.error(f"❌ You selected {len(final_urls)} URLs. The default daily limit is 200. Please reduce your list.")
-                    else:
-                        with st.spinner(f"Pinging Google for {len(final_urls)} URLs..."):
-                            # Call our new helper function
-                            idx_results_df = submit_to_indexing_api(
-                                st.session_state.last_gsc_key, 
-                                final_urls, 
-                                indexing_action
-                            )
-                            
-                            st.success("✅ Submission Process Complete!")
-                            st.dataframe(
-                                idx_results_df, 
-                                use_container_width=True,
-                                column_config={
-                                    "URL": st.column_config.LinkColumn("Target URL"),
-                                    "Status": st.column_config.TextColumn("Status", width="small"),
-                                    "Details": st.column_config.TextColumn("API Response")
-                                }
-                            )
-                            
-                            csv_idx = idx_results_df.to_csv(index=False).encode('utf-8')
-                            st.download_button("📥 Download Submission Report", csv_idx, "indexing_api_report.csv", "text/csv")
-    
-    with tab_competitor:
-        st.subheader("⚔️ The Ultimate Deep SEO Analysis")
-        st.info("Analyzes architecture, semantic gaps, CWV, and deep site-wide interlinking.")
-        
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            my_url_input = st.text_input("Your Page URL", key="adv_my_url", placeholder="https://mysite.com/page")
-            keywords_input = st.text_area("Target Keywords (Comma separated)", key="adv_kws", placeholder="seo tools, python script")
-            
-            # --- NEW TOGGLES ---
-            st.write("**Deep Crawl Settings**")
-            enable_deep_inlinks = st.checkbox("🕷️ Crawl Entire Website for Inlinks", help="Finds exact number of internal pages pointing to the target. WARNING: Very slow!")
-            max_inlink_pages = st.number_input("Max pages to crawl per domain (if enabled)", 50, 5000, 200, step=50)
-
-        with c2:
-            competitors_input = st.text_area("Competitor URLs (1 per line)", height=220, key="adv_comps")
-
-        if st.button("🚀 Run The Ultimate Analysis"):
-            if not my_url_input or not competitors_input or not keywords_input:
-                st.error("⚠️ Fill in all fields.")
-            else:
-                comps = [u.strip() for u in competitors_input.split('\n') if u.strip()]
-                keywords = [k.strip().lower() for k in keywords_input.split(',') if k.strip()]
-                all_urls = [my_url_input] + comps
-                
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                results_data = []
-                
-                crawler_comp = UltraFrogCrawler() 
-                
-                with ThreadPoolExecutor(max_workers=3) as executor:
-                    future_to_url = {executor.submit(crawler_comp.extract_page_data, u): u for u in all_urls}
-                    
-                    for i, future in enumerate(as_completed(future_to_url)):
-                        url = future_to_url[future]
-                        status_text.text(f"Fetching Advanced Metrics: {url}")
-                        
+                    if 'x' in str(real) and 'x' in str(vis_d) and real != 'Not Checked' and vis_d != 'Not Scanned':
                         try:
-                            # 1. Main Crawler Data
-                            data = future.result()
-                            parsed_url = urlparse(url)
-                            domain = parsed_url.netloc.lower()
-                            
-                            # 2. Secondary HTML parsing for advanced tags
-                            try:
-                                r = requests.get(url, timeout=8, headers={'User-Agent': 'Mozilla/5.0'})
-                                soup = BeautifulSoup(r.content, 'html.parser')
-                                
-                                list_count = len(soup.find_all(['ul', 'ol']))
-                                table_count = len(soup.find_all('table'))
-                                video_count = len(soup.find_all(['iframe', 'video']))
-                                
-                                # Paragraph analysis
-                                paragraphs = soup.find_all('p')
-                                p_lengths = [len(p.get_text().split()) for p in paragraphs if len(p.get_text().strip()) > 0]
-                                avg_p_len = sum(p_lengths) / len(p_lengths) if p_lengths else 0
-                                
-                                publish_date = extract_publish_date(soup)
-                            except:
-                                list_count, table_count, video_count, avg_p_len, publish_date = 0, 0, 0, 0, "Unknown"
-                            
-                            # Content variables
-                            title = str(data.get('title', ''))
-                            desc = str(data.get('meta_description', ''))
-                            h1 = str(data.get('h1_tags', '')).lower()
-                            h2 = str(data.get('h2_tags', '')).lower()
-                            h3 = str(data.get('h3_tags', '')).lower()
-                            body = str(data.get('scope_content', ''))
-                            body_lower = body.lower()
-                            
-                            alts = " ".join([str(img.get('alt', '')).lower() for img in data.get('images', [])])
-                            word_count = data.get('word_count', 0)
-                            image_count = data.get('image_count', 0)
-                            first_100_words = " ".join(body_lower.split()[:100])
-                            
-                            word_to_img_ratio = round(word_count / image_count, 1) if image_count > 0 else word_count
-                            readability = textstat.flesch_reading_ease(body) if body else 0
-                            domain_age = get_domain_age(domain)
-                            
-                            # External Link Analysis (Nofollow Ratio)
-                            ext_links = data.get('external_links', [])
-                            nofollow_count = sum(1 for link in ext_links if 'nofollow' in link.get('rel_status', ''))
-                            ext_total = len(ext_links)
-                            nofollow_ratio = f"{int((nofollow_count/ext_total)*100)}%" if ext_total > 0 else "0%"
-                            
-                            # Deep Site Crawl for Inlinks
-                            total_inlinks_to_page = "Skipped"
-                            if enable_deep_inlinks:
-                                status_text.text(f"🕷️ Deep Crawling {domain} to find inlinks...")
-                                total_inlinks_to_page = deep_crawl_for_inlinks(url, max_pages=max_inlink_pages)
-                            
-                            # Keyword Zones & Fuzzy Logic
-                            kw_stats = {}
-                            for kw in keywords:
-                                fuzzy_count = count_fuzzy_match(body, kw)
-                                kw_stats[kw] = {
-                                    'Domain': domain.count(kw), 'URL': parsed_url.path.lower().count(kw),
-                                    'Title': title.lower().count(kw), 'Desc': desc.lower().count(kw),
-                                    'H1': h1.count(kw), 'H2': h2.count(kw), 'H3': h3.count(kw),
-                                    'Alt': alts.count(kw), 'Body Exact': body_lower.count(kw),
-                                    'Body Fuzzy': fuzzy_count,
-                                    'In First 100': "✅" if kw in first_100_words else "❌"
-                                }
-
-                            # PSI with Core Web Vitals
-                            lcp, cls, mobile_score = "N/A", "N/A", "N/A"
-                            if psi_api_key:
-                                status_text.text(f"Running PSI: {url}")
-                                m_res = run_psi_test(url, psi_api_key, "mobile")
-                                if isinstance(m_res, dict) and "Score" in m_res:
-                                    mobile_score = m_res['Score']
-                                    lcp = m_res.get('LCP', 'N/A')
-                                    cls = m_res.get('CLS', 'N/A')
-
-                            results_data.append({
-                                'Type': '🟦 ME' if url == my_url_input else '🟥 COMP',
-                                'URL': url,
-                                'Date Published': publish_date,
-                                'Domain Age': domain_age,
-                                'Readability': round(readability, 1),
-                                'Word Count': word_count,
-                                'Avg Paragraph': f"{round(avg_p_len)} words",
-                                'Title / Meta Length': f"{len(title)} / {len(desc)}",
-                                'H2 / H3 Count': f"{data.get('h2_count', 0)} / {data.get('h3_count', 0)}",
-                                'Word/Img Ratio': f"{word_to_img_ratio}:1",
-                                'Media (Vid/List/Tab)': f"{video_count} / {list_count} / {table_count}",
-                                'On-Page Internal Links': data.get('internal_links_count', 0),
-                                'Total Inlinks (Whole Site)': total_inlinks_to_page, # NEW METRIC
-                                'External Outbound': f"{ext_total} (Nofollow: {nofollow_ratio})",
-                                'Schema': data.get('schema_types', 'None'),
-                                'CWV (Score | LCP | CLS)': f"{mobile_score} | {lcp} | {cls}",
-                                'Keywords': kw_stats,
-                                'RawBody': body
-                            })
-                            
-                        except Exception as e:
-                            st.error(f"Failed {url}: {e}")
-                            
-                        progress_bar.progress((i + 1) / len(all_urls))
-                
-                status_text.success("✅ Deep Analysis Complete!")
-                
-                # --- VISUALIZATION ---
-                
-                # Separate "Me" and "Competitors" for easy column building
-                my_data = next((item for item in results_data if 'ME' in item['Type']), None)
-                comp_data = [item for item in results_data if 'COMP' in item['Type']]
-                
-                # Helper to get clean domain names for column headers
-                def get_clean_domain(url_str):
-                    return urlparse(url_str).netloc.replace('www.', '')
-
-                st.write("### 🏗️ 1. Content & Technical Architecture")
-                st.markdown("Side-by-side structural comparison. **Metrics are rows, Websites are columns.**")
-                
-                if my_data:
-                    # Define the metrics we want to compare
-                    metrics_keys = [
-                        'Word Count', 'Readability', 'H2 / H3 Count', 'Images', 
-                        'Word/Img Ratio', 'Media (Vid/List/Tab)', 'On-Page Internal Links', 
-                        'Total Inlinks (Whole Site)', 'External Outbound', 'Schema', 
-                        'Domain Age', 'Date Published', 'CWV (Score | LCP | CLS)'
-                    ]
-                    
-                    t1_rows = []
-                    for metric in metrics_keys:
-                        row = {"Metric": metric}
-                        row["🫵 My Page"] = my_data.get(metric, "N/A")
+                            rw, rh = map(int, real.split('x'))
+                            vw, vh = map(int, vis_d.split('x'))
+                            if vw > 0 and rw < vw: status.append("⚠️ Pixelated (Real < Visible)")
+                            if vw > 0 and rw > (vw * 3): status.append("⚠️ Too Big (Real > 3x Visible)")
+                        except: pass
                         
-                        for i, comp in enumerate(comp_data):
-                            col_name = f"Comp {i+1} ({get_clean_domain(comp['URL'])})"
-                            row[col_name] = comp.get(metric, "N/A")
-                            
-                        t1_rows.append(row)
-                        
-                    struct_df = pd.DataFrame(t1_rows)
-                    st.dataframe(struct_df, use_container_width=True)
-                else:
-                    st.error("Could not fetch data for 'Your Page URL'.")
+                    if not status: return "✅ Good"
+                    return " | ".join(status)
 
-                st.divider()
+                if not img_df.empty:
+                    img_df['Analysis'] = img_df.apply(analyze_image_status, axis=1)
 
-                st.write("### 🎯 2. Keyword Zone Matrix")
-                st.info("Select a keyword below to see exactly which HTML tags your competitors placed it in.")
-                
-                if my_data:
-                    kw_tabs = st.tabs(keywords)
-                    flat_kw_export = [] # For CSV download later
-                    
-                    for i, kw in enumerate(keywords):
-                        with kw_tabs[i]:
-                            zones = ['Body Exact', 'Body Fuzzy', 'In First 100 Words?', 'Title', 'H1', 'H2', 'H3', 'Meta Desc', 'Img Alt', 'URL', 'Domain']
-                            kw_rows = []
-                            
-                            for zone in zones:
-                                row = {"HTML Zone": zone}
-                                my_val = my_data['Keywords'][kw].get(zone, 0)
-                                row["🫵 My Page"] = my_val
-                                
-                                comp_vals_for_avg = []
-                                for j, comp in enumerate(comp_data):
-                                    comp_val = comp['Keywords'][kw].get(zone, 0)
-                                    col_name = f"Comp {j+1} ({get_clean_domain(comp['URL'])})"
-                                    row[col_name] = comp_val
-                                    
-                                    if isinstance(comp_val, (int, float)):
-                                        comp_vals_for_avg.append(comp_val)
-                                
-                                # Calculate Average
-                                if comp_vals_for_avg:
-                                    avg = sum(comp_vals_for_avg) / len(comp_vals_for_avg)
-                                    row["Competitor Avg"] = round(avg, 1)
-                                    
-                                    # Status indicator for numeric zones
-                                    if isinstance(my_val, (int, float)):
-                                        if my_val < avg: row["Status"] = "📉 Below Avg"
-                                        elif my_val > avg * 2: row["Status"] = "📈 High (Careful)"
-                                        else: row["Status"] = "✅ Optimal"
-                                else:
-                                    row["Competitor Avg"] = "N/A"
-                                    row["Status"] = "-"
-                                    
-                                kw_rows.append(row)
-                                
-                                # Save for flat CSV export
-                                flat_row = {"Keyword": kw, **row}
-                                flat_kw_export.append(flat_row)
-                            
-                            kw_df = pd.DataFrame(kw_rows)
-                            st.dataframe(kw_df, use_container_width=True)
+                cols_order = ['image_url', 'status_code', 'size_kb', 'source_url', 'alt_text', 'html_dimensions', 'real_dimensions', 'Analysis']
+                final_cols = cols_order + [c for c in img_df.columns if c not in cols_order]
 
-                st.divider()
-
-                # --- 3. LSI / TF-IDF N-GRAM GAP ANALYSIS ---
-                st.write("### 🧠 3. Semantic LSI Gap Analysis")
-                st.markdown("Top 2-word and 3-word phrases used by competitors. See exactly who is using which sub-topics.")
-                
-                try:
-                    comp_data = [r for r in results_data if 'COMP' in r['Type']]
-                    comp_bodies = [r['RawBody'] for r in comp_data]
-                    my_body = my_data['RawBody'].lower() if my_data else ""
-                    
-                    if comp_bodies:
-                        vec = CountVectorizer(ngram_range=(2, 3), stop_words='english', max_features=30)
-                        matrix = vec.fit_transform(comp_bodies)
-                        sums = matrix.sum(axis=0).A1
-                        vocab = vec.get_feature_names_out()
-                        
-                        freq = [(vocab[idx], sums[idx]) for idx in range(len(vocab))]
-                        freq = sorted(freq, key=lambda x: x[1], reverse=True)
-                        
-                        lsi_data = []
-                        for phrase, total_count in freq[:20]:
-                            my_usage_count = my_body.count(phrase)
-                            status = "✅ Used" if my_usage_count > 0 else "❌ Missing"
-                            
-                            # Start building the row dictionary
-                            row_data = {
-                                "Semantic Phrase (LSI)": phrase,
-                                "🫵 My Page": my_usage_count,
-                            }
-                            
-                            # Dynamically add a column for each competitor and count their specific usage
-                            for i, comp in enumerate(comp_data):
-                                col_name = f"Comp {i+1} ({get_clean_domain(comp['URL'])})"
-                                row_data[col_name] = comp['RawBody'].lower().count(phrase)
-                                
-                            # Add the status at the very end so it sits on the far right
-                            row_data["Gap Status"] = status
-                            lsi_data.append(row_data)
-                            
-                        lsi_df = pd.DataFrame(lsi_data)
-                        st.dataframe(
-                            lsi_df, 
-                            use_container_width=True,
-                            column_config={
-                                "Gap Status": st.column_config.TextColumn("Status", width="small")
-                            }
-                        )
-                    else:
-                        st.warning("Not enough competitor data to generate LSI keywords.")
-                except Exception as e:
-                    st.error(f"Could not generate LSI phrases: {e}")
-
-                # --- CSV EXPORTS ---
-                st.markdown("<br>", unsafe_allow_html=True)
-                c_btn1, c_btn2, c_btn3 = st.columns(3)
-                
-                if 'struct_df' in locals():
-                    c_btn1.download_button("📥 Download Architecture", struct_df.to_csv(index=False).encode('utf-8'), "competitor_structure.csv", "text/csv")
-                if 'flat_kw_export' in locals() and flat_kw_export:
-                    flat_df = pd.DataFrame(flat_kw_export)
-                    c_btn2.download_button("📥 Download Keyword Matrix", flat_df.to_csv(index=False).encode('utf-8'), "competitor_keywords.csv", "text/csv")
-                if 'lsi_df' in locals():
-                    c_btn3.download_button("📥 Download LSI Gaps", lsi_df.to_csv(index=False).encode('utf-8'), "lsi_gaps.csv", "text/csv")
-    
-    with tab_audit:
-        st.subheader("📅 AI Content Relevance & Freshness Auditor")
-        st.info("Identify 'Stale' or 'Zombie' pages that need to be updated or removed based on current real-world relevance.")
-        
-        c1, c2 = st.columns(2)
-        with c1:
-            aud_provider = st.selectbox("AI Provider", ["Gemini", "OpenAI Compatible (Groq/Ollama/OpenAI)"], key="aud_p")
-            aud_key = st.text_input("API Key (or Ollama URL if empty)", type="password", key="aud_k")
-        with c2:
-            # Note: I am inserting the Groq model name Kamal uses here!
-            aud_model = st.text_input("Model", value="gemini-1.5-flash" if aud_provider=="Gemini" else "llama-3.3-70b-versatile", key="aud_m")
-            aud_url = st.text_input("Endpoint (if needed)", value="https://api.groq.com/openai/v1/chat/completions", key="aud_u")
-
-        # FIX 3: Added a 'Custom Select' option to prevent API rate limits
-        audit_scope = st.radio("Audit Scope:", ["Selected Pages (Custom)", "Top 10 High Traffic (GSC Needed)", "All Indexable Pages (WARNING: High API Cost)"], horizontal=True)
-
-        targets_to_audit = []
-        if audit_scope == "Selected Pages (Custom)":
-            selected_urls = st.multiselect("Select URLs to Audit", df['url'].tolist(), default=df['url'].head(3).tolist())
-            targets_to_audit = df[df['url'].isin(selected_urls)].to_dict('records')
-            
-        elif audit_scope == "Top 10 High Traffic (GSC Needed)":
-            if 'gsc_merged_data' in st.session_state and not st.session_state.gsc_merged_data.empty:
-                targets_to_audit = st.session_state.gsc_merged_data.sort_values(by='GSC Clicks', ascending=False).head(10).to_dict('records')
-            else:
-                st.warning("⚠️ No GSC Data found. Please fetch GSC data in the 'GSC Data' tab first.")
-                
-        else:
-            targets_to_audit = df[df['indexability'] == 'Indexable'].to_dict('records')
-            st.warning(f"⚠️ You are about to send {len(targets_to_audit)} pages to the AI API. This may take a while.")
-
-        if st.button("🚀 Start Content Audit"):
-            if not aud_key and aud_provider == "Gemini":
-                st.error("⚠️ Please enter an API key to run the audit.")
-            elif not targets_to_audit:
-                st.error("⚠️ No target URLs found to audit.")
-            else:
-                progress_aud = st.progress(0)
-                status_aud = st.empty()
-                audit_results = []
-                
-                # Reduced max_workers to 2 to prevent Groq API rate limiting
-                with ThreadPoolExecutor(max_workers=2) as executor:
-                    futures = [executor.submit(analyze_content_freshness, t['url'], t.get('title', ''), t.get('scope_content', ''), aud_provider, aud_key, aud_model, aud_url) for t in targets_to_audit]
-                    for i, f in enumerate(as_completed(futures)):
-                        audit_results.append(f.result())
-                        progress_aud.progress((i + 1) / len(targets_to_audit))
-                        status_aud.text(f"Audited {i + 1}/{len(targets_to_audit)}")
-                
-                aud_res_df = pd.DataFrame(audit_results)
-                st.session_state.content_audit_data = aud_res_df
-                status_aud.success("✅ Audit Complete!")
-
-        # --- DISPLAY RESULTS ---
-        if 'content_audit_data' in st.session_state and not st.session_state.content_audit_data.empty:
-            res = st.session_state.content_audit_data
-            
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("KEEP", len(res[res['Decision'] == 'KEEP']))
-            m2.metric("UPDATE", len(res[res['Decision'] == 'UPDATE']), delta_color="off")
-            m3.metric("REMOVE", len(res[res['Decision'] == 'REMOVE']), delta="-"+str(len(res[res['Decision'] == 'REMOVE'])))
-            m4.metric("ERRORS", len(res[res['Decision'] == 'ERROR']))
-            
-            st.dataframe(res, use_container_width=True, column_config={
-                "Decision": st.column_config.SelectboxColumn("Decision", options=["KEEP", "UPDATE", "REMOVE", "UNKNOWN", "ERROR"]),
-                "URL": st.column_config.LinkColumn("Page URL")
-            })
-            
-            csv_aud = res.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download Audit Report", csv_aud, "content_audit.csv", "text/csv")
-
-       # --- NEW SECTION: GRAMMAR CHECKER (UPDATED) ---
-        st.markdown("---")
-        st.subheader("📝 Grammar & Spelling Auditor")
-        st.info("Checks for spelling and grammar errors. Works for any website.")
-
-        if not HAS_LT:
-            st.error("❌ `language_tool_python` is missing. Please run: `pip install language_tool_python`")
-        else:
-            gram_scope = st.radio("Grammar Scope:", ["Selected Pages Only (Use Filter below)", "All Pages (Slow)"], horizontal=True)
-            
-            # Allow filtering to test first
-            if gram_scope == "Selected Pages Only (Use Filter below)":
-                gram_targets = st.multiselect("Select URLs to Check:", df['url'].tolist(), default=df['url'].head(3).tolist())
-            else:
-                gram_targets = df['url'].tolist()
-
-            if st.button("🔍 Check Grammar & Spelling"):
-                if not gram_targets:
-                    st.warning("No pages selected.")
-                else:
-                    progress_gram = st.progress(0)
-                    status_gram = st.empty()
-                    gram_results = []
-                    
-                    # 1. Initialize Tool
-                    tool = None
-                    use_cloud_fallback = False
-                    
-                    try:
-                        status_gram.text("Initializing LanguageTool...")
-                        tool = language_tool_python.LanguageTool('en-US') 
-                    except Exception:
-                        status_gram.text("⚠️ Java missing. Switching to Cloud API...")
-                        use_cloud_fallback = True
-
-                    total_g = len(gram_targets)
-                    
-                    for i, u in enumerate(gram_targets):
-                        # Find data row
-                        row_data = df[df['url'] == u].iloc[0]
-                        
-                        # Fields to check
-                        check_map = {
-                            'Title': row_data.get('title', ''),
-                            'H1': row_data.get('h1_tags', ''),
-                            'Meta Desc': row_data.get('meta_description', ''),
-                            'Content': row_data.get('scope_content', '')[:2500] # Check first 2500 chars
-                        }
-                        
-                        for field, text in check_map.items():
-                            if text and len(text) > 5:
-                                matches = []
-                                
-                                # A. Use Library (Local Java)
-                                if tool:
-                                    try:
-                                        lt_matches = tool.check(text)
-                                        for m in lt_matches:
-                                            matches.append({
-                                                'replacements': m.replacements[:3],
-                                                'offset': m.offset,
-                                                'length': m.errorLength
-                                            })
-                                    except: pass
-                                
-                                # B. Use Cloud Fallback (No Java)
-                                elif use_cloud_fallback:
-                                    matches = check_grammar_cloud(text)
-                                    time.sleep(0.3) # Rate limit
-                                
-                                # Process Matches into Clean Table
-                                for m in matches:
-                                    # Extract the specific wrong word using offset slicing
-                                    start = m['offset']
-                                    end = m['offset'] + m['length']
-                                    wrong_word = text[start:end]
-                                    
-                                    # Skip if it extracted nothing or just whitespace
-                                    if not wrong_word.strip():
-                                        continue
-
-                                    gram_results.append({
-                                        'Page URL': u,
-                                        'Location': field,
-                                        'Wrong Spelling': wrong_word,
-                                        'Correct Spelling': ", ".join(m['replacements'])
-                                    })
-                        
-                        progress_gram.progress((i + 1) / total_g)
-                        status_gram.text(f"Checking {i+1}/{total_g}: {u}")
-
-                    st.session_state.grammar_audit_data = pd.DataFrame(gram_results)
-                    status_gram.success("✅ Grammar Check Complete!")
-
-            # Display Results
-            if 'grammar_audit_data' in st.session_state and not st.session_state.grammar_audit_data.empty:
-                gdf = st.session_state.grammar_audit_data
-                
-                st.write(f"**Found {len(gdf)} potential errors.**")
-                
-                # Simple Clean Table
                 st.dataframe(
-                    gdf, 
-                    use_container_width=True,
+                    img_df[final_cols], 
+                    use_container_width=True, 
                     column_config={
-                        "Page URL": st.column_config.LinkColumn("Page"),
-                        "Wrong Spelling": st.column_config.TextColumn("Wrong Spelling", width="small"),
-                        "Correct Spelling": st.column_config.TextColumn("Correct Spelling", width="medium"),
+                        "image_url": st.column_config.LinkColumn("Image Link"),
+                        "source_url": st.column_config.LinkColumn("Found On Page"),
+                        "size_kb": st.column_config.NumberColumn("KB", format="%.2f"),
+                        "status_code": st.column_config.TextColumn("HTTP Status", width="small"),
                     }
                 )
                 
-                csv_gram = gdf.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Download Spelling Report", csv_gram, "spelling_report.csv", "text/csv")
-            elif 'grammar_audit_data' in st.session_state:
-                st.info("No spelling errors found in the selected pages.")
+                csv_img = img_df.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Download Image Report", csv_img, "images_report.csv", "text/csv")
 
-    st.markdown("---")
-    st.header("📥 Full Report")
-    
-    if st.session_state.storage_mode == "SQLite" and os.path.exists(st.session_state.db_file):
-        with open(st.session_state.db_file, "rb") as file:
-            st.download_button("📊 Download Complete Database (SQLite)", file, "battersea_data.db", "application/octet-stream")
+                st.divider()
+                st.subheader("📉 Optimize & Resize Images")
+                
+                if not HAS_PIL:
+                    st.error("❌ 'Pillow' library missing. Run `pip install Pillow`")
+                else:
+                    st.info("Resize images to match their rendered size (Step 1) and then compress them (Step 2).")
+                    
+                    c1, c2, c3, c4 = st.columns(4)
+                    min_kb = c1.number_input("Filter Min KB:", 0, 10000, 100)
+                    reduc_pct = c2.slider("Quality %", 10, 90, 50, help="Lower = Smaller File")
+                    target_fmt_ui = c3.selectbox("Format", ["WebP", "JPEG", "PNG", "Original"])
+                    
+                    resize_mode = c4.selectbox("Resize To:", ["Original Size Only (No Resize)", "Desktop Rendered Size", "Mobile Rendered Size", "Both Desktop & Mobile"])
+
+                    if st.button("✨ Optimize Images", type="primary"):
+                        out_dir = "optimized_images"
+                        if not os.path.exists(out_dir): os.makedirs(out_dir)
+
+                        candidates = img_df[img_df['size_kb'] >= min_kb].drop_duplicates(subset=['image_url'])
+                        
+                        if candidates.empty:
+                            st.warning("No images found matching your size filter.")
+                        else:
+                            progress = st.progress(0)
+                            status = st.empty()
+                            report_data = []
+                            
+                            target_urls = candidates['image_url'].tolist()
+                            
+                            def process_variant(img_obj, url, variant_label, target_w, target_h, original_kb, original_dims_str, old_fmt):
+                                try:
+                                    if target_w and target_h:
+                                        img_obj = img_obj.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                                    
+                                    new_dims_str = f"{img_obj.width}x{img_obj.height}"
+                                    
+                                    if target_fmt_ui == "Original": fmt = old_fmt
+                                    elif target_fmt_ui == "WebP": fmt = "WEBP"
+                                    elif target_fmt_ui == "JPEG": fmt = "JPEG"
+                                    elif target_fmt_ui == "PNG": fmt = "PNG"
+                                    else: fmt = old_fmt
+
+                                    if img_obj.mode in ("RGBA", "P") and fmt in ["JPEG"]:
+                                        img_obj = img_obj.convert("RGB")
+                                    
+                                    buf = io.BytesIO()
+                                    save_args = {'format': fmt, 'optimize': True}
+                                    if fmt in ['JPEG', 'WEBP']: save_args['quality'] = reduc_pct
+                                    
+                                    img_obj.save(buf, **save_args)
+                                    new_data = buf.getvalue()
+                                    new_size_kb = len(new_data) / 1024
+
+                                    base_name = url.split('/')[-1].split('?')[0].split('.')[0]
+                                    if not base_name: base_name = f"img_{uuid.uuid4().hex[:6]}"
+                                    base_name = "".join([c for c in base_name if c.isalnum() or c in '_-'])
+                                    
+                                    suffix = f"_{variant_label.lower()}" if variant_label != "Original" else ""
+                                    filename = f"{base_name}{suffix}.{fmt.lower()}"
+                                    local_path = os.path.abspath(os.path.join(out_dir, filename))
+                                    
+                                    with open(local_path, "wb") as f: f.write(new_data)
+                                    
+                                    return {
+                                        "Original URL": url,
+                                        "Variant": variant_label,
+                                        "Old Size KB": round(original_kb, 2),
+                                        "New Size KB": round(new_size_kb, 2),
+                                        "Before Dimension": original_dims_str,
+                                        "New Dimension": new_dims_str,
+                                        "Old Format": old_fmt,
+                                        "New Format": fmt,
+                                        "Path": local_path
+                                    }
+                                except Exception as e:
+                                    return None
+
+                            def process_image_row(row_tuple):
+                                url = row_tuple.image_url
+                                
+                                desk_render = row_tuple.rendered_desktop
+                                mob_render = row_tuple.rendered_mobile
+                                
+                                try:
+                                    r = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'}, verify=False)
+                                    if r.status_code != 200: return []
+                                    
+                                    original_kb = len(r.content) / 1024
+                                    img_org = Image.open(io.BytesIO(r.content))
+                                    original_dims_str = f"{img_org.width}x{img_org.height}"
+                                    old_fmt = img_org.format if img_org.format else 'JPEG'
+
+                                    results = []
+                                    tasks = []
+                                    
+                                    if resize_mode == "Original Size Only (No Resize)":
+                                        tasks.append((None, None, "Original"))
+                                        
+                                    elif resize_mode == "Desktop Rendered Size":
+                                        if desk_render and 'x' in desk_render and desk_render != 'Not Scanned':
+                                            dw, dh = map(int, desk_render.split('x'))
+                                            tasks.append((dw, dh, "Desktop"))
+                                        else:
+                                            tasks.append((None, None, "Skipped (Missing Data)"))
+                                            
+                                    elif resize_mode == "Mobile Rendered Size":
+                                        if mob_render and 'x' in mob_render and mob_render != 'Not Scanned':
+                                            mw, mh = map(int, mob_render.split('x'))
+                                            tasks.append((mw, mh, "Mobile"))
+                                        else:
+                                            tasks.append((None, None, "Skipped (Missing Data)"))
+
+                                    elif resize_mode == "Both Desktop & Mobile":
+                                        if desk_render and 'x' in desk_render and desk_render != 'Not Scanned':
+                                            dw, dh = map(int, desk_render.split('x'))
+                                            tasks.append((dw, dh, "Desktop"))
+                                        else:
+                                            tasks.append((None, None, "Skipped (Missing Data)"))
+                                        
+                                        if mob_render and 'x' in mob_render and mob_render != 'Not Scanned':
+                                            mw, mh = map(int, mob_render.split('x'))
+                                            tasks.append((mw, mh, "Mobile"))
+
+                                    for w, h, label in tasks:
+                                        res = process_variant(img_org.copy(), url, label, w, h, original_kb, original_dims_str, old_fmt)
+                                        if res: results.append(res)
+                                        
+                                    return results
+
+                                except Exception: return []
+
+                            with ThreadPoolExecutor(max_workers=5) as exe:
+                                futures = [exe.submit(process_image_row, row) for row in candidates.itertuples()]
+                                for i, f in enumerate(as_completed(futures)):
+                                    res_list = f.result()
+                                    if res_list: report_data.extend(res_list)
+                                    progress.progress((i + 1) / len(candidates))
+                                    status.text(f"Processing: {i+1}/{len(candidates)}")
+
+                            if report_data:
+                                st.success(f"✅ Generated {len(report_data)} optimized images!")
+                                rep_df = pd.DataFrame(report_data)
+                                st.dataframe(rep_df, use_container_width=True)
+                                
+                                csv_rep = rep_df.to_csv(index=False).encode('utf-8')
+                                st.download_button("📥 Download Full Report", csv_rep, "conversion_report.csv", "text/csv")
+                            else:
+                                st.warning("No images processed successfully.")
+
+            else:
+                st.info("No images found.")
+
+            # --- 6. OFFLINE BULK IMAGE OPTIMIZER ---
+            st.divider()
+            st.subheader("🗜️ Offline Bulk Image Optimizer")
+            st.info("Upload heavy images. This tool will resize them, compress them, and convert them to SEO-friendly WebP format.")
+
+            uploaded_images = st.file_uploader("Upload Images (JPG, PNG)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+
+            c_opt1, c_opt2 = st.columns(2)
+            max_width_bulk = c_opt1.number_input("Max Width (px) - Good for Hero images", value=1200, step=100)
+            quality_bulk = c_opt2.slider("WebP Quality (1-100)", min_value=10, max_value=100, value=75, help="75 is the sweet spot for SEO.")
+
+            if uploaded_images and st.button("🚀 Compress & Convert to WebP", type="primary"):
+                with st.spinner("Compressing images..."):
+                    zip_buffer = io.BytesIO()
+                    
+                    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+                        for img_file in uploaded_images:
+                            try:
+                                img = Image.open(img_file)
+                                if img.mode in ("RGBA", "P"):
+                                    img = img.convert("RGB")
+                                    
+                                if img.width > max_width_bulk:
+                                    ratio = max_width_bulk / float(img.width)
+                                    new_height = int((float(img.height) * float(ratio)))
+                                    img = img.resize((max_width_bulk, new_height), Image.Resampling.LANCZOS)
+                                    
+                                img_byte_arr = io.BytesIO()
+                                img.save(img_byte_arr, format='WEBP', quality=quality_bulk, optimize=True)
+                                
+                                original_name = img_file.name.rsplit('.', 1)[0]
+                                zip_file.writestr(f"{original_name}_optimized.webp", img_byte_arr.getvalue())
+                                
+                            except Exception as e:
+                                st.error(f"Failed to process {img_file.name}: {e}")
+                                
+                    st.success("✅ Compression Complete!")
+                    
+                    st.download_button(
+                        label="📥 Download All Optimized WebP Images (ZIP)",
+                        data=zip_buffer.getvalue(),
+                        file_name="seo_optimized_images.zip",
+                        mime="application/zip"
+                    )
+
+        with tab_meta_titles:
+            st.subheader("📝 Meta Tags & Titles Analysis")
+            meta_view = df[['url', 'title', 'title_length', 'meta_description', 'meta_desc_length', 'h1_tags']].copy()
+            st.dataframe(meta_view, use_container_width=True)
+            csv_meta = meta_view.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download All Meta Data", csv_meta, "meta_titles.csv", "text/csv")
+
+            st.divider()
+            with st.expander("✨ AI Content Generator (Titles & Meta)", expanded=False):
+                st.info("Generate missing or improved tags using AI.")
+                
+                c1, c2 = st.columns(2)
+                provider = c1.selectbox("Provider", ["Gemini", "OpenAI Compatible (Groq/Ollama/OpenAI)"])
+                api_key_gen = c2.text_input("API Key (Leave empty for Ollama)", type="password")
+                
+                c3, c4 = st.columns(2)
+                model_name = c3.text_input("Model Name", value="gemini-1.5-flash" if provider=="Gemini" else "lama-3.1-8b-instant")
+                endpoint = c4.text_input("Endpoint URL (OpenAI/Ollama Only)", value="https://api.groq.com/openai/v1/chat/completions")
+                
+                action_type = st.radio("I want to generate:", ["Titles Only", "Meta Descriptions Only"], horizontal=True)
+                filter_mode = st.radio("Generate for:", ["Only Missing Items (Empty)", "Regenerate All"], horizontal=True)
+                
+                if st.button("🚀 Generate Content", type="primary"):
+                    if action_type == "Titles Only":
+                        if filter_mode == "Only Missing Items (Empty)":
+                            targets = meta_view[meta_view['title_length'] == 0].copy()
+                        else:
+                            targets = meta_view.copy()
+                    else: 
+                        if filter_mode == "Only Missing Items (Empty)":
+                            targets = meta_view[meta_view['meta_desc_length'] == 0].copy()
+                        else:
+                            targets = meta_view.copy()
+                    
+                    if targets.empty:
+                        st.warning("No pages match your criteria.")
+                    else:
+                        st.write(f"Generating for {len(targets)} pages...")
+                        progress_gen = st.progress(0)
+                        results_gen = []
+                        
+                        def process_gen_row(row):
+                            content_snippet = str(row.get('scope_content', df[df['url'] == row['url']]['scope_content'].values[0]))[:2000] 
+                            
+                            if action_type == "Titles Only":
+                                context = f"Current H1: {row.get('h1_tags', '')}\nPage Content: {content_snippet}"
+                                prompt = f"""
+                                Act as a Senior SEO Copywriter. Generate ONE highly optimized SEO Title tag for this webpage.
+                                
+                                STRICT RULES:
+                                1. Length: Must be exactly between 50 and 60 characters.
+                                2. Intent: Make it highly clickable (High CTR) but DO NOT use cheap clickbait.
+                                3. Keywords: Put the main topic/keyword near the front.
+                                4. Format: Output ONLY the title text. Do NOT wrap it in quotes. Do NOT say "Here is your title".
+                                
+                                Context:
+                                {context}
+                                """
+                                col_name = "New AI Title"
+                                old_val = row['title']
+                            else:
+                                context = f"Current Title: {row.get('title', '')}\nPage Content: {content_snippet}"
+                                prompt = f"""
+                                Act as a Senior SEO Copywriter. Generate ONE highly optimized SEO Meta Description for this webpage.
+                                
+                                STRICT RULES:
+                                1. Length: Must be exactly between 145 and 155 characters.
+                                2. Intent: Clearly explain the exact value the user will get by clicking.
+                                3. CTA: End with a natural, subtle Call-to-Action (e.g., Learn more, Discover how, Get started).
+                                4. Tone: Professional, engaging, and active voice.
+                                5. Format: Output ONLY the description text. Do NOT wrap it in quotes. Do NOT add any extra conversational text.
+                                
+                                Context:
+                                {context}
+                                """
+                                col_name = "New AI Description"
+                                old_val = row['meta_description']
+                            
+                            generated = generate_ai_meta(provider, api_key_gen, model_name, endpoint, prompt, "You are a strict Technical SEO Expert. Follow length rules perfectly.")
+                            
+                            clean_generated = generated.strip().strip('"').strip("'").replace("**", "")
+                            
+                            return {"URL": row['url'], "Old Value": old_val, col_name: clean_generated}
+
+                        with ThreadPoolExecutor(max_workers=5) as executor:
+                            futures = [executor.submit(process_gen_row, row) for _, row in targets.iterrows()]
+                            for i, f in enumerate(as_completed(futures)):
+                                res = f.result()
+                                results_gen.append(res)
+                                progress_gen.progress((i + 1) / len(targets))
+                        
+                        res_df = pd.DataFrame(results_gen)
+                        st.success("✅ Generation Complete!")
+                        st.dataframe(res_df, use_container_width=True)
+                        csv_gen = res_df.to_csv(index=False).encode('utf-8')
+                        st.download_button("📥 Download Generated Data", csv_gen, "ai_generated_tags.csv", "text/csv")
+
+        with tab_headers:
+            st.subheader("🏗️ Header Architecture & Counts")
+            
+            if 'header_structure' in df.columns:
+                struct_df = df[['url', 'h1_count', 'h2_count', 'h3_count', 'h4_count', 'h1_tags', 'header_structure']].copy()
+                
+                analyzed_data = []
+                problematic_urls = []
+                bad_h1_count = 0
+                broken_struct_count = 0
+                
+                def get_struct_status(row):
+                    struct = row['header_structure']
+                    if isinstance(struct, str):
+                        try: struct = json.loads(struct)
+                        except: struct = []
+                    
+                    issues, h1_c = analyze_heading_structure(struct)
+                    
+                    has_h1_issue = h1_c != 1
+                    has_hierarchy_issue = any("Skipped" in i for i in issues)
+                    
+                    status_label = "✅ Perfect"
+                    if has_h1_issue and has_hierarchy_issue: status_label = "❌ H1 & Hierarchy Errors"
+                    elif has_h1_issue: status_label = "❌ Bad H1 Count"
+                    elif has_hierarchy_issue: status_label = "⚠️ Skipped Levels"
+                    
+                    analyzed_data.append({
+                        'url': row['url'],
+                        'structure': struct,
+                        'issues': issues,
+                        'h1_count': h1_c,
+                        'status': status_label
+                    })
+                    
+                    if has_h1_issue or has_hierarchy_issue:
+                        problematic_urls.append({
+                            'URL': row['url'],
+                            'H1 Count': h1_c,
+                            'Hierarchy Issues': " | ".join(issues)
+                        })
+                        
+                    return status_label
+
+                struct_df['Hierarchy Status'] = struct_df.apply(get_struct_status, axis=1)
+                
+                bad_h1_count = len(struct_df[struct_df['h1_count'] != 1])
+                broken_struct_count = len(struct_df[struct_df['Hierarchy Status'].str.contains("Skipped")])
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Total Pages", len(df))
+                m2.metric("❌ Bad H1 Usage", bad_h1_count, help="Pages with 0 or >1 H1 tags")
+                m3.metric("⚠️ Broken Levels", broken_struct_count, help="Pages skipping levels (e.g. H2->H4)")
+                m4.metric("✅ Perfect Structure", len(df) - len(problematic_urls))
+
+                st.divider()
+
+                st.write("### 📊 Overview Table")
+                cols_to_show = ['Hierarchy Status', 'url', 'h1_count', 'h2_count', 'h3_count', 'h1_tags']
+                st.dataframe(
+                    struct_df[cols_to_show],
+                    use_container_width=True,
+                    column_config={
+                        "url": st.column_config.LinkColumn("Page URL"),
+                        "h1_tags": st.column_config.TextColumn("H1 Text", width="large"),
+                        "Hierarchy Status": st.column_config.TextColumn("Status", width="medium"),
+                    }
+                )
+                
+                csv = struct_df.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Download Header Report", csv, "header_analysis.csv", "text/csv")
+
+                st.divider()
+
+                c_insp, c_tree = st.columns([1, 2])
+                
+                with c_insp:
+                    st.write("### 🔍 Visual Inspector")
+                    st.info("Select a page to visualize its Heading Tree (DOM).")
+                    
+                    filter_mode = st.radio("Filter List:", ["All Pages", "Only Pages with Issues"], horizontal=True)
+                    
+                    if filter_mode == "Only Pages with Issues":
+                        options = [d['URL'] for d in problematic_urls]
+                    else:
+                        options = [d['url'] for d in analyzed_data]
+                    
+                    if not options:
+                        st.warning("No pages match this filter.")
+                        selected_page = None
+                    else:
+                        selected_page = st.selectbox("Select Page:", options, key="merged_struct_select")
+
+                with c_tree:
+                    if selected_page:
+                        page_data = next((item for item in analyzed_data if item['url'] == selected_page), None)
+                        
+                        if page_data:
+                            st.markdown(f"**Analysis for:** `{selected_page}`")
+                            
+                            if page_data['issues']:
+                                for issue in page_data['issues']:
+                                    if "❌" in issue: st.error(issue)
+                                    else: st.warning(issue)
+                            else:
+                                st.success("✅ Structure is perfectly logical.")
+
+                            st.markdown("#### 🌳 Heading Tree")
+                            st.markdown("""
+                            <style>
+                            .header-node { padding: 3px 8px; border-left: 3px solid rgba(128,128,128,0.3); margin-bottom: 3px; font-family: monospace; }
+                            .h1-node { border-left-color: #ff4b4b; background-color: rgba(255, 75, 75, 0.1); font-weight: bold; }
+                            .h2-node { border-left-color: #ffbd45; background-color: rgba(255, 189, 69, 0.1); }
+                            .h3-node { border-left-color: #92c5de; }
+                            .h4-node { border-left-color: rgba(128,128,128,0.5); opacity: 0.8; }
+                            </style>
+                            """, unsafe_allow_html=True)
+
+                            if not page_data['structure']:
+                                st.info("No headers found on this page.")
+                            
+                            for h in page_data['structure']:
+                                lvl = h['level']
+                                indent = (lvl - 1) * 20
+                                css_class = "header-node"
+                                if lvl == 1: css_class += " h1-node"
+                                elif lvl == 2: css_class += " h2-node"
+                                elif lvl == 3: css_class += " h3-node"
+                                elif lvl >= 4: css_class += " h4-node"
+                                
+                                st.markdown(
+                                    f"<div class='{css_class}' style='margin-left: {indent}px;'>"
+                                    f"<span>{h['tag'].upper()}</span>: {h['text']}"
+                                    f"</div>", 
+                                    unsafe_allow_html=True
+                                )
+            else:
+                st.warning("Header structure data not available. Please re-crawl the site.")
+
+        with tab_tech:
+            st.header("🛠️ Master Technical Audit")
+            st.info("Unified view of Status Codes, Redirects, and Canonicals.")
+
+            tech_df = df[['url', 'status_code', 'indexability', 'redirect_count', 'final_url', 'canonical_url', 'meta_robots']].copy()
+
+            def get_canonical_status(row):
+                c_url = row['canonical_url']
+                if not c_url: return "❌ Missing"
+                if row['url'] == c_url: return "✅ Self-Referencing"
+                return "⚠️ Canonicalized to Other"
+
+            tech_df['Canonical Status'] = tech_df.apply(get_canonical_status, axis=1)
+
+            def get_redirect_status(row):
+                if row['redirect_count'] > 0:
+                    return f"🔄 Redirect ({row['redirect_count']} hops)"
+                if row['status_code'] == 200:
+                    return "✅ 200 OK"
+                return f"⚠️ {row['status_code']}"
+
+            tech_df['Page Status'] = tech_df.apply(get_redirect_status, axis=1)
+
+            display_df = tech_df[[
+                'url', 
+                'Page Status', 
+                'indexability', 
+                'final_url', 
+                'Canonical Status', 
+                'canonical_url',
+                'meta_robots'
+            ]]
+
+            display_df.columns = [
+                'Source URL', 'Status Overview', 'Indexability', 
+                'Redirect Target (Final URL)', 'Canonical Status', 'Canonical Link', 'Robots Tag'
+            ]
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total URLs", len(tech_df))
+            m2.metric("🔄 Redirects", len(tech_df[tech_df['redirect_count'] > 0]))
+            m3.metric("❌ Broken (4xx/5xx)", len(tech_df[tech_df['status_code'] >= 400]))
+            m4.metric("⚠️ Canonical Issues", len(tech_df[tech_df['Canonical Status'].str.contains("Missing|Other")]))
+
+            st.divider()
+
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                column_config={
+                    "Source URL": st.column_config.LinkColumn("Source URL", width="medium"),
+                    "Redirect Target (Final URL)": st.column_config.LinkColumn("Redirect Target"),
+                    "Canonical Link": st.column_config.LinkColumn("Canonical Tag"),
+                    "Status Overview": st.column_config.TextColumn("Status", width="small"),
+                }
+            )
+
+            csv = display_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "📥 Download Full Technical Report", 
+                csv, 
+                "master_technical_audit.csv", 
+                "text/csv",
+                type="primary"
+            )
+
+        with tab10:
+            st.subheader("📱 Social Tags")
+            st.dataframe(df[['url', 'og_title', 'twitter_title']], use_container_width=True)
+            csv = df[['url', 'og_title', 'twitter_title']].to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download Social", csv, "social_tags.csv", "text/csv")
+
+        with tab11:
+            st.subheader("🚀 Performance Stats")
+            st.dataframe(df[['url', 'response_time', 'word_count', 'content_length']], use_container_width=True)
+            csv = df[['url', 'response_time']].to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download Performance", csv, "performance.csv", "text/csv")
+
+        with tab13:
+            st.subheader("👻 Orphan Pages")
+            if orphans:
+                orphan_df = pd.DataFrame(orphans, columns=['Orphan URL'])
+                st.dataframe(orphan_df, use_container_width=True)
+                csv = orphan_df.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Download Orphans", csv, "orphans.csv", "text/csv")
+            else:
+                st.success("No orphans found (or no sitemap provided).")
+
+        with tab14:
+            st.subheader("⛏️ Custom Extracted Data")
+            
+            if 'custom_extraction' not in df.columns:
+                st.info("No custom data found. Add rules in the sidebar and start a crawl.")
+            else:
+                try:
+                    valid_custom = df[df['custom_extraction'].notna() & (df['custom_extraction'] != '')].copy()
+                    
+                    if valid_custom.empty:
+                        st.warning("No data extracted yet.")
+                    else:
+                        json_data = valid_custom['custom_extraction'].apply(
+                            lambda x: json.loads(x) if isinstance(x, str) and x.startswith('{') else {}
+                        ).tolist()
+                        
+                        extracted_df = pd.DataFrame(json_data)
+                        result_df = pd.concat([valid_custom['url'].reset_index(drop=True), extracted_df], axis=1)
+                        
+                        st.write(f"**Found data for {len(result_df)} URLs**")
+                        st.dataframe(result_df, use_container_width=True)
+                        
+                        csv = result_df.to_csv(index=False).encode('utf-8')
+                        st.download_button("📥 Download Custom Data", csv, "custom_extraction.csv", "text/csv")
+                except Exception as e:
+                    st.error(f"Error parsing data: {e}")
+                    st.dataframe(df[['url', 'custom_extraction']], use_container_width=True)
+
+        with tab15:
+            st.subheader("⚡ Google PageSpeed Insights (PSI)")
+            st.info("Enter your Google PageSpeed API Key in the Sidebar to use this feature.")
+            
+            if psi_api_key:
+                check_all = st.checkbox("Select All URLs (Run for everyone)", help="⚠️ Be careful with API limits if you have thousands of URLs.")
+                if check_all:
+                    urls_to_test = df['url'].tolist()
+                    st.write(f"Selected {len(urls_to_test)} URLs.")
+                else:
+                    urls_to_test = st.multiselect("Select URLs to Test (Max 5 recommended)", df['url'].head(20).tolist())
+                
+                if st.button("🏃 Run PageSpeed Test (Mobile & Desktop)", type="primary"):
+                    if not urls_to_test:
+                        st.warning("Please select at least one URL.")
+                    else:
+                        progress_psi = st.progress(0)
+                        status_text = st.empty()
+                        results = []
+                        total_steps = len(urls_to_test)
+                        
+                        for i, u in enumerate(urls_to_test):
+                            status_text.text(f"Testing {i+1}/{total_steps}: {u}...")
+                            mobile_res = run_psi_test(u, psi_api_key, "mobile")
+                            desktop_res = run_psi_test(u, psi_api_key, "desktop")
+                            
+                            row = {'url': u}
+                            if "error" in mobile_res: row['Mobile Error'] = mobile_res['error']
+                            else:
+                                for k, v in mobile_res.items(): row[f"Mobile {k}"] = v
+                                    
+                            if "error" in desktop_res: row['Desktop Error'] = desktop_res['error']
+                            else:
+                                for k, v in desktop_res.items(): row[f"Desktop {k}"] = v
+
+                            results.append(row)
+                            progress_psi.progress((i + 1) / total_steps)
+                        
+                        st.session_state.psi_results = results
+                        status_text.success("✅ Analysis Complete!")
+                
+                if st.session_state.psi_results:
+                    psi_df = pd.DataFrame(st.session_state.psi_results)
+                    desired_order = ['url', 'Mobile Score', 'Desktop Score', 'Mobile LCP', 'Desktop LCP', 'Mobile FCP', 'Desktop FCP', 'Mobile CLS', 'Desktop CLS', 'Mobile INP', 'Desktop INP']
+                    final_cols = [c for c in desired_order if c in psi_df.columns]
+                    remaining_cols = [c for c in psi_df.columns if c not in final_cols]
+                    st.dataframe(psi_df[final_cols + remaining_cols], use_container_width=True)
+                    csv_psi = psi_df.to_csv(index=False).encode('utf-8')
+                    st.download_button("📥 Download PSI Report", csv_psi, "psi_report.csv", "text/csv")
+            else:
+                st.warning("⚠️ PSI API Key is missing. Please add it in the sidebar.")
+
+        with tab16:
+            st.subheader("🏗️ Schema Markup Analysis")
+
+            schema_view = df[['url', 'schema_types', 'schema_validity']].copy()
+            schema_view['Rule-Based Suggestion'] = df.apply(get_suggested_schema, axis=1)
+
+            with st.expander("✨ Get AI-Powered Schema Suggestions"):
+                st.info("Use AI to read the actual page content and recommend the exact Schema types you should add.")
+                c_ai1, c_ai2 = st.columns(2)
+                sch_provider = c_ai1.selectbox("AI Provider", ["Gemini", "OpenAI Compatible (Groq/Ollama/OpenAI)"], key="sch_p")
+                sch_key = c_ai2.text_input("API Key (or empty for Ollama)", type="password", key="sch_k")
+                
+                c_ai3, c_ai4 = st.columns(2)
+                sch_model = c_ai3.text_input("Model", value="gemini-1.5-flash" if sch_provider=="Gemini" else "llama-3.3-70b-versatile", key="sch_m")
+                sch_url = c_ai4.text_input("Endpoint URL", value="https://api.groq.com/openai/v1/chat/completions", key="sch_u")
+
+                if st.button("🧠 Check Schema Suggestion with AI"):
+                    with st.spinner("AI is analyzing content to suggest schemas..."):
+                        ai_results = {}
+                        progress_sch = st.progress(0)
+                        total_urls = len(df)
+                        
+                        def fetch_ai_schema(row):
+                            content = str(row.get('scope_content', ''))[:1500] 
+                            title = str(row.get('title', ''))
+                            
+                            prompt = f"""
+                            Analyze this webpage content.
+                            Title: {title}
+                            Content Snippet: {content}
+                            
+                            Task: Suggest the top 1-3 most relevant Schema.org markup types for this page (e.g., Article, FAQPage, Product, LocalBusiness, Recipe, JobPosting, SoftwareApplication). 
+                            ONLY output the exact schema names separated by a comma. Do not include any other text, explanations, or code.
+                            """
+                            
+                            res = generate_ai_meta(sch_provider, sch_key, sch_model, sch_url, prompt, "You are a Technical SEO Expert.")
+                            clean_res = res.replace("DECISION:", "").replace("`", "").strip()
+                            return row['url'], clean_res
+
+                        with ThreadPoolExecutor(max_workers=3) as executor:
+                            futures = {executor.submit(fetch_ai_schema, row): row for _, row in df.iterrows()}
+                            for i, f in enumerate(as_completed(futures)):
+                                url, suggestion = f.result()
+                                ai_results[url] = suggestion
+                                progress_sch.progress((i + 1) / total_urls)
+                        
+                        st.session_state.ai_schema_suggestions = ai_results
+                        st.success("✅ AI Suggestions Generated!")
+
+            if 'ai_schema_suggestions' in st.session_state:
+                schema_view['✨ AI Suggestion'] = schema_view['url'].map(st.session_state.ai_schema_suggestions)
+            else:
+                schema_view['✨ AI Suggestion'] = "Click AI Button ⬆️"
+
+            st.write("### 📊 Schema Overview")
+            st.info("Select a row to see the Google Preview and Validation details below.")
+
+            col_config = {
+                "url": st.column_config.LinkColumn("Page URL", width="medium"),
+                "schema_types": st.column_config.TextColumn("Detected Schema", width="small"),
+                "Rule-Based Suggestion": st.column_config.TextColumn("Standard Suggestion", width="small"),
+                "schema_validity": st.column_config.TextColumn("Status", width="small"),
+                "✨ AI Suggestion": st.column_config.TextColumn("✨ AI Suggestion", width="medium")
+            }
+
+            selection = st.dataframe(
+                schema_view,
+                use_container_width=True,
+                column_config=col_config,
+                on_select="rerun", 
+                selection_mode="single-row"
+            )
+
+            st.divider()
+            
+            if selection.selection.rows:
+                idx = selection.selection.rows[0]
+                selected_url = schema_view.iloc[idx]['url']
+                
+                st.markdown(f"### 🔍 Inspecting: `{selected_url}`")
+                
+                row = df[df['url'] == selected_url].iloc[0]
+                schema_dump = row.get('schema_dump', [])
+                
+                col_preview, col_json = st.columns([1, 1])
+                
+                with col_preview:
+                    st.markdown("#### 📱 Google Search Preview")
+                    
+                    if isinstance(schema_dump, str):
+                        try: schema_objs = json.loads(schema_dump)
+                        except: schema_objs = []
+                    else: schema_objs = schema_dump
+                    
+                    if not schema_objs:
+                        st.warning("⚠️ No Schema JSON found to render preview.")
+                        st.markdown("""
+                        <div style="font-family:arial; background:rgba(128,128,128,0.05); padding:15px; border:1px solid rgba(128,128,128,0.2); border-radius:8px;">
+                            <div style="font-size:12px; opacity:0.8;">https://example.com › ...</div>
+                            <div style="font-size:20px; color:#4da8da; margin:5px 0;">Page Title Example</div>
+                            <div style="font-size:14px; opacity:0.9;">No rich snippets detected. This is how a standard result looks.</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        render_rich_snippet_preview(schema_objs[0] if isinstance(schema_objs, list) else schema_objs)
+                        
+                        st.markdown("#### ✅ Validation Issues")
+                        issues = validate_schema_structure(schema_objs[0] if isinstance(schema_objs, list) else schema_objs)
+                        if issues:
+                            for i in issues: st.error(i)
+                        else:
+                            st.success("Structure looks valid for Google Rich Results.")
+
+                    encoded_url = requests.utils.quote(selected_url)
+                    st.markdown(f"""
+                    <div style="display: flex; gap: 10px; margin-top: 20px;">
+                        <a href="https://search.google.com/test/rich-results?url={encoded_url}" target="_blank">
+                            <button style="padding:8px 16px; border-radius:5px; border:1px solid #ccc; background:rgba(128,128,128,0.1); cursor:pointer;">
+                                📡 Test in Google
+                            </button>
+                        </a>
+                        <a href="https://validator.schema.org/#url={encoded_url}" target="_blank">
+                            <button style="padding:8px 16px; border-radius:5px; border:1px solid #ccc; background:rgba(128,128,128,0.1); cursor:pointer;">
+                                ✅ Schema Validator
+                            </button>
+                        </a>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                with col_json:
+                    st.markdown("#### 📝 Raw JSON-LD")
+                    st.json(schema_objs, expanded=True)
+
+            else:
+                st.info("👆 Click on a row in the table above to see the Google Preview.")
+                
+                csv = schema_view.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Download Schema Report", csv, "schema_analysis.csv", "text/csv")
+
+        with tab_search:
+            st.subheader("🔍 Custom Search Results")
+            s_conf = st.session_state.get('search_config', None)
+            if 'custom_search_count' not in df.columns:
+                st.info("Please configure Custom Search in the Sidebar and run a new crawl.")
+            elif s_conf:
+                st.info(f"Results for search: **'{s_conf['query']}'** ({s_conf['mode']}) in **{s_conf['scope']}**")
+                found_df = df[df['custom_search_count'] > 0][['url', 'custom_search_count']].copy()
+                st.dataframe(found_df, use_container_width=True)
+            else:
+                st.warning("No search was configured.") 
+        
+        with tab_cannibal:
+            st.subheader("👯 Content Similarity & Pruning")
+            st.markdown("""
+            **Two-Step Pruning Strategy:**
+            1. **Duplicates (High Match):** Pages that are copies. Action: *Delete or 301 Redirect.*
+            2. **Cannibalization (Medium Match):** Different pages fighting for the same topic. Action: *Merge content.*
+            """)
+            
+            if not HAS_SKLEARN:
+                st.error("❌ 'scikit-learn' is not installed. Please run: `pip install scikit-learn`")
+            else:
+                col1, col2 = st.columns(2)
+                
+                merge_thresh = col1.slider("Merge Threshold % (Topic Overlap)", 30, 90, 60, help="Finds pages that talk about similar things.")
+                dupe_thresh = col2.slider("Duplicate Threshold % (Exact Copies)", 80, 100, 90, help="Finds pages that are almost identical.")
+                
+                if st.button("🔍 Analyze Content Similarity", type="primary"):
+                    with st.spinner("Comparing semantic fingerprints (Title + H1 + Body)..."):
+                        if 'scope_content' not in df.columns:
+                            st.error("Please re-crawl the website to capture content data.")
+                        else:
+                            cannibal_df = analyze_content_cannibalization(df, merge_threshold=merge_thresh/100, duplicate_threshold=dupe_thresh/100)
+                            st.session_state.cannibal_data = cannibal_df
+                
+                if 'cannibal_data' in st.session_state:
+                    data = st.session_state.cannibal_data
+                    
+                    if data.empty:
+                        st.success("✅ No similarity found above your thresholds.")
+                    else:
+                        duplicates = data[data['Recommendation'].str.contains("Remove")]
+                        st.write("### 🚨 1. Duplicates (High Risk - Remove/Redirect)")
+                        if not duplicates.empty:
+                            st.error(f"Found {len(duplicates)} pages that look like copies.")
+                            st.dataframe(
+                                duplicates, 
+                                use_container_width=True,
+                                column_config={
+                                    "Similarity": st.column_config.ProgressColumn("Match %", format="%.1f%%", min_value=0, max_value=100),
+                                    "Page A": st.column_config.LinkColumn("Page A"),
+                                    "Page B": st.column_config.LinkColumn("Page B"),
+                                }
+                            )
+                        else:
+                            st.info("No exact duplicates found.")
+
+                        st.divider()
+
+                        mergers = data[data['Recommendation'].str.contains("Merge")]
+                        st.write("### 🤝 2. Merge Opportunities (Keyword Cannibalization)")
+                        if not mergers.empty:
+                            st.warning(f"Found {len(mergers)} pages covering similar topics.")
+                            st.caption("These pages are likely competing for the same keywords. Pick the strongest one and merge the others into it.")
+                            st.dataframe(
+                                mergers, 
+                                use_container_width=True,
+                                column_config={
+                                    "Similarity": st.column_config.ProgressColumn("Match %", format="%.1f%%", min_value=0, max_value=100),
+                                    "Page A": st.column_config.LinkColumn("Page A"),
+                                    "Page B": st.column_config.LinkColumn("Page B"),
+                                }
+                            )
+                        else:
+                            st.info("No merge opportunities found with current settings.")
+
+        with tab_gsc:
+            st.subheader("📈 Google Search Console Analysis")
+            
+            if not HAS_GSC:
+                st.error("Missing libraries. Run: `pip install google-api-python-client google-auth`")
+            elif not st.session_state.gsc_service or not gsc_property:
+                st.info("👈 Please upload your JSON Key and select a property in the sidebar.")
+            else:
+                st.write("### 1. Performance Metrics")
+                
+                valid_dates = False
+                start_d, end_d = None, None
+                
+                if 'date_range' in locals() and isinstance(date_range, tuple) and len(date_range) == 2:
+                    start_d, end_d = date_range
+                    st.caption(f"Fetching data from: **{start_d}** to **{end_d}**")
+                    valid_dates = True
+                elif 'date_range' not in locals():
+                     st.warning("⚠️ Date picker loading...")
+                else:
+                    st.warning("⚠️ Please select both a Start Date and an End Date in the sidebar.")
+
+                if st.button("🔄 Fetch Performance (Clicks, Imp, CTR, Pos)", disabled=not valid_dates):
+                    with st.spinner("Fetching performance data..."):
+                        gsc_data = fetch_gsc_data(st.session_state.gsc_service, gsc_property, start_d, end_d)
+                        
+                        if not gsc_data.empty:
+                            st.success(f"Fetched data for {len(gsc_data)} URLs!")
+                            
+                            if 'GSC CTR' in gsc_data.columns:
+                                gsc_data['GSC CTR'] = (gsc_data['GSC CTR'] * 100).round(2).astype(str) + '%'
+                            if 'GSC Position' in gsc_data.columns:
+                                gsc_data['GSC Position'] = gsc_data['GSC Position'].round(1)
+
+                            if df is not None and not df.empty:
+                                df['url'] = df['url'].astype(str)
+                                gsc_data['url'] = gsc_data['url'].astype(str)
+                                
+                                merged_gsc = pd.merge(df, gsc_data, on='url', how='left')
+                                
+                                zero_clicks = merged_gsc[merged_gsc['GSC Clicks'].fillna(0) == 0]
+                                st.metric("Pages in List with 0 Clicks", len(zero_clicks))
+                                
+                                display_df = merged_gsc.copy()
+                                complex_cols = ['schema_dump', 'internal_links', 'external_links', 
+                                              'images', 'redirect_chain', 'header_structure', 'custom_extraction']
+                                for col in complex_cols:
+                                    if col in display_df.columns:
+                                        display_df[col] = display_df[col].astype(str)
+                                
+                                target_cols = ['url', 'GSC Clicks', 'GSC Impressions', 'GSC CTR', 'GSC Position']
+                                final_cols = [c for c in target_cols if c in display_df.columns]
+                                
+                                st.dataframe(display_df[final_cols], use_container_width=True)
+                                st.session_state.gsc_merged_data = merged_gsc
+                            else:
+                                st.dataframe(gsc_data, use_container_width=True)
+                                st.session_state.gsc_merged_data = gsc_data
+                        else:
+                            st.warning("No data found in GSC for this period.")
+
+                st.divider()
+
+                st.write("### 2. Indexing & Canonical Inspection")
+                st.info("ℹ️ Checks the live Google Index status. Use 'List Mode' crawl to define your URLs first.")
+                
+                available_urls = []
+                if df is not None and not df.empty:
+                    available_urls = df['url'].tolist()
+                elif 'gsc_merged_data' in st.session_state and not st.session_state.gsc_merged_data.empty:
+                    available_urls = st.session_state.gsc_merged_data['url'].tolist()
+                
+                if available_urls:
+                    st.write(f"**Ready to inspect {len(available_urls)} URLs**")
+                    
+                    col_i1, col_i2 = st.columns(2)
+                    do_inspect = False
+                    urls_to_run = []
+                    
+                    with col_i1:
+                        specific_url = st.text_input("Inspect Single URL")
+                        if st.button("🔎 Inspect One"):
+                            if specific_url:
+                                urls_to_run = [specific_url]
+                                do_inspect = True
+                            else:
+                                st.warning("Enter a URL")
+
+                    with col_i2:
+                        st.write(f"Batch Inspect ({len(available_urls)} URLs)")
+                        if st.button(f"🚀 Inspect All {len(available_urls)} URLs"):
+                            urls_to_run = available_urls
+                            do_inspect = True
+                    
+                    if do_inspect:
+                        with st.status("Inspecting URLs... (This can take a while)") as status:
+                            insp_df = inspect_url_indexing(st.session_state.gsc_service, gsc_property, urls_to_run)
+                            status.update(label="Inspection Complete!", state="complete")
+                        
+                        if not insp_df.empty:
+                            if 'Google Canonical' in insp_df.columns and 'User Canonical' in insp_df.columns:
+                                mismatches = insp_df[
+                                    (insp_df['Google Canonical'] != 'N/A') & 
+                                    (insp_df['Google Canonical'] != insp_df['User Canonical'])
+                                ]
+                                if not mismatches.empty:
+                                    st.error(f"⚠️ Found {len(mismatches)} Canonical Mismatches (Google chose differently)")
+                                    st.dataframe(mismatches, use_container_width=True)
+                                else:
+                                    st.success("✅ Google respects all your canonical tags.")
+
+                            st.dataframe(insp_df, use_container_width=True)
+                            csv_insp = insp_df.to_csv(index=False).encode('utf-8')
+                            st.download_button("📥 Download Inspection Report", csv_insp, "indexing_report.csv", "text/csv")
+                else:
+                    st.warning("⚠️ No URLs found to inspect. Please run a Crawl (List Mode) or Fetch Performance Data first.")
+                    
+                st.divider()
+                st.write("### 🚀 3. Bulk Indexing API (Force Indexing)")
+                st.info("Directly ping Google to crawl/index these URLs immediately. **Limit: 200 per day.** Ensure your Service Account is added as an 'Owner' in GSC.")
+                
+                if 'last_gsc_key' not in st.session_state or not st.session_state.last_gsc_key:
+                    st.warning("⚠️ Please upload your Service Account JSON Key in the sidebar first.")
+                else:
+                    c_idx1, c_idx2 = st.columns([2, 1])
+                    
+                    with c_idx1:
+                        avail_urls = df['url'].tolist() if (df is not None and not df.empty) else []
+                        selected_index_urls = st.multiselect(
+                            "Select Crawled URLs to Submit:", 
+                            options=avail_urls,
+                            help="Select URLs from your current crawl."
+                        )
+                        
+                        manual_index_urls = st.text_area("Or Paste URLs (One per line):", placeholder="https://mysite.com/new-post")
+                    
+                    with c_idx2:
+                        indexing_action = st.radio(
+                            "Action Type:", 
+                            ["URL_UPDATED", "URL_DELETED"], 
+                            help="UPDATED = Add/Refresh page. DELETED = Remove page from Google."
+                        )
+                    
+                    if st.button("🚀 Ping Google Indexing API", type="primary"):
+                        final_urls = list(set(selected_index_urls + [u.strip() for u in manual_index_urls.split('\n') if u.strip()]))
+                        
+                        if not final_urls:
+                            st.error("❌ Please provide at least one URL.")
+                        elif len(final_urls) > 200:
+                            st.error(f"❌ You selected {len(final_urls)} URLs. The default daily limit is 200. Please reduce your list.")
+                        else:
+                            with st.spinner(f"Pinging Google for {len(final_urls)} URLs..."):
+                                idx_results_df = submit_to_indexing_api(
+                                    st.session_state.last_gsc_key, 
+                                    final_urls, 
+                                    indexing_action
+                                )
+                                
+                                st.success("✅ Submission Process Complete!")
+                                st.dataframe(
+                                    idx_results_df, 
+                                    use_container_width=True,
+                                    column_config={
+                                        "URL": st.column_config.LinkColumn("Target URL"),
+                                        "Status": st.column_config.TextColumn("Status", width="small"),
+                                        "Details": st.column_config.TextColumn("API Response")
+                                    }
+                                )
+                                
+                                csv_idx = idx_results_df.to_csv(index=False).encode('utf-8')
+                                st.download_button("📥 Download Submission Report", csv_idx, "indexing_api_report.csv", "text/csv")
+        
+        with tab_audit:
+            st.subheader("📅 AI Content Relevance & Freshness Auditor")
+            st.info("Identify 'Stale' or 'Zombie' pages that need to be updated or removed based on current real-world relevance.")
+            
+            c1, c2 = st.columns(2)
+            with c1:
+                aud_provider = st.selectbox("AI Provider", ["Gemini", "OpenAI Compatible (Groq/Ollama/OpenAI)"], key="aud_p")
+                aud_key = st.text_input("API Key (or Ollama URL if empty)", type="password", key="aud_k")
+            with c2:
+                aud_model = st.text_input("Model", value="gemini-1.5-flash" if aud_provider=="Gemini" else "llama-3.3-70b-versatile", key="aud_m")
+                aud_url = st.text_input("Endpoint (if needed)", value="https://api.groq.com/openai/v1/chat/completions", key="aud_u")
+
+            audit_scope = st.radio("Audit Scope:", ["Selected Pages (Custom)", "Top 10 High Traffic (GSC Needed)", "All Indexable Pages (WARNING: High API Cost)"], horizontal=True)
+
+            targets_to_audit = []
+            if audit_scope == "Selected Pages (Custom)":
+                selected_urls = st.multiselect("Select URLs to Audit", df['url'].tolist(), default=df['url'].head(3).tolist())
+                targets_to_audit = df[df['url'].isin(selected_urls)].to_dict('records')
+                
+            elif audit_scope == "Top 10 High Traffic (GSC Needed)":
+                if 'gsc_merged_data' in st.session_state and not st.session_state.gsc_merged_data.empty:
+                    targets_to_audit = st.session_state.gsc_merged_data.sort_values(by='GSC Clicks', ascending=False).head(10).to_dict('records')
+                else:
+                    st.warning("⚠️ No GSC Data found. Please fetch GSC data in the 'GSC Data' tab first.")
+                    
+            else:
+                targets_to_audit = df[df['indexability'] == 'Indexable'].to_dict('records')
+                st.warning(f"⚠️ You are about to send {len(targets_to_audit)} pages to the AI API. This may take a while.")
+
+            if st.button("🚀 Start Content Audit", type="primary"):
+                if not aud_key and aud_provider == "Gemini":
+                    st.error("⚠️ Please enter an API key to run the audit.")
+                elif not targets_to_audit:
+                    st.error("⚠️ No target URLs found to audit.")
+                else:
+                    progress_aud = st.progress(0)
+                    status_aud = st.empty()
+                    audit_results = []
+                    
+                    with ThreadPoolExecutor(max_workers=2) as executor:
+                        futures = [executor.submit(analyze_content_freshness, t['url'], t.get('title', ''), t.get('scope_content', ''), aud_provider, aud_key, aud_model, aud_url) for t in targets_to_audit]
+                        for i, f in enumerate(as_completed(futures)):
+                            audit_results.append(f.result())
+                            progress_aud.progress((i + 1) / len(targets_to_audit))
+                            status_aud.text(f"Audited {i + 1}/{len(targets_to_audit)}")
+                    
+                    aud_res_df = pd.DataFrame(audit_results)
+                    st.session_state.content_audit_data = aud_res_df
+                    status_aud.success("✅ Audit Complete!")
+
+            if 'content_audit_data' in st.session_state and not st.session_state.content_audit_data.empty:
+                res = st.session_state.content_audit_data
+                
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("KEEP", len(res[res['Decision'] == 'KEEP']))
+                m2.metric("UPDATE", len(res[res['Decision'] == 'UPDATE']), delta_color="off")
+                m3.metric("REMOVE", len(res[res['Decision'] == 'REMOVE']), delta="-"+str(len(res[res['Decision'] == 'REMOVE'])))
+                m4.metric("ERRORS", len(res[res['Decision'] == 'ERROR']))
+                
+                st.dataframe(res, use_container_width=True, column_config={
+                    "Decision": st.column_config.SelectboxColumn("Decision", options=["KEEP", "UPDATE", "REMOVE", "UNKNOWN", "ERROR"]),
+                    "URL": st.column_config.LinkColumn("Page URL")
+                })
+                
+                csv_aud = res.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Download Audit Report", csv_aud, "content_audit.csv", "text/csv")
+
+            st.divider()
+            st.subheader("📝 Grammar & Spelling Auditor")
+            st.info("Checks for spelling and grammar errors. Works for any website.")
+
+            if not HAS_LT:
+                st.error("❌ `language_tool_python` is missing. Please run: `pip install language_tool_python`")
+            else:
+                gram_scope = st.radio("Grammar Scope:", ["Selected Pages Only (Use Filter below)", "All Pages (Slow)"], horizontal=True)
+                
+                if gram_scope == "Selected Pages Only (Use Filter below)":
+                    gram_targets = st.multiselect("Select URLs to Check:", df['url'].tolist(), default=df['url'].head(3).tolist())
+                else:
+                    gram_targets = df['url'].tolist()
+
+                if st.button("🔍 Check Grammar & Spelling"):
+                    if not gram_targets:
+                        st.warning("No pages selected.")
+                    else:
+                        progress_gram = st.progress(0)
+                        status_gram = st.empty()
+                        gram_results = []
+                        
+                        tool = None
+                        use_cloud_fallback = False
+                        
+                        try:
+                            status_gram.text("Initializing LanguageTool...")
+                            tool = language_tool_python.LanguageTool('en-US') 
+                        except Exception:
+                            status_gram.text("⚠️ Java missing. Switching to Cloud API...")
+                            use_cloud_fallback = True
+
+                        total_g = len(gram_targets)
+                        
+                        for i, u in enumerate(gram_targets):
+                            row_data = df[df['url'] == u].iloc[0]
+                            
+                            check_map = {
+                                'Title': row_data.get('title', ''),
+                                'H1': row_data.get('h1_tags', ''),
+                                'Meta Desc': row_data.get('meta_description', ''),
+                                'Content': row_data.get('scope_content', '')[:2500] 
+                            }
+                            
+                            for field, text in check_map.items():
+                                if text and len(text) > 5:
+                                    matches = []
+                                    
+                                    if tool:
+                                        try:
+                                            lt_matches = tool.check(text)
+                                            for m in lt_matches:
+                                                matches.append({
+                                                    'replacements': m.replacements[:3],
+                                                    'offset': m.offset,
+                                                    'length': m.errorLength
+                                                })
+                                        except: pass
+                                    
+                                    elif use_cloud_fallback:
+                                        matches = check_grammar_cloud(text)
+                                        time.sleep(0.3) 
+                                    
+                                    for m in matches:
+                                        start = m['offset']
+                                        end = m['offset'] + m['length']
+                                        wrong_word = text[start:end]
+                                        
+                                        if not wrong_word.strip():
+                                            continue
+
+                                        gram_results.append({
+                                            'Page URL': u,
+                                            'Location': field,
+                                            'Wrong Spelling': wrong_word,
+                                            'Correct Spelling': ", ".join(m['replacements'])
+                                        })
+                            
+                            progress_gram.progress((i + 1) / total_g)
+                            status_gram.text(f"Checking {i+1}/{total_g}: {u}")
+
+                        st.session_state.grammar_audit_data = pd.DataFrame(gram_results)
+                        status_gram.success("✅ Grammar Check Complete!")
+
+                if 'grammar_audit_data' in st.session_state and not st.session_state.grammar_audit_data.empty:
+                    gdf = st.session_state.grammar_audit_data
+                    st.write(f"**Found {len(gdf)} potential errors.**")
+                    
+                    st.dataframe(
+                        gdf, 
+                        use_container_width=True,
+                        column_config={
+                            "Page URL": st.column_config.LinkColumn("Page"),
+                            "Wrong Spelling": st.column_config.TextColumn("Wrong Spelling", width="small"),
+                            "Correct Spelling": st.column_config.TextColumn("Correct Spelling", width="medium"),
+                        }
+                    )
+                    
+                    csv_gram = gdf.to_csv(index=False).encode('utf-8')
+                    st.download_button("📥 Download Spelling Report", csv_gram, "spelling_report.csv", "text/csv")
+                elif 'grammar_audit_data' in st.session_state:
+                    st.info("No spelling errors found in the selected pages.")
+
+        with tab_competitor:
+            st.subheader("⚔️ The Ultimate Deep SEO Analysis")
+            st.info("Analyzes architecture, semantic gaps, CWV, and deep site-wide interlinking.")
+            
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                my_url_input = st.text_input("Your Page URL", key="adv_my_url", placeholder="https://mysite.com/page")
+                keywords_input = st.text_area("Target Keywords (Comma separated)", key="adv_kws", placeholder="seo tools, python script")
+                
+                st.write("**Deep Crawl Settings**")
+                enable_deep_inlinks = st.checkbox("🕷️ Crawl Entire Website for Inlinks", help="Finds exact number of internal pages pointing to the target. WARNING: Very slow!")
+                max_inlink_pages = st.number_input("Max pages to crawl per domain (if enabled)", 50, 5000, 200, step=50)
+
+            with c2:
+                competitors_input = st.text_area("Competitor URLs (1 per line)", height=220, key="adv_comps")
+
+            if st.button("🚀 Run The Ultimate Analysis", type="primary"):
+                if not my_url_input or not competitors_input or not keywords_input:
+                    st.error("⚠️ Fill in all fields.")
+                else:
+                    comps = [u.strip() for u in competitors_input.split('\n') if u.strip()]
+                    keywords = [k.strip().lower() for k in keywords_input.split(',') if k.strip()]
+                    all_urls = [my_url_input] + comps
+                    
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    results_data = []
+                    
+                    crawler_comp = UltraFrogCrawler() 
+                    
+                    with ThreadPoolExecutor(max_workers=3) as executor:
+                        future_to_url = {executor.submit(crawler_comp.extract_page_data, u): u for u in all_urls}
+                        
+                        for i, future in enumerate(as_completed(future_to_url)):
+                            url = future_to_url[future]
+                            status_text.text(f"Fetching Advanced Metrics: {url}")
+                            
+                            try:
+                                data = future.result()
+                                parsed_url = urlparse(url)
+                                domain = parsed_url.netloc.lower()
+                                
+                                try:
+                                    r = requests.get(url, timeout=8, headers={'User-Agent': 'Mozilla/5.0'})
+                                    soup = BeautifulSoup(r.content, 'html.parser')
+                                    
+                                    list_count = len(soup.find_all(['ul', 'ol']))
+                                    table_count = len(soup.find_all('table'))
+                                    video_count = len(soup.find_all(['iframe', 'video']))
+                                    
+                                    paragraphs = soup.find_all('p')
+                                    p_lengths = [len(p.get_text().split()) for p in paragraphs if len(p.get_text().strip()) > 0]
+                                    avg_p_len = sum(p_lengths) / len(p_lengths) if p_lengths else 0
+                                    
+                                    publish_date = extract_publish_date(soup)
+                                except:
+                                    list_count, table_count, video_count, avg_p_len, publish_date = 0, 0, 0, 0, "Unknown"
+                                
+                                title = str(data.get('title', ''))
+                                desc = str(data.get('meta_description', ''))
+                                h1 = str(data.get('h1_tags', '')).lower()
+                                h2 = str(data.get('h2_tags', '')).lower()
+                                h3 = str(data.get('h3_tags', '')).lower()
+                                body = str(data.get('scope_content', ''))
+                                body_lower = body.lower()
+                                
+                                alts = " ".join([str(img.get('alt', '')).lower() for img in data.get('images', [])])
+                                word_count = data.get('word_count', 0)
+                                image_count = data.get('image_count', 0)
+                                first_100_words = " ".join(body_lower.split()[:100])
+                                
+                                word_to_img_ratio = round(word_count / image_count, 1) if image_count > 0 else word_count
+                                readability = textstat.flesch_reading_ease(body) if body else 0
+                                domain_age = get_domain_age(domain)
+                                
+                                ext_links = data.get('external_links', [])
+                                nofollow_count = sum(1 for link in ext_links if 'nofollow' in link.get('rel_status', ''))
+                                ext_total = len(ext_links)
+                                nofollow_ratio = f"{int((nofollow_count/ext_total)*100)}%" if ext_total > 0 else "0%"
+                                
+                                total_inlinks_to_page = "Skipped"
+                                if enable_deep_inlinks:
+                                    status_text.text(f"🕷️ Deep Crawling {domain} to find inlinks...")
+                                    total_inlinks_to_page = deep_crawl_for_inlinks(url, max_pages=max_inlink_pages)
+                                
+                                kw_stats = {}
+                                for kw in keywords:
+                                    fuzzy_count = count_fuzzy_match(body, kw)
+                                    kw_stats[kw] = {
+                                        'Domain': domain.count(kw), 'URL': parsed_url.path.lower().count(kw),
+                                        'Title': title.lower().count(kw), 'Desc': desc.lower().count(kw),
+                                        'H1': h1.count(kw), 'H2': h2.count(kw), 'H3': h3.count(kw),
+                                        'Alt': alts.count(kw), 'Body Exact': body_lower.count(kw),
+                                        'Body Fuzzy': fuzzy_count,
+                                        'In First 100': "✅" if kw in first_100_words else "❌"
+                                    }
+
+                                lcp, cls, mobile_score = "N/A", "N/A", "N/A"
+                                if psi_api_key:
+                                    status_text.text(f"Running PSI: {url}")
+                                    m_res = run_psi_test(url, psi_api_key, "mobile")
+                                    if isinstance(m_res, dict) and "Score" in m_res:
+                                        mobile_score = m_res['Score']
+                                        lcp = m_res.get('LCP', 'N/A')
+                                        cls = m_res.get('CLS', 'N/A')
+
+                                results_data.append({
+                                    'Type': '🟦 ME' if url == my_url_input else '🟥 COMP',
+                                    'URL': url,
+                                    'Date Published': publish_date,
+                                    'Domain Age': domain_age,
+                                    'Readability': round(readability, 1),
+                                    'Word Count': word_count,
+                                    'Avg Paragraph': f"{round(avg_p_len)} words",
+                                    'Title / Meta Length': f"{len(title)} / {len(desc)}",
+                                    'H2 / H3 Count': f"{data.get('h2_count', 0)} / {data.get('h3_count', 0)}",
+                                    'Word/Img Ratio': f"{word_to_img_ratio}:1",
+                                    'Media (Vid/List/Tab)': f"{video_count} / {list_count} / {table_count}",
+                                    'On-Page Internal Links': data.get('internal_links_count', 0),
+                                    'Total Inlinks (Whole Site)': total_inlinks_to_page, 
+                                    'External Outbound': f"{ext_total} (Nofollow: {nofollow_ratio})",
+                                    'Schema': data.get('schema_types', 'None'),
+                                    'CWV (Score | LCP | CLS)': f"{mobile_score} | {lcp} | {cls}",
+                                    'Keywords': kw_stats,
+                                    'RawBody': body
+                                })
+                                
+                            except Exception as e:
+                                st.error(f"Failed {url}: {e}")
+                                
+                            progress_bar.progress((i + 1) / len(all_urls))
+                    
+                    status_text.success("✅ Deep Analysis Complete!")
+                    
+                    my_data = next((item for item in results_data if 'ME' in item['Type']), None)
+                    comp_data = [item for item in results_data if 'COMP' in item['Type']]
+                    
+                    def get_clean_domain(url_str):
+                        return urlparse(url_str).netloc.replace('www.', '')
+
+                    st.write("### 🏗️ 1. Content & Technical Architecture")
+                    st.markdown("Side-by-side structural comparison. **Metrics are rows, Websites are columns.**")
+                    
+                    if my_data:
+                        metrics_keys = [
+                            'Word Count', 'Readability', 'H2 / H3 Count', 'Images', 
+                            'Word/Img Ratio', 'Media (Vid/List/Tab)', 'On-Page Internal Links', 
+                            'Total Inlinks (Whole Site)', 'External Outbound', 'Schema', 
+                            'Domain Age', 'Date Published', 'CWV (Score | LCP | CLS)'
+                        ]
+                        
+                        t1_rows = []
+                        for metric in metrics_keys:
+                            row = {"Metric": metric}
+                            row["🫵 My Page"] = my_data.get(metric, "N/A")
+                            
+                            for i, comp in enumerate(comp_data):
+                                col_name = f"Comp {i+1} ({get_clean_domain(comp['URL'])})"
+                                row[col_name] = comp.get(metric, "N/A")
+                                
+                            t1_rows.append(row)
+                            
+                        struct_df = pd.DataFrame(t1_rows)
+                        st.dataframe(struct_df, use_container_width=True)
+                    else:
+                        st.error("Could not fetch data for 'Your Page URL'.")
+
+                    st.divider()
+
+                    st.write("### 🎯 2. Keyword Zone Matrix")
+                    st.info("Select a keyword below to see exactly which HTML tags your competitors placed it in.")
+                    
+                    if my_data:
+                        kw_tabs = st.tabs(keywords)
+                        flat_kw_export = [] 
+                        
+                        for i, kw in enumerate(keywords):
+                            with kw_tabs[i]:
+                                zones = ['Body Exact', 'Body Fuzzy', 'In First 100 Words?', 'Title', 'H1', 'H2', 'H3', 'Meta Desc', 'Img Alt', 'URL', 'Domain']
+                                kw_rows = []
+                                
+                                for zone in zones:
+                                    row = {"HTML Zone": zone}
+                                    my_val = my_data['Keywords'][kw].get(zone, 0)
+                                    row["🫵 My Page"] = my_val
+                                    
+                                    comp_vals_for_avg = []
+                                    for j, comp in enumerate(comp_data):
+                                        comp_val = comp['Keywords'][kw].get(zone, 0)
+                                        col_name = f"Comp {j+1} ({get_clean_domain(comp['URL'])})"
+                                        row[col_name] = comp_val
+                                        
+                                        if isinstance(comp_val, (int, float)):
+                                            comp_vals_for_avg.append(comp_val)
+                                    
+                                    if comp_vals_for_avg:
+                                        avg = sum(comp_vals_for_avg) / len(comp_vals_for_avg)
+                                        row["Competitor Avg"] = round(avg, 1)
+                                        
+                                        if isinstance(my_val, (int, float)):
+                                            if my_val < avg: row["Status"] = "📉 Below Avg"
+                                            elif my_val > avg * 2: row["Status"] = "📈 High (Careful)"
+                                            else: row["Status"] = "✅ Optimal"
+                                    else:
+                                        row["Competitor Avg"] = "N/A"
+                                        row["Status"] = "-"
+                                        
+                                    kw_rows.append(row)
+                                    
+                                    flat_row = {"Keyword": kw, **row}
+                                    flat_kw_export.append(flat_row)
+                                
+                                kw_df = pd.DataFrame(kw_rows)
+                                st.dataframe(kw_df, use_container_width=True)
+
+                    st.divider()
+
+                    st.write("### 🧠 3. Semantic LSI Gap Analysis")
+                    st.markdown("Top 2-word and 3-word phrases used by competitors. See exactly who is using which sub-topics.")
+                    
+                    try:
+                        comp_data = [r for r in results_data if 'COMP' in r['Type']]
+                        comp_bodies = [r['RawBody'] for r in comp_data]
+                        my_body = my_data['RawBody'].lower() if my_data else ""
+                        
+                        if comp_bodies:
+                            vec = CountVectorizer(ngram_range=(2, 3), stop_words='english', max_features=30)
+                            matrix = vec.fit_transform(comp_bodies)
+                            sums = matrix.sum(axis=0).A1
+                            vocab = vec.get_feature_names_out()
+                            
+                            freq = [(vocab[idx], sums[idx]) for idx in range(len(vocab))]
+                            freq = sorted(freq, key=lambda x: x[1], reverse=True)
+                            
+                            lsi_data = []
+                            for phrase, total_count in freq[:20]:
+                                my_usage_count = my_body.count(phrase)
+                                status = "✅ Used" if my_usage_count > 0 else "❌ Missing"
+                                
+                                row_data = {
+                                    "Semantic Phrase (LSI)": phrase,
+                                    "🫵 My Page": my_usage_count,
+                                }
+                                
+                                for i, comp in enumerate(comp_data):
+                                    col_name = f"Comp {i+1} ({get_clean_domain(comp['URL'])})"
+                                    row_data[col_name] = comp['RawBody'].lower().count(phrase)
+                                    
+                                row_data["Gap Status"] = status
+                                lsi_data.append(row_data)
+                                
+                            lsi_df = pd.DataFrame(lsi_data)
+                            st.dataframe(
+                                lsi_df, 
+                                use_container_width=True,
+                                column_config={
+                                    "Gap Status": st.column_config.TextColumn("Status", width="small")
+                                }
+                            )
+                        else:
+                            st.warning("Not enough competitor data to generate LSI keywords.")
+                    except Exception as e:
+                        st.error(f"Could not generate LSI phrases: {e}")
+
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    c_btn1, c_btn2, c_btn3 = st.columns(3)
+                    
+                    if 'struct_df' in locals():
+                        c_btn1.download_button("📥 Download Architecture", struct_df.to_csv(index=False).encode('utf-8'), "competitor_structure.csv", "text/csv")
+                    if 'flat_kw_export' in locals() and flat_kw_export:
+                        flat_df = pd.DataFrame(flat_kw_export)
+                        c_btn2.download_button("📥 Download Keyword Matrix", flat_df.to_csv(index=False).encode('utf-8'), "competitor_keywords.csv", "text/csv")
+                    if 'lsi_df' in locals():
+                        c_btn3.download_button("📥 Download LSI Gaps", lsi_df.to_csv(index=False).encode('utf-8'), "lsi_gaps.csv", "text/csv")
+        
+        st.divider()
+        st.header("📥 Full Report")
+        
+        if st.session_state.storage_mode == "SQLite" and os.path.exists(st.session_state.db_file):
+            with open(st.session_state.db_file, "rb") as file:
+                st.download_button("📊 Download Complete Database (SQLite)", file, "battersea_data.db", "application/octet-stream", type="primary")
+        else:
+            csv_all = df.to_csv(index=False).encode('utf-8')
+            st.download_button("📊 Download Complete Crawl Data", csv_all, "complete_crawl.csv", "text/csv", type="primary")
+
     else:
-        csv_all = df.to_csv(index=False).encode('utf-8')
-        st.download_button("📊 Download Complete Crawl Data", csv_all, "complete_crawl.csv", "text/csv")
+        st.info("👈 Configure your crawl settings in the sidebar and click '🚀 Start Crawl' to begin.")
+        
+# ==========================================
+# 3. SOCIAL MEDIA WORKSPACE
+# ==========================================
+elif workspace == "📱 Social Media Reporting":
+    
+    # --- API HELPER FUNCTIONS ---
+    def fetch_meta_data(page_id, ig_id, token, start_date, end_date):
+        """Fetches REAL data with Deep Fetch for Post-Level Impressions filtered by Date"""
+        if not token: return None, None, []
+        
+        fb_data, ig_data = {}, {}
+        all_posts = [] 
+        
+        # ---> THIS IS THE NEW DATE FORMATTING LOGIC <---
+        # We must convert Python dates into "YYYY-MM-DD" text so Facebook understands it
+        since_str = start_date.strftime('%Y-%m-%d')
+        until_str = (end_date + timedelta(days=1)).strftime('%Y-%m-%d')
+        
+        try:
+            # ==========================================
+            # 1. FACEBOOK PAGE DATA
+            # ==========================================
+            page_token = token 
+            
+            if page_id:
+                # 1A: Get Page Access Token
+                token_url = f"https://graph.facebook.com/v19.0/{page_id}?fields=access_token&access_token={token}"
+                token_res = requests.get(token_url).json()
+                page_token = token_res.get('access_token', token)
+                
+                # 1B: Get Page Followers
+                fb_info_url = f"https://graph.facebook.com/v19.0/{page_id}?fields=followers_count,fan_count&access_token={page_token}"
+                fb_info_res = requests.get(fb_info_url).json()
+                followers = fb_info_res.get('followers_count', fb_info_res.get('fan_count', 0))
+                
+                # 1C: Get Page Impressions
+                impressions = 0
+                fb_insights_url = f"https://graph.facebook.com/v19.0/{page_id}/insights?metric=page_impressions&period=day&access_token={page_token}"
+                fb_insights_res = requests.get(fb_insights_url).json()
+                if "data" in fb_insights_res and len(fb_insights_res["data"]) > 0:
+                    vals = fb_insights_res["data"][0].get("values", [])
+                    impressions = sum(v.get("value", 0) for v in vals)
+                
+                # 1D: Get Posts & DEEP FETCH Impressions (NOW USING SINCE/UNTIL DATES)
+                engagements = 0
+                fb_posts_url = f"https://graph.facebook.com/v19.0/{page_id}/published_posts?fields=id,created_time,permalink_url,likes.summary(true),comments.summary(true),shares&since={since_str}&until={until_str}&limit=100&access_token={page_token}"
+                fb_posts_res = requests.get(fb_posts_url).json()
+                
+                if "data" in fb_posts_res:
+                    for post in fb_posts_res["data"]:
+                        post_id = post.get("id")
+                        likes = post.get("likes", {}).get("summary", {}).get("total_count", 0)
+                        comments = post.get("comments", {}).get("summary", {}).get("total_count", 0)
+                        shares = post.get("shares", {}).get("count", 0)
+                        engagements += (likes + comments + shares)
+                        
+                        # --- THE DEEP FETCH FOR FB IMPRESSIONS ---
+                        post_imps = "-" # Default to a clean dash
+                        try:
+                            p_ins_url = f"https://graph.facebook.com/v19.0/{post_id}/insights?metric=post_impressions&access_token={page_token}"
+                            p_ins_res = requests.get(p_ins_url).json()
+                            
+                            # If Facebook returns an error (like on a Reel), keep it a clean dash
+                            if "error" in p_ins_res:
+                                post_imps = "-" 
+                            # If it succeeds, grab the actual number
+                            elif "data" in p_ins_res and len(p_ins_res["data"]) > 0:
+                                post_imps = p_ins_res["data"][0]["values"][0]["value"]
+                        except: 
+                            pass
+                        
+                        date_str = post.get("created_time", "").split("T")[0] if "created_time" in post else "Unknown"
+                        all_posts.append({
+                            "Date": date_str,
+                            "Platform": "Facebook",
+                            "Post Type": "Post",
+                            "Preview Link": post.get("permalink_url", "https://facebook.com"),
+                            "Impressions": post_imps,
+                            "Likes": likes,
+                            "Comments": comments,
+                            "Shares/Reposts": shares
+                        })
+                
+                er = round((engagements / impressions) * 100, 2) if impressions > 0 else 0
+                
+                fb_data = {
+                    "Followers": followers, 
+                    "Impressions": impressions, 
+                    "Engagements": engagements,
+                    "ER %": f"{er}%"
+                }
 
-else:
-    st.info("👈 Configure your crawl settings and click '🚀 Start Crawl' to begin.")
+            # ==========================================
+            # 1.5. AUTO-DISCOVER INSTAGRAM ID
+            # ==========================================
+            actual_ig_id = ig_id 
+            if page_id:
+                find_ig_url = f"https://graph.facebook.com/v19.0/{page_id}?fields=instagram_business_account&access_token={page_token}"
+                find_ig_res = requests.get(find_ig_url).json()
+                if 'instagram_business_account' in find_ig_res:
+                    actual_ig_id = find_ig_res['instagram_business_account']['id']
+            
+            # ==========================================
+            # 2. INSTAGRAM ACCOUNT DATA
+            # ==========================================
+            if actual_ig_id:
+                clean_ig_id = str(actual_ig_id).replace("@", "").strip()
+                
+                # Get IG Followers
+                ig_info_url = f"https://graph.facebook.com/v19.0/{clean_ig_id}?fields=followers_count&access_token={token}"
+                ig_info_res = requests.get(ig_info_url).json()
+                ig_followers = ig_info_res.get('followers_count', 0) if "error" not in ig_info_res else 0
+                    
+                # Get IG Overall Reach
+                ig_impressions = 0
+                ig_insights_url = f"https://graph.facebook.com/v19.0/{clean_ig_id}/insights?metric=reach&period=day&access_token={token}"
+                ig_insights_res = requests.get(ig_insights_url).json()
+                if "data" in ig_insights_res and len(ig_insights_res["data"]) > 0:
+                    vals = ig_insights_res["data"][0].get("values", [])
+                    ig_impressions = sum(v.get("value", 0) for v in vals)
+                
+                # Get IG Media & DEEP FETCH Reach (NOW USING SINCE/UNTIL DATES)
+                ig_engagements = 0
+                ig_media_url = f"https://graph.facebook.com/v19.0/{clean_ig_id}/media?fields=id,timestamp,permalink,media_type,like_count,comments_count&since={since_str}&until={until_str}&limit=100&access_token={token}"
+                ig_media_res = requests.get(ig_media_url).json()
+                
+                if "data" in ig_media_res:
+                    for media in ig_media_res["data"]:
+                        m_id = media.get("id")
+                        likes = media.get("like_count", 0)
+                        comments = media.get("comments_count", 0)
+                        ig_engagements += (likes + comments)
+                        
+                        # --- THE DEEP FETCH FOR IG REACH ---
+                        ig_post_reach = "N/A"
+                        try:
+                            m_ins_url = f"https://graph.facebook.com/v19.0/{m_id}/insights?metric=reach&access_token={token}"
+                            m_ins_res = requests.get(m_ins_url).json()
+                            if "data" in m_ins_res and len(m_ins_res["data"]) > 0:
+                                ig_post_reach = m_ins_res["data"][0]["values"][0]["value"]
+                        except: pass
+                        
+                        date_str = media.get("timestamp", "").split("T")[0] if "timestamp" in media else "Unknown"
+                        all_posts.append({
+                            "Date": date_str,
+                            "Platform": "Instagram",
+                            "Post Type": media.get("media_type", "Media"),
+                            "Preview Link": media.get("permalink", "https://instagram.com"),
+                            "Impressions": ig_post_reach,
+                            "Likes": likes,
+                            "Comments": comments,
+                            "Shares/Reposts": "API Restricted" 
+                        })
+                
+                ig_er = round((ig_engagements / ig_impressions) * 100, 2) if ig_impressions > 0 else 0
+                            
+                ig_data = {
+                    "Followers": ig_followers, 
+                    "Impressions": ig_impressions, 
+                    "Engagements": ig_engagements, 
+                    "ER %": f"{ig_er}%"
+                }
+                    
+            return fb_data if fb_data else None, ig_data if ig_data else None, all_posts
+            
+        except Exception as e:
+            st.error(f"🚨 Python Request Error: {e}")
+            return None, None, []
+
+    def fetch_linkedin_data(org_urn, token):
+        """Fetches data from LinkedIn API"""
+        if not token or not org_urn: return None
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Restli-Protocol-Version": "2.0.0",
+            "LinkedIn-Version": "202401"
+        }
+        try:
+            # Example endpoint for page statistics
+            li_url = f"https://api.linkedin.com/rest/organizationalEntityPageStatistics?q=organization&organization={org_urn}"
+            li_res = requests.get(li_url, headers=headers).json()
+            return {"Followers": 0, "Impressions": 0, "Engagements": 0} # Parse real response here
+        except Exception as e:
+            st.error(f"LinkedIn API Error: {e}")
+            return None
+
+    def fetch_x_data(username, token):
+        """Fetches data from X (Twitter) API v2"""
+        if not token or not username: return None
+        headers = {"Authorization": f"Bearer {token}"}
+        try:
+            # First get User ID from username
+            user_url = f"https://api.twitter.com/2/users/by/username/{username}?user.fields=public_metrics"
+            user_res = requests.get(user_url, headers=headers).json()
+            if "data" in user_res:
+                metrics = user_res["data"]["public_metrics"]
+                return {"Followers": metrics.get("followers_count", 0), "Impressions": 0, "Engagements": 0}
+            return None
+        except Exception as e:
+            st.error(f"X API Error: {e}")
+            return None
+
+    # --- CREDENTIALS MANAGEMENT (MULTI-CLIENT) ---
+    SMO_CRED_FILE = "smo_credentials.json"
+    
+    def load_smo_creds():
+        if os.path.exists(SMO_CRED_FILE):
+            with open(SMO_CRED_FILE, "r") as f:
+                return json.load(f)
+        return {} # Returns an empty dict if no file exists
+
+    def save_smo_creds(creds_dict):
+        with open(SMO_CRED_FILE, "w") as f:
+            json.dump(creds_dict, f, indent=4)
+
+    saved_creds = load_smo_creds()
+
+    # --- SIDEBAR CONFIGURATION ---
+    with st.sidebar:
+        st.markdown("### 👤 Client Details")
+        
+        # 1. Profile Selector
+        client_options = list(saved_creds.keys())
+        client_options.insert(0, "➕ Create New Client...")
+        
+        selected_profile = st.selectbox("Select Client Profile", client_options)
+        
+        # 2. Setup variables based on selection
+        if selected_profile == "➕ Create New Client...":
+            client_name = st.text_input("New Client Name", placeholder="e.g., Travio World")
+            c_data = {} # Empty data for new client
+        else:
+            client_name = selected_profile
+            c_data = saved_creds.get(selected_profile, {})
+            # Read-only display of the selected name to avoid confusion
+            st.text_input("Editing Client:", value=client_name, disabled=True) 
+
+        # 3. Date Range
+        today = datetime.now()
+        thirty_days_ago = today - timedelta(days=30)
+        date_range_smo = st.date_input("Reporting Period", value=(thirty_days_ago, today), format="DD/MM/YYYY")
+        
+        # 4. IDs and Tokens (Auto-filled if c_data exists)
+        with st.expander("🔗 Platform Page IDs", expanded=(selected_profile == "➕ Create New Client...")):
+            fb_page_id = st.text_input("Facebook Page ID", value=c_data.get("fb_page_id", ""))
+            ig_account_id = st.text_input("Instagram Account ID", value=c_data.get("ig_account_id", ""))
+            li_org_urn = st.text_input("LinkedIn Org URN", value=c_data.get("li_org_urn", ""))
+            x_username = st.text_input("X (Twitter) Username", value=c_data.get("x_username", ""))
+            
+        with st.expander("🔑 API Authentication", expanded=False):
+            meta_token = st.text_input("Meta Access Token", type="password", value=c_data.get("meta_token", ""))
+            li_token = st.text_input("LinkedIn Bearer Token", type="password", value=c_data.get("li_token", ""))
+            x_token = st.text_input("X Bearer Token", type="password", value=c_data.get("x_token", ""))
+            
+        # 5. Save Button
+        if st.button("💾 Save Client Profile"):
+            if not client_name:
+                st.error("Please enter a Client Name before saving.")
+            else:
+                # Update the specific client's data in the master dictionary
+                saved_creds[client_name] = {
+                    "fb_page_id": fb_page_id,
+                    "ig_account_id": ig_account_id,
+                    "li_org_urn": li_org_urn,
+                    "x_username": x_username,
+                    "meta_token": meta_token,
+                    "li_token": li_token,
+                    "x_token": x_token
+                }
+                save_smo_creds(saved_creds)
+                st.success(f"Saved profile for {client_name}!")
+                time.sleep(1)
+                st.rerun()
+                
+        # Optional: Delete Profile Button
+        if selected_profile != "➕ Create New Client...":
+            if st.button("🗑️ Delete Profile"):
+                del saved_creds[selected_profile]
+                save_smo_creds(saved_creds)
+                st.warning(f"Deleted profile: {selected_profile}")
+                time.sleep(1)
+                st.rerun()
+            
+        st.divider()
+        fetch_smo_data = st.button("🔄 Fetch Live Data", type="primary", use_container_width=True)
+
+    # --- INITIALIZE SESSION STATE FOR SOCIAL DATA ---
+    if 'social_overview_df' not in st.session_state:
+        st.session_state.social_overview_df = pd.DataFrame(columns=["Platform", "Followers", "Impressions", "Engagements", "ER %"])
+    if 'social_posts_df' not in st.session_state:
+        st.session_state.social_posts_df = pd.DataFrame(columns=["Date", "Platform", "Post Type", "Preview Link", "Impressions", "Likes", "Comments"])
+
+    # --- MAIN DASHBOARD ---
+    st.header(f"📱 Social Media Reporting: {client_name if client_name else 'Select Client'}")
+    
+    # Tabs
+    tab_overview, tab_platforms, tab_posts, tab_ai_writer, tab_reports = st.tabs([
+        "📊 Executive Overview", "📱 Platform Deep-Dive", "📝 Top Posts", "🤖 AI Content Hub", "📥 Client Reports"
+    ])
+    
+    # --- FETCH DATA LOGIC ---
+    if fetch_smo_data:
+        if len(date_range_smo) != 2:
+            st.error("Please select both a Start Date and End Date in the sidebar.")
+        else:
+            with st.spinner("Connecting to platform APIs..."):
+                start_d, end_d = date_range_smo[0], date_range_smo[1]
+                
+                # 1. Fetch Meta (Now passing start_d and end_d)
+                fb_stats, ig_stats, meta_posts = fetch_meta_data(fb_page_id, ig_account_id, meta_token, start_d, end_d)
+            
+            # 2. Fetch LinkedIn
+            li_stats = fetch_linkedin_data(li_org_urn, li_token)
+            # 3. Fetch X
+            x_stats = fetch_x_data(x_username, x_token)
+            
+            # Combine into list
+            api_results = []
+            if fb_stats: api_results.append({"Platform": "Facebook", **fb_stats})
+            if ig_stats: api_results.append({"Platform": "Instagram", **ig_stats})
+            if li_stats: api_results.append({"Platform": "LinkedIn", **li_stats})
+            if x_stats: api_results.append({"Platform": "X (Twitter)", **x_stats})
+            
+            if api_results:
+                st.session_state.social_overview_df = pd.DataFrame(api_results)
+                
+                # SAVING POSTS FOR TAB 3!
+                if meta_posts:
+                    st.session_state.social_posts_df = pd.DataFrame(meta_posts)
+                
+                st.toast("Live API Data successfully loaded!", icon="✅")
+            else:
+                st.warning("No API data fetched. Check your tokens and IDs.")
+    # -------------------------------------------------------------
+    # TAB 1: EXECUTIVE OVERVIEW
+    # -------------------------------------------------------------
+    with tab_overview:
+        st.subheader("📊 Cross-Platform Performance")
+        
+        df_overview = st.session_state.social_overview_df
+        
+        if df_overview.empty:
+            st.info("👈 Enter your client IDs and API tokens in the sidebar, then click 'Fetch Live Data'.")
+        else:
+            # Calculate Totals (Using .columns for best practice)
+            tot_followers = df_overview['Followers'].sum() if 'Followers' in df_overview.columns else 0
+            tot_imps = df_overview['Impressions'].sum() if 'Impressions' in df_overview.columns else 0
+            tot_eng = df_overview['Engagements'].sum() if 'Engagements' in df_overview.columns else 0
+            
+            # Calculate Total Average Engagement Rate
+            if tot_imps > 0:
+                avg_er = round((tot_eng / tot_imps) * 100, 2)
+                avg_er_display = f"{avg_er}%"
+            else:
+                avg_er_display = "0%"
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Audience", f"{tot_followers:,}")
+            m2.metric("Total Impressions", f"{tot_imps:,}")
+            m3.metric("Total Engagements", f"{tot_eng:,}")
+            m4.metric("Avg. Engagement Rate", avg_er_display) 
+            
+            st.divider()
+            st.write("#### Platform Breakdown")
+            st.dataframe(df_overview, use_container_width=True)
+        
+    # -------------------------------------------------------------
+    # TAB 2: PLATFORM DEEP DIVE
+    # -------------------------------------------------------------
+    with tab_platforms:
+        st.subheader("📱 Platform Deep-Dive")
+        selected_platform = st.selectbox("Select Platform to Inspect:", ["Instagram", "Facebook", "LinkedIn", "X (Twitter)"])
+        st.info("In the future, map specific API demographic and geography arrays to this table.")
+        st.dataframe(pd.DataFrame(columns=["Audience Segment", "Value"]), use_container_width=True)
+            
+    # -------------------------------------------------------------
+    # TAB 3: TOP POSTS
+    # -------------------------------------------------------------
+    with tab_posts:
+        st.subheader("📝 Top Performing Posts")
+        
+        df_posts = st.session_state.social_posts_df
+        
+        if df_posts.empty:
+             st.info("👈 Click 'Fetch Live Data' in the sidebar to populate your posts.")
+        else:
+            # 1. Filter DataFrames by Platform
+            fb_posts = df_posts[df_posts['Platform'] == 'Facebook'].copy()
+            ig_posts = df_posts[df_posts['Platform'] == 'Instagram'].copy()
+            
+            # Common Column Config (Turns the URL into a clickable link)
+            col_conf = {
+                "Preview Link": st.column_config.LinkColumn("View Post")
+            }
+            
+            # 2. Render Facebook Table
+            st.markdown("### 🟦 Facebook Posts")
+            if not fb_posts.empty:
+                # We drop the 'Platform' column here because it's redundant now
+                st.dataframe(
+                    fb_posts.drop(columns=['Platform']), 
+                    use_container_width=True, 
+                    column_config=col_conf
+                )
+            else:
+                st.info("No Facebook posts found for this period.")
+                
+            st.divider()
+            
+            # 3. Render Instagram Table
+            st.markdown("### 📸 Instagram Posts")
+            if not ig_posts.empty:
+                st.dataframe(
+                    ig_posts.drop(columns=['Platform']), 
+                    use_container_width=True, 
+                    column_config=col_conf
+                )
+            else:
+                st.info("No Instagram posts found for this period.")
+        
+    # -------------------------------------------------------------
+    # TAB 4: AI CONTENT HUB
+    # -------------------------------------------------------------
+    with tab_ai_writer:
+        st.subheader("🤖 AI Content Hub")
+        st.info("Generate social media captions instantly using your SEO AI models.")
+        
+        c_topic, c_tone = st.columns([3, 1])
+        topic = c_topic.text_area("What is the post about? (Paste URL or text)", height=100)
+        tone = c_tone.selectbox("Tone of Voice", ["Professional", "Witty/Humorous", "Educational", "Urgent/Sales"])
+        
+        if st.button("✨ Generate Captions", type="primary"):
+            if topic:
+                with st.spinner("Writing captions..."):
+                    # REUSE YOUR EXISTING AI FUNCTION HERE
+                    prompt = f"Write a social media post about this topic: '{topic}'. Tone: {tone}. Give me one version for LinkedIn and one for X (Twitter)."
+                    
+                    # Assuming you have the Groq/Gemini variables loaded from the SEO tab, 
+                    # or you can add them to the Social sidebar. For now, simulating output:
+                    time.sleep(1.5)
+                    st.success("Feature ready! Connect your Groq/Gemini function here.")
+            else:
+                st.warning("Please enter a topic first.")
+                
+    # -------------------------------------------------------------
+    # TAB 5: CLIENT REPORTS
+    # -------------------------------------------------------------
+    with tab_reports:
+        st.subheader("📥 Client Reporting")
+        st.write(f"Generate the end-of-month report for **{client_name if client_name else 'the client'}**.")
+        
+        if st.button("🧠 Generate Executive Summary (AI)"):
+            if st.session_state.social_overview_df.empty:
+                st.warning("Fetch API data first so the AI has numbers to analyze.")
+            else:
+                st.info("Pass `st.session_state.social_overview_df` to your AI prompt to write a summary.")
+        
+        st.divider()
+        
+        if not st.session_state.social_overview_df.empty:
+            csv_export = st.session_state.social_overview_df.to_csv(index=False).encode('utf-8')
+            file_name = f"{client_name.replace(' ', '_')}_Social_Report.csv" if client_name else "Social_Report.csv"
+            
+            st.download_button(
+                label="📊 Download Complete CSV Report",
+                data=csv_export,
+                file_name=file_name,
+                mime="text/csv",
+                type="primary"
+            )
+
+# ==========================================
+# 4. CONTENT WRITERS WORKSPACE
+# ==========================================
+elif workspace == "✍️ Content Writers Hub":
+    st.header("✍️ Content Writers Hub")
+    st.info("Add your AI Generation, Grammar checking, and Plagiarism tools here.")
+    # You can move your LanguageTool logic here if you want it decoupled from the crawler
+
+# ==========================================
+# 5. OTHER TOOLS (UTILITIES) WORKSPACE
+# ==========================================
+elif workspace == "🛠️ Other Tools":
+    st.header("🛠️ Agency Utility Tools")
+    st.markdown("A collection of formatting, compression, and conversion tools for the team.")
+
+    tab_img, tab_pdf, tab_html = st.tabs(["🖼️ Image Tools", "📄 PDF Tools", "🌐 HTML & Doc Tools"])
+
+    # ---------------------------------------------------------
+    # TAB 1: IMAGE TOOLS
+    # ---------------------------------------------------------
+    with tab_img:
+        st.subheader("🗜️ Bulk Image Optimizer (Size Reducer)")
+        st.info("Resize and compress heavy images into SEO-friendly WebP format.")
+        
+        up_imgs = st.file_uploader("Upload Images for Optimization", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True, key="opt_imgs")
+        c_opt1, c_opt2 = st.columns(2)
+        max_width = c_opt1.number_input("Max Width (px)", value=1200, step=100)
+        quality = c_opt2.slider("WebP Quality (1-100)", 10, 100, 75)
+        
+        if up_imgs and st.button("🚀 Compress to WebP", type="primary"):
+            with st.spinner("Compressing images..."):
+                zip_buf = io.BytesIO()
+                with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED, False) as zf:
+                    for img_file in up_imgs:
+                        try:
+                            img = Image.open(img_file)
+                            if img.mode in ("RGBA", "P"): img = img.convert("RGB")
+                            if img.width > max_width:
+                                ratio = max_width / float(img.width)
+                                new_h = int((float(img.height) * float(ratio)))
+                                img = img.resize((max_width, new_h), Image.Resampling.LANCZOS)
+                                
+                            img_byte_arr = io.BytesIO()
+                            img.save(img_byte_arr, format='WEBP', quality=quality, optimize=True)
+                            
+                            orig_name = img_file.name.rsplit('.', 1)[0]
+                            zf.writestr(f"{orig_name}_optimized.webp", img_byte_arr.getvalue())
+                        except Exception as e: st.error(f"Failed {img_file.name}: {e}")
+                            
+                st.success("✅ Compression Complete!")
+                st.download_button("📥 Download Optimized Images (ZIP)", zip_buf.getvalue(), "optimized_images.zip", "application/zip")
+
+        st.divider()
+
+        st.subheader("🔄 Universal Image & Doc to PDF Converter")
+        st.info("Convert any image format to another (e.g., WEBP to PNG, JPG to PDF, etc.)")
+        
+        conv_imgs = st.file_uploader("Upload Images to Convert", type=['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'tiff'], accept_multiple_files=True, key="conv_imgs")
+        target_fmt = st.selectbox("Convert to Format:", ["PNG", "JPEG", "WEBP", "BMP", "PDF"])
+        
+        if conv_imgs and st.button("🔄 Convert Images", type="primary"):
+            with st.spinner(f"Converting to {target_fmt}..."):
+                zip_buf = io.BytesIO()
+                with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED, False) as zf:
+                    for img_file in conv_imgs:
+                        try:
+                            img = Image.open(img_file)
+                            # Handle transparency issues for JPEG/BMP/PDF
+                            if img.mode in ("RGBA", "P") and target_fmt in ["JPEG", "BMP", "PDF"]: 
+                                img = img.convert("RGB")
+                                
+                            img_byte_arr = io.BytesIO()
+                            img.save(img_byte_arr, format=target_fmt)
+                            
+                            orig_name = img_file.name.rsplit('.', 1)[0]
+                            ext = target_fmt.lower() if target_fmt != "JPEG" else "jpg"
+                            zf.writestr(f"{orig_name}_converted.{ext}", img_byte_arr.getvalue())
+                        except Exception as e: st.error(f"Failed {img_file.name}: {e}")
+                
+                st.success("✅ Conversion Complete!")
+                st.download_button("📥 Download Converted Files (ZIP)", zip_buf.getvalue(), f"converted_to_{target_fmt}.zip", "application/zip")
+
+    # ---------------------------------------------------------
+    # TAB 2: PDF TOOLS
+    # ---------------------------------------------------------
+    with tab_pdf:
+        st.subheader("📸 PDF to Image Converter")
+        st.info("Extracts every page of a PDF into high-quality JPGs or PNGs.")
+        pdf_file = st.file_uploader("Upload PDF File", type=['pdf'], key="pdf_to_img")
+        img_fmt = st.radio("Output Image Format:", ["png", "jpeg"], horizontal=True)
+        
+        if pdf_file and st.button("📸 Convert PDF to Images", type="primary"):
+            with st.spinner("Extracting pages..."):
+                try:
+                    doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
+                    zip_buf = io.BytesIO()
+                    with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED) as zf:
+                        for page_num in range(len(doc)):
+                            page = doc.load_page(page_num)
+                            pix = page.get_pixmap(dpi=300) # High quality
+                            img_bytes = pix.tobytes(img_fmt)
+                            
+                            orig_name = pdf_file.name.replace('.pdf', '')
+                            ext = "jpg" if img_fmt == "jpeg" else "png"
+                            zf.writestr(f"{orig_name}_page_{page_num+1}.{ext}", img_bytes)
+                            
+                    st.success(f"✅ Extracted {len(doc)} pages!")
+                    st.download_button("📥 Download Images (ZIP)", zip_buf.getvalue(), f"{orig_name}_images.zip", "application/zip")
+                except Exception as e:
+                    st.error(f"Failed: {e}")
+
+        st.divider()
+
+        st.subheader("📝 PDF to Word (DOCX) Converter")
+        pdf_to_word = st.file_uploader("Upload PDF", type=['pdf'], key="pdf_to_word")
+        if pdf_to_word and st.button("📝 Convert to Word", type="primary"):
+            with st.spinner("Converting document..."):
+                try:
+                    # Write to temp file (pdf2docx requires file paths, not streams)
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_in:
+                        tmp_in.write(pdf_to_word.read())
+                        tmp_in_path = tmp_in.name
+                        
+                    out_path = tmp_in_path.replace(".pdf", ".docx")
+                    
+                    cv = Converter(tmp_in_path)
+                    cv.convert(out_path)
+                    cv.close()
+                    
+                    with open(out_path, "rb") as f:
+                        docx_data = f.read()
+                        
+                    st.success("✅ Converted to Word!")
+                    orig_name = pdf_to_word.name.replace('.pdf', '.docx')
+                    st.download_button("📥 Download DOCX", docx_data, orig_name, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                    
+                    # Cleanup temp files
+                    os.remove(tmp_in_path)
+                    os.remove(out_path)
+                except Exception as e:
+                    st.error(f"Failed: {e}")
+
+        st.divider()
+        st.subheader("📄 Word (DOCX) to PDF Converter")
+        st.info("Note: This feature requires Microsoft Word to be installed on the machine running Streamlit.")
+        word_to_pdf = st.file_uploader("Upload Word Doc", type=['docx'], key="word_to_pdf")
+        if word_to_pdf and st.button("📄 Convert to PDF", type="primary"):
+            with st.spinner("Converting to PDF..."):
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp_in:
+                        tmp_in.write(word_to_pdf.read())
+                        tmp_in_path = tmp_in.name
+                        
+                    out_path = tmp_in_path.replace(".docx", ".pdf")
+                    docx2pdf_convert(tmp_in_path, out_path)
+                    
+                    with open(out_path, "rb") as f:
+                        pdf_data = f.read()
+                        
+                    st.success("✅ Converted to PDF!")
+                    orig_name = word_to_pdf.name.replace('.docx', '.pdf')
+                    st.download_button("📥 Download PDF", pdf_data, orig_name, "application/pdf")
+                    
+                    os.remove(tmp_in_path)
+                    os.remove(out_path)
+                except Exception as e:
+                    st.error(f"Failed: Ensure MS Word is installed. Error: {e}")
+
+    # ---------------------------------------------------------
+    # TAB 3: HTML & DOC TOOLS
+    # ---------------------------------------------------------
+    with tab_html:
+        st.subheader("🌐 HTML to Word (DOCX)")
+        st.info("Paste HTML code and instantly get a cleanly formatted Word Document.")
+        
+        html_input = st.text_area("Paste HTML Code Here", height=200)
+        if st.button("📝 Generate Word Doc", type="primary"):
+            if not html_input:
+                st.warning("Please paste HTML first.")
+            else:
+                try:
+                    document = docx.Document()
+                    new_parser = HtmlToDocx()
+                    new_parser.add_html_to_document(html_input, document)
+                    
+                    doc_io = io.BytesIO()
+                    document.save(doc_io)
+                    
+                    st.success("✅ Generated successfully!")
+                    st.download_button("📥 Download Word Doc", doc_io.getvalue(), "HTML_Conversion.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                except Exception as e:
+                    st.error(f"Error parsing HTML: {e}")
+
+        st.divider()
+
+        st.subheader("🌐 HTML to PDF")
+        st.info("⚠️ Note: Requires `wkhtmltopdf` installed on your server/computer for this to work.")
+        html_pdf_input = st.text_area("Paste HTML Code Here", height=200, key="html_to_pdf")
+        if st.button("📄 Generate PDF", type="primary"):
+            if not html_pdf_input:
+                st.warning("Please paste HTML first.")
+            else:
+                try:
+                    # Uses default wkhtmltopdf installation path.
+                    pdf_bytes = pdfkit.from_string(html_pdf_input, False)
+                    st.success("✅ PDF Generated!")
+                    st.download_button("📥 Download PDF", pdf_bytes, "HTML_Conversion.pdf", "application/pdf")
+                except Exception as e:
+                    st.error(f"Failed. Make sure wkhtmltopdf is installed. Error: {e}")
