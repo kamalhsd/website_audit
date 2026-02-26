@@ -859,12 +859,13 @@ class UltraFrogCrawler:
                 if sitemapindex:
                     for sitemap in sitemapindex:
                         loc = sitemap.find('sitemap:loc', namespaces)
-                        if loc is not None: urls.extend(self.extract_sitemap_urls(loc.text))
+                        if loc is not None and loc.text: urls.extend(self.extract_sitemap_urls(loc.text.strip()))
                 else:
                     url_elements = root.findall('.//sitemap:url', namespaces)
                     for url_elem in url_elements:
                         loc = url_elem.find('sitemap:loc', namespaces)
-                        if loc is not None: urls.append(loc.text)
+                        if loc is not None and loc.text: urls.append(loc.text.strip())
+                        
         except Exception as e: st.error(f"Error parsing sitemap: {e}")
         return urls
         
@@ -1013,8 +1014,10 @@ class UltraFrogCrawler:
                 if specific_section: search_area = specific_section
             
             for link in search_area.find_all('a', href=True):
-                href = urljoin(response.url, link['href']) 
-                href = href.split('#')[0]
+                # FIX: Strip whitespace from the raw href before and after processing
+                raw_href = link['href'].strip()
+                href = urljoin(response.url, raw_href) 
+                href = href.split('#')[0].strip()
                 if not href: continue
 
                 link_text = self.smart_clean(link.get_text())[:100]
@@ -1325,6 +1328,7 @@ def measure_rendered_images(url_list, progress_callback=None):
 
 # --- CRAWLER HANDLERS ---
 def crawl_website(start_url, max_urls, crawl_scope, progress_container, ignore_robots=False, custom_selector=None, link_selector=None, search_config=None, use_js=False, storage="RAM"):
+    start_url = start_url.strip() # FIX: Ensure the starting URL has no hidden spaces
     crawler = UltraFrogCrawler(max_urls, ignore_robots, crawl_scope, custom_selector, link_selector, search_config, use_js)
     crawler.set_base_url(start_url)
     
@@ -2484,34 +2488,45 @@ if workspace == "🔍 SEO & Technical Audit":
                 st.download_button("📥 Download Image Report", csv_img, "images_report.csv", "text/csv")
 
                 st.divider()
-                st.subheader("📉 Optimize & Resize Images")
+                st.subheader("📉 Optimize & Resize Images (Bulk & Interactive)")
                 
                 if not HAS_PIL:
                     st.error("❌ 'Pillow' library missing. Run `pip install Pillow`")
                 else:
-                    st.info("Resize images to match their rendered size (Step 1) and then compress them (Step 2).")
+                    st.info("Identify heavy images from your crawl, shrink them to their actual rendered size, and compress them.")
                     
-                    c1, c2, c3, c4 = st.columns(4)
-                    min_kb = c1.number_input("Filter Min KB:", 0, 10000, 100)
-                    reduc_pct = c2.slider("Quality %", 10, 90, 50, help="Lower = Smaller File")
-                    target_fmt_ui = c3.selectbox("Format", ["WebP", "JPEG", "PNG", "Original"])
+                    c_f1, c_f2 = st.columns(2)
+                    min_kb = c_f1.number_input("Filter Min KB (Find heavy images):", 0, 10000, 100)
+                    interactive_seo_mode = c_f2.checkbox("🔍 Interactive Preview Mode (Review 1-by-1)", value=False)
                     
-                    resize_mode = c4.selectbox("Resize To:", ["Original Size Only (No Resize)", "Desktop Rendered Size", "Mobile Rendered Size", "Both Desktop & Mobile"])
-
-                    if st.button("✨ Optimize Images", type="primary"):
-                        out_dir = "optimized_images"
-                        if not os.path.exists(out_dir): os.makedirs(out_dir)
-
-                        candidates = img_df[img_df['size_kb'] >= min_kb].drop_duplicates(subset=['image_url'])
+                    # Reset wizard if user unchecks the box
+                    if not interactive_seo_mode and 'seo_wizard_active' in st.session_state:
+                        st.session_state.seo_wizard_active = False
                         
-                        if candidates.empty:
-                            st.warning("No images found matching your size filter.")
-                        else:
+                    st.divider()
+                    
+                    candidates = img_df[img_df['size_kb'] >= min_kb].drop_duplicates(subset=['image_url'])
+                    target_urls = candidates['image_url'].tolist()
+
+                    if candidates.empty:
+                        st.warning(f"No images found larger than {min_kb} KB. Try lowering the filter.")
+                        
+                    elif not interactive_seo_mode:
+                        # ==========================================
+                        # STANDARD BULK MODE
+                        # ==========================================
+                        c1, c2, c3 = st.columns(3)
+                        reduc_pct = c1.slider("Quality %", 10, 90, 50, help="Lower = Smaller File")
+                        target_fmt_ui = c2.selectbox("Format", ["WebP", "JPEG", "PNG", "Original"])
+                        resize_mode = c3.selectbox("Resize To:", ["Original Size Only (No Resize)", "Desktop Rendered Size", "Mobile Rendered Size", "Both Desktop & Mobile"])
+
+                        if st.button("✨ Optimize All (Bulk)", type="primary"):
+                            out_dir = "optimized_images"
+                            if not os.path.exists(out_dir): os.makedirs(out_dir)
+
                             progress = st.progress(0)
                             status = st.empty()
                             report_data = []
-                            
-                            target_urls = candidates['image_url'].tolist()
                             
                             def process_variant(img_obj, url, variant_label, target_w, target_h, original_kb, original_dims_str, old_fmt):
                                 try:
@@ -2548,22 +2563,15 @@ if workspace == "🔍 SEO & Technical Audit":
                                     with open(local_path, "wb") as f: f.write(new_data)
                                     
                                     return {
-                                        "Original URL": url,
-                                        "Variant": variant_label,
-                                        "Old Size KB": round(original_kb, 2),
-                                        "New Size KB": round(new_size_kb, 2),
-                                        "Before Dimension": original_dims_str,
-                                        "New Dimension": new_dims_str,
-                                        "Old Format": old_fmt,
-                                        "New Format": fmt,
-                                        "Path": local_path
+                                        "Original URL": url, "Variant": variant_label, "Old Size KB": round(original_kb, 2),
+                                        "New Size KB": round(new_size_kb, 2), "Before Dimension": original_dims_str,
+                                        "New Dimension": new_dims_str, "Old Format": old_fmt, "New Format": fmt, "Path": local_path
                                     }
-                                except Exception as e:
+                                except Exception:
                                     return None
 
                             def process_image_row(row_tuple):
                                 url = row_tuple.image_url
-                                
                                 desk_render = row_tuple.rendered_desktop
                                 mob_render = row_tuple.rendered_mobile
                                 
@@ -2576,8 +2584,7 @@ if workspace == "🔍 SEO & Technical Audit":
                                     original_dims_str = f"{img_org.width}x{img_org.height}"
                                     old_fmt = img_org.format if img_org.format else 'JPEG'
 
-                                    results = []
-                                    tasks = []
+                                    results, tasks = [], []
                                     
                                     if resize_mode == "Original Size Only (No Resize)":
                                         tasks.append((None, None, "Original"))
@@ -2586,23 +2593,16 @@ if workspace == "🔍 SEO & Technical Audit":
                                         if desk_render and 'x' in desk_render and desk_render != 'Not Scanned':
                                             dw, dh = map(int, desk_render.split('x'))
                                             tasks.append((dw, dh, "Desktop"))
-                                        else:
-                                            tasks.append((None, None, "Skipped (Missing Data)"))
                                             
                                     elif resize_mode == "Mobile Rendered Size":
                                         if mob_render and 'x' in mob_render and mob_render != 'Not Scanned':
                                             mw, mh = map(int, mob_render.split('x'))
                                             tasks.append((mw, mh, "Mobile"))
-                                        else:
-                                            tasks.append((None, None, "Skipped (Missing Data)"))
 
                                     elif resize_mode == "Both Desktop & Mobile":
                                         if desk_render and 'x' in desk_render and desk_render != 'Not Scanned':
                                             dw, dh = map(int, desk_render.split('x'))
                                             tasks.append((dw, dh, "Desktop"))
-                                        else:
-                                            tasks.append((None, None, "Skipped (Missing Data)"))
-                                        
                                         if mob_render and 'x' in mob_render and mob_render != 'Not Scanned':
                                             mw, mh = map(int, mob_render.split('x'))
                                             tasks.append((mw, mh, "Mobile"))
@@ -2612,7 +2612,6 @@ if workspace == "🔍 SEO & Technical Audit":
                                         if res: results.append(res)
                                         
                                     return results
-
                                 except Exception: return []
 
                             with ThreadPoolExecutor(max_workers=5) as exe:
@@ -2624,62 +2623,147 @@ if workspace == "🔍 SEO & Technical Audit":
                                     status.text(f"Processing: {i+1}/{len(candidates)}")
 
                             if report_data:
-                                st.success(f"✅ Generated {len(report_data)} optimized images!")
+                                st.success(f"✅ Generated {len(report_data)} optimized images in folder: `{out_dir}`")
                                 rep_df = pd.DataFrame(report_data)
                                 st.dataframe(rep_df, use_container_width=True)
-                                
                                 csv_rep = rep_df.to_csv(index=False).encode('utf-8')
-                                st.download_button("📥 Download Full Report", csv_rep, "conversion_report.csv", "text/csv")
+                                st.download_button("📥 Download Bulk Report", csv_rep, "conversion_report.csv", "text/csv")
                             else:
                                 st.warning("No images processed successfully.")
 
-            else:
-                st.info("No images found.")
+                    else:
+                        # ==========================================
+                        # NEW INTERACTIVE SEO WIZARD
+                        # ==========================================
+                        if 'seo_wizard_active' not in st.session_state:
+                            st.session_state.seo_wizard_active = False
 
-            # --- 6. OFFLINE BULK IMAGE OPTIMIZER ---
-            st.divider()
-            st.subheader("🗜️ Offline Bulk Image Optimizer")
-            st.info("Upload heavy images. This tool will resize them, compress them, and convert them to SEO-friendly WebP format.")
+                        if not st.session_state.seo_wizard_active:
+                            st.write(f"**Found {len(target_urls)} images.** Ready to review them one by one?")
+                            if st.button("🚀 Start Interactive Wizard", type="primary", use_container_width=True):
+                                st.session_state.seo_wizard_active = True
+                                st.session_state.seo_int_img_index = 0
+                                st.session_state.seo_int_processed_imgs = {}
+                                st.session_state.seo_last_target_urls = target_urls
+                                st.rerun()
+                        else:
+                            # State management specifically for the SEO tab
+                            if 'seo_int_img_index' not in st.session_state:
+                                st.session_state.seo_int_img_index = 0
+                            if 'seo_int_processed_imgs' not in st.session_state:
+                                st.session_state.seo_int_processed_imgs = {}
 
-            uploaded_images = st.file_uploader("Upload Images (JPG, PNG)", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
+                            # Reset if the list of filtered URLs changes
+                            if target_urls != st.session_state.seo_last_target_urls:
+                                st.session_state.seo_last_target_urls = target_urls
+                                st.session_state.seo_int_img_index = 0
+                                st.session_state.seo_int_processed_imgs = {}
 
-            c_opt1, c_opt2 = st.columns(2)
-            max_width_bulk = c_opt1.number_input("Max Width (px) - Good for Hero images", value=1200, step=100)
-            quality_bulk = c_opt2.slider("WebP Quality (1-100)", min_value=10, max_value=100, value=75, help="75 is the sweet spot for SEO.")
+                            if st.session_state.seo_int_img_index < len(target_urls):
+                                current_idx = st.session_state.seo_int_img_index
+                                current_url = target_urls[current_idx]
+                                row_data = candidates[candidates['image_url'] == current_url].iloc[0]
+                                
+                                st.write(f"### Image {current_idx + 1} of {len(target_urls)}")
+                                st.markdown(f"**Found on:** `{row_data['source_url']}`")
+                                st.markdown(f"**Image Link:** `{current_url}`")
+                                
+                                desk_render = row_data.get('rendered_desktop', 'Not Scanned')
+                                mob_render = row_data.get('rendered_mobile', 'Not Scanned')
+                                st.info(f"💡 **Playwright Detected Sizes** -> Desktop: `{desk_render}` | Mobile: `{mob_render}`")
 
-            if uploaded_images and st.button("🚀 Compress & Convert to WebP", type="primary"):
-                with st.spinner("Compressing images..."):
-                    zip_buffer = io.BytesIO()
-                    
-                    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-                        for img_file in uploaded_images:
-                            try:
-                                img = Image.open(img_file)
-                                if img.mode in ("RGBA", "P"):
-                                    img = img.convert("RGB")
+                                try:
+                                    # 1. Download the Live Image
+                                    r = requests.get(current_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'}, verify=False)
+                                    if r.status_code == 200:
+                                        orig_bytes = r.content
+                                        orig_img = Image.open(io.BytesIO(orig_bytes))
+                                        orig_kb = len(orig_bytes) / 1024
+                                        
+                                        # 2. Interactive Controls
+                                        c_ctrl1, c_ctrl2, c_ctrl3 = st.columns(3)
+                                        dyn_width = c_ctrl1.number_input("Max Width (px)", value=min(1200, orig_img.width), step=50, key=f"seo_w_{current_idx}")
+                                        dyn_quality = c_ctrl2.slider("Quality %", 10, 100, 75, key=f"seo_q_{current_idx}")
+                                        dyn_fmt = c_ctrl3.selectbox("Format", ["WEBP", "JPEG", "PNG"], key=f"seo_fmt_{current_idx}")
+                                        
+                                        # 3. Process Live
+                                        if orig_img.mode in ("RGBA", "P") and dyn_fmt in ["JPEG"]: 
+                                            proc_img = orig_img.convert("RGB")
+                                        else:
+                                            proc_img = orig_img.copy()
+                                            
+                                        if proc_img.width > dyn_width:
+                                            ratio = dyn_width / float(proc_img.width)
+                                            new_h = int((float(proc_img.height) * float(ratio)))
+                                            proc_img = proc_img.resize((dyn_width, new_h), Image.Resampling.LANCZOS)
+                                            
+                                        img_byte_arr = io.BytesIO()
+                                        save_args = {'format': dyn_fmt}
+                                        if dyn_fmt in ['JPEG', 'WEBP']: save_args['quality'] = dyn_quality
+                                        if dyn_fmt in ['JPEG', 'WEBP', 'PNG']: save_args['optimize'] = True
+                                            
+                                        proc_img.save(img_byte_arr, **save_args)
+                                        new_bytes = img_byte_arr.getvalue()
+                                        new_kb = len(new_bytes) / 1024
+                                        
+                                        # 4. Preview
+                                        col_l, col_r = st.columns(2)
+                                        with col_l:
+                                            st.markdown(f"**Original:** {orig_img.width}x{orig_img.height}px | **{orig_kb:.1f} KB**")
+                                            st.image(orig_img, use_container_width=True)
+                                        with col_r:
+                                            savings = 100 - ((new_kb / orig_kb) * 100) if orig_kb > 0 else 0
+                                            color = "#38ef7d" if savings > 0 else "#ff4b4b"
+                                            st.markdown(f"**Preview:** {proc_img.width}x{proc_img.height}px | **{new_kb:.1f} KB** (<span style='color:{color}; font-weight:bold;'>-{savings:.1f}%</span>)", unsafe_allow_html=True)
+                                            st.image(new_bytes, use_container_width=True)
+                                        
+                                        st.write("")
+                                        
+                                        # 5. Buttons
+                                        c_btn1, c_btn2, c_btn3 = st.columns([1, 1, 2])
+                                        if c_btn1.button("✅ Accept & Next", type="primary", use_container_width=True):
+                                            base_name = current_url.split('/')[-1].split('?')[0].split('.')[0]
+                                            if not base_name: base_name = f"img_{uuid.uuid4().hex[:6]}"
+                                            base_name = "".join([c for c in base_name if c.isalnum() or c in '_-'])
+                                            save_name = f"{base_name}_opt.{dyn_fmt.lower()}"
+                                            
+                                            st.session_state.seo_int_processed_imgs[save_name] = new_bytes
+                                            st.session_state.seo_int_img_index += 1
+                                            st.rerun()
+                                            
+                                        if c_btn2.button("⏭️ Skip Image", use_container_width=True):
+                                            st.session_state.seo_int_img_index += 1
+                                            st.rerun()
+                                            
+                                    else:
+                                        st.error(f"Failed to fetch image from URL (HTTP {r.status_code}). Target site might block bots.")
+                                        if st.button("⏭️ Skip Blocked Image"):
+                                            st.session_state.seo_int_img_index += 1
+                                            st.rerun()
+                                            
+                                except Exception as e:
+                                    st.error(f"Error loading image: {e}")
+                                    if st.button("⏭️ Skip Broken Image"):
+                                        st.session_state.seo_int_img_index += 1
+                                        st.rerun()
+                                        
+                            else:
+                                st.success(f"🎉 You have reviewed all {len(target_urls)} flagged images!")
+                                
+                                if st.session_state.seo_int_processed_imgs:
+                                    st.write(f"You optimized **{len(st.session_state.seo_int_processed_imgs)}** images.")
+                                    zip_buf = io.BytesIO()
+                                    with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED, False) as zf:
+                                        for name, _bytes in st.session_state.seo_int_processed_imgs.items():
+                                            zf.writestr(name, _bytes)
                                     
-                                if img.width > max_width_bulk:
-                                    ratio = max_width_bulk / float(img.width)
-                                    new_height = int((float(img.height) * float(ratio)))
-                                    img = img.resize((max_width_bulk, new_height), Image.Resampling.LANCZOS)
-                                    
-                                img_byte_arr = io.BytesIO()
-                                img.save(img_byte_arr, format='WEBP', quality=quality_bulk, optimize=True)
+                                    st.download_button("📥 Download Final ZIP", zip_buf.getvalue(), "seo_interactive_optimized.zip", "application/zip", type="primary")
+                                else:
+                                    st.warning("You skipped all images. Nothing to download.")
                                 
-                                original_name = img_file.name.rsplit('.', 1)[0]
-                                zip_file.writestr(f"{original_name}_optimized.webp", img_byte_arr.getvalue())
-                                
-                            except Exception as e:
-                                st.error(f"Failed to process {img_file.name}: {e}")
-                                
-                    st.success("✅ Compression Complete!")
-                    
-                    st.download_button(
-                        label="📥 Download All Optimized WebP Images (ZIP)",
-                        data=zip_buffer.getvalue(),
-                        file_name="seo_optimized_images.zip",
-                        mime="application/zip"
-                    )
+                                if st.button("🔄 Close Wizard"):
+                                    st.session_state.seo_wizard_active = False
+                                    st.rerun()
 
         with tab_meta_titles:
             st.subheader("📝 Meta Tags & Titles Analysis")
@@ -4423,66 +4507,153 @@ elif workspace == "🛠️ Other Tools":
     # TAB 1: IMAGE TOOLS
     # ---------------------------------------------------------
     with tab_img:
-        st.subheader("🗜️ Bulk Image Optimizer (Size Reducer)")
+        st.subheader("🗜️ Image Optimizer (Bulk & Interactive)")
         st.info("Resize and compress heavy images into SEO-friendly WebP format.")
         
         up_imgs = st.file_uploader("Upload Images for Optimization", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True, key="opt_imgs")
-        c_opt1, c_opt2 = st.columns(2)
-        max_width = c_opt1.number_input("Max Width (px)", value=1200, step=100)
-        quality = c_opt2.slider("WebP Quality (1-100)", 10, 100, 75)
         
-        if up_imgs and st.button("🚀 Compress to WebP", type="primary"):
-            with st.spinner("Compressing images..."):
-                zip_buf = io.BytesIO()
-                with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED, False) as zf:
-                    for img_file in up_imgs:
-                        try:
-                            img = Image.open(img_file)
-                            if img.mode in ("RGBA", "P"): img = img.convert("RGB")
-                            if img.width > max_width:
-                                ratio = max_width / float(img.width)
-                                new_h = int((float(img.height) * float(ratio)))
-                                img = img.resize((max_width, new_h), Image.Resampling.LANCZOS)
-                                
-                            img_byte_arr = io.BytesIO()
-                            img.save(img_byte_arr, format='WEBP', quality=quality, optimize=True)
-                            
-                            orig_name = img_file.name.rsplit('.', 1)[0]
-                            zf.writestr(f"{orig_name}_optimized.webp", img_byte_arr.getvalue())
-                        except Exception as e: st.error(f"Failed {img_file.name}: {e}")
-                            
-                st.success("✅ Compression Complete!")
-                st.download_button("📥 Download Optimized Images (ZIP)", zip_buf.getvalue(), "optimized_images.zip", "application/zip")
-
+        interactive_mode = st.checkbox("🔍 Interactive Preview Mode (Review & adjust images one by one)", value=False)
         st.divider()
 
-        st.subheader("🔄 Universal Image & Doc to PDF Converter")
-        st.info("Convert any image format to another (e.g., WEBP to PNG, JPG to PDF, etc.)")
-        
-        conv_imgs = st.file_uploader("Upload Images to Convert", type=['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'tiff'], accept_multiple_files=True, key="conv_imgs")
-        target_fmt = st.selectbox("Convert to Format:", ["PNG", "JPEG", "WEBP", "BMP", "PDF"])
-        
-        if conv_imgs and st.button("🔄 Convert Images", type="primary"):
-            with st.spinner(f"Converting to {target_fmt}..."):
-                zip_buf = io.BytesIO()
-                with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED, False) as zf:
-                    for img_file in conv_imgs:
-                        try:
-                            img = Image.open(img_file)
-                            # Handle transparency issues for JPEG/BMP/PDF
-                            if img.mode in ("RGBA", "P") and target_fmt in ["JPEG", "BMP", "PDF"]: 
-                                img = img.convert("RGB")
+        # --- STATE MANAGEMENT FOR INTERACTIVE MODE ---
+        if 'int_img_index' not in st.session_state:
+            st.session_state.int_img_index = 0
+        if 'int_processed_imgs' not in st.session_state:
+            st.session_state.int_processed_imgs = {}
+        if 'last_upload_names' not in st.session_state:
+            st.session_state.last_upload_names = []
+
+        # Reset the wizard if the user uploads a new batch of files
+        current_names = [f.name for f in up_imgs] if up_imgs else []
+        if current_names != st.session_state.last_upload_names:
+            st.session_state.last_upload_names = current_names
+            st.session_state.int_img_index = 0
+            st.session_state.int_processed_imgs = {}
+
+        if not up_imgs:
+            st.write("Waiting for uploads...")
+            
+        elif not interactive_mode:
+            # ==========================================
+            # STANDARD BULK MODE (Original Logic)
+            # ==========================================
+            c_opt1, c_opt2 = st.columns(2)
+            max_width = c_opt1.number_input("Max Width (px)", value=1200, step=100)
+            quality = c_opt2.slider("WebP Quality (1-100)", 10, 100, 75)
+            
+            if st.button("🚀 Compress All to WebP", type="primary"):
+                with st.spinner("Compressing images..."):
+                    zip_buf = io.BytesIO()
+                    with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED, False) as zf:
+                        for img_file in up_imgs:
+                            try:
+                                img = Image.open(img_file)
+                                if img.mode in ("RGBA", "P"): img = img.convert("RGB")
+                                if img.width > max_width:
+                                    ratio = max_width / float(img.width)
+                                    new_h = int((float(img.height) * float(ratio)))
+                                    img = img.resize((max_width, new_h), Image.Resampling.LANCZOS)
+                                    
+                                img_byte_arr = io.BytesIO()
+                                img.save(img_byte_arr, format='WEBP', quality=quality, optimize=True)
                                 
-                            img_byte_arr = io.BytesIO()
-                            img.save(img_byte_arr, format=target_fmt)
-                            
-                            orig_name = img_file.name.rsplit('.', 1)[0]
-                            ext = target_fmt.lower() if target_fmt != "JPEG" else "jpg"
-                            zf.writestr(f"{orig_name}_converted.{ext}", img_byte_arr.getvalue())
-                        except Exception as e: st.error(f"Failed {img_file.name}: {e}")
+                                orig_name = img_file.name.rsplit('.', 1)[0]
+                                zf.writestr(f"{orig_name}_optimized.webp", img_byte_arr.getvalue())
+                            except Exception as e: st.error(f"Failed {img_file.name}: {e}")
+                                
+                    st.success("✅ Bulk Compression Complete!")
+                    st.download_button("📥 Download Optimized Images (ZIP)", zip_buf.getvalue(), "optimized_images.zip", "application/zip")
+
+        else:
+            # ==========================================
+            # NEW INTERACTIVE PREVIEW MODE
+            # ==========================================
+            if st.session_state.int_img_index < len(up_imgs):
+                current_idx = st.session_state.int_img_index
+                current_file = up_imgs[current_idx]
                 
-                st.success("✅ Conversion Complete!")
-                st.download_button("📥 Download Converted Files (ZIP)", zip_buf.getvalue(), f"converted_to_{target_fmt}.zip", "application/zip")
+                st.write(f"### Image {current_idx + 1} of {len(up_imgs)}: `{current_file.name}`")
+                
+                try:
+                    # 1. Load Original Data
+                    orig_bytes = current_file.getvalue()
+                    orig_img = Image.open(io.BytesIO(orig_bytes))
+                    orig_kb = len(orig_bytes) / 1024
+                    
+                    # 2. Interactive Controls (Keys must be unique per image so sliders reset)
+                    c_ctrl1, c_ctrl2 = st.columns(2)
+                    dyn_width = c_ctrl1.number_input("Max Width (px)", value=min(1200, orig_img.width), step=100, key=f"w_{current_idx}")
+                    dyn_quality = c_ctrl2.slider("WebP Quality %", 10, 100, 75, key=f"q_{current_idx}")
+                    
+                    # 3. Process the Image Dynamically based on current slider values
+                    if orig_img.mode in ("RGBA", "P"): 
+                        proc_img = orig_img.convert("RGB")
+                    else:
+                        proc_img = orig_img.copy()
+                        
+                    if proc_img.width > dyn_width:
+                        ratio = dyn_width / float(proc_img.width)
+                        new_h = int((float(proc_img.height) * float(ratio)))
+                        proc_img = proc_img.resize((dyn_width, new_h), Image.Resampling.LANCZOS)
+                        
+                    img_byte_arr = io.BytesIO()
+                    proc_img.save(img_byte_arr, format='WEBP', quality=dyn_quality, optimize=True)
+                    new_bytes = img_byte_arr.getvalue()
+                    new_kb = len(new_bytes) / 1024
+                    
+                    # 4. Render the Before & After Columns
+                    col_l, col_r = st.columns(2)
+                    with col_l:
+                        st.markdown(f"**Original File:** {orig_img.width}x{orig_img.height}px | **{orig_kb:.1f} KB**")
+                        st.image(orig_img, use_container_width=True)
+                        
+                    with col_r:
+                        savings = 100 - ((new_kb / orig_kb) * 100) if orig_kb > 0 else 0
+                        color = "#38ef7d" if savings > 0 else "#ff4b4b"
+                        st.markdown(f"**WebP Preview:** {proc_img.width}x{proc_img.height}px | **{new_kb:.1f} KB** (<span style='color:{color}; font-weight:bold;'>-{savings:.1f}%</span>)", unsafe_allow_html=True)
+                        st.image(new_bytes, use_container_width=True)
+                    
+                    st.write("") # Spacer
+                    
+                    # 5. Action Buttons
+                    c_btn1, c_btn2, c_btn3 = st.columns([1, 1, 2])
+                    if c_btn1.button("✅ Accept & Next", type="primary", use_container_width=True):
+                        st.session_state.int_processed_imgs[current_file.name] = new_bytes
+                        st.session_state.int_img_index += 1
+                        st.rerun()
+                        
+                    if c_btn2.button("⏭️ Skip Image", use_container_width=True):
+                        st.session_state.int_img_index += 1
+                        st.rerun()
+                        
+                except Exception as e:
+                    st.error(f"Error loading image: {e}")
+                    if st.button("⏭️ Skip Broken File"):
+                        st.session_state.int_img_index += 1
+                        st.rerun()
+                        
+            else:
+                # 6. Finish Screen
+                st.success(f"🎉 All {len(up_imgs)} images reviewed!")
+                
+                if st.session_state.int_processed_imgs:
+                    st.write(f"You optimized **{len(st.session_state.int_processed_imgs)}** images.")
+                    zip_buf = io.BytesIO()
+                    with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED, False) as zf:
+                        for name, _bytes in st.session_state.int_processed_imgs.items():
+                            orig_name = name.rsplit('.', 1)[0]
+                            zf.writestr(f"{orig_name}_optimized.webp", _bytes)
+                    
+                    st.download_button("📥 Download Final ZIP", zip_buf.getvalue(), "interactive_optimized_images.zip", "application/zip", type="primary")
+                else:
+                    st.warning("You skipped all images. Nothing to download.")
+                
+                if st.button("🔄 Start Over"):
+                    st.session_state.int_img_index = 0
+                    st.session_state.int_processed_imgs = {}
+                    st.rerun()
+
+        st.divider()
 
     # ---------------------------------------------------------
     # TAB 2: PDF TOOLS
