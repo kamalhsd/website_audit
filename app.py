@@ -1486,10 +1486,6 @@ def crawl_from_sitemap(sitemap_url, max_urls, progress_container, ignore_robots=
     
     st.info(f"Found {len(sitemap_urls)} URLs in sitemap")
     return crawl_from_list(sitemap_urls, progress_container, ignore_robots, custom_selector, link_selector, search_config, use_js, storage)
-
-
-
-
 # ==========================================
 # 1. WORKSPACE SWITCHER (Top of Sidebar)
 # ==========================================
@@ -3066,6 +3062,34 @@ if workspace == "🔍 SEO & Technical Audit":
                 "text/csv",
                 type="primary"
             )
+
+            st.divider()
+            st.subheader("⛔ Non-Indexable & Restricted URLs")
+            st.info("Pages with 'noindex' or 'nofollow' directives preventing search engine indexing.")
+            
+            restricted_df = tech_df[
+                tech_df['meta_robots'].str.contains('noindex|nofollow', case=False, na=False) |
+                (tech_df['indexability'] == 'Non-Indexable')
+            ].copy()
+            
+            if not restricted_df.empty:
+                st.dataframe(
+                    restricted_df[['url', 'indexability', 'meta_robots', 'status_code', 'canonical_url']],
+                    use_container_width=True,
+                    column_config={
+                        "url": st.column_config.LinkColumn("URL", width="medium"),
+                        "canonical_url": st.column_config.LinkColumn("Canonical Link")
+                    }
+                )
+                csv_restricted = restricted_df.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    "📥 Download Restricted URLs",
+                    csv_restricted,
+                    "restricted_urls.csv",
+                    "text/csv"
+                )
+            else:
+                st.success("✅ No restricted URLs found (no 'noindex' or 'nofollow' directives).")
 
         with tab10:
             st.subheader("📱 Social Tags")
